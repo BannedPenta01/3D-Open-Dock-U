@@ -989,11 +989,36 @@ class PretendoManager(QMainWindow):
             self._run_command("docker compose down", self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
 
     def toggle_docker_service(self):
-        pw = self._ask_sudo_password()
-        if not pw: return
+        # Silent check for password from UI or cache
+        pw = None
+        if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text():
+            pw = self.server_sudo_pass.text()
+        elif self.cached_password:
+            pw = self.cached_password
+
+        # Aggressive port cleaning logic
+        custom_port = self.host_port.text().strip()
+        ports = f"80 443 21 53 8080 {custom_port} 9231"
+        fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
+
         if self.docker_service_running:
-            self._run_command("sudo -S bash -c 'systemctl stop docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: self._check_docker_status())
+            # DISABLING: Make it popup-free and clear ports
+            if pw:
+                self.setup_log.append("[System] Disabling Docker service and clearing ports (Fast-Track)...")
+                cmd = f"sudo -S bash -c 'systemctl stop docker.socket docker.service; {fuser_cmd} || true'"
+                self._run_command(cmd, self.setup_log, stdin_data=pw, on_done=lambda c: self._check_docker_status())
+            else:
+                self.setup_log.append("[System] Clearing ports and attempting service stop (Silent-Best-Effort)...")
+                # Try killing ports as user, then stop service (service stop requires sudo but might work if NOPASSWD)
+                cmd = f"{fuser_cmd} || true; systemctl stop docker.socket docker.service"
+                self._run_command(cmd, self.setup_log, on_done=lambda c: self._check_docker_status())
         else:
+            # ENABLING: Standard security prompt if no password found
+            if not pw:
+                pw = self._ask_sudo_password()
+                if not pw: return
+            
+            self.setup_log.append("[System] Activating Docker services...")
             self._run_command("sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: self._check_docker_status())
 
     def clone_pretendo(self):
