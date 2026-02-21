@@ -940,13 +940,22 @@ class PretendoManager(QMainWindow):
         fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
         
         if OS_INFO["os"] == "linux":
-            pw = self._ask_sudo_password()
-            if not pw: return
-            self.server_log.append("[System] Clearing network binds and starting server...")
-            # Run docker compose under sudo if needed, or ensure user is in group. 
-            # We'll use the user's current context for docker but sudo for fuser.
-            cmd = f"sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service; {fuser_cmd} || true'; docker compose up -d"
-            self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=lambda c: self._check_docker_status())
+            # Attempt to get password from UI or cache without triggering a dialog
+            pw = None
+            if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text():
+                pw = self.server_sudo_pass.text()
+            elif self.cached_password:
+                pw = self.cached_password
+
+            if pw:
+                self.server_log.append("[System] Clearing network binds and starting server (Fast-Track)...")
+                cmd = f"sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service; {fuser_cmd} || true'; docker compose up -d"
+                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=lambda c: self._check_docker_status())
+            else:
+                self.server_log.append("[System] Starting server containers and clearing ports (Best-Effort)...")
+                # Try to kill what we can as current user, then docker up
+                cmd = f"{fuser_cmd} || true; docker compose up -d"
+                self._run_command(cmd, self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
         else:
             self._run_command("docker compose up -d", self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
 
@@ -956,14 +965,26 @@ class PretendoManager(QMainWindow):
         
         custom_port = self.host_port.text().strip()
         ports = f"80 443 21 53 8080 {custom_port} 9231"
+        # Optional fuser command for deep cleaning
         fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
         
         if OS_INFO["os"] == "linux":
-            pw = self._ask_sudo_password()
-            if not pw: return
-            self.server_log.append("[System] Stopping server and force-releasing network ports...")
-            cmd = f"docker compose down; sudo -S bash -c 'systemctl stop docker.socket docker.service; {fuser_cmd} || true'"
-            self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=lambda c: self._check_docker_status())
+            # Attempt to get password from UI or cache without triggering a dialog
+            pw = None
+            if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text():
+                pw = self.server_sudo_pass.text()
+            elif self.cached_password:
+                pw = self.cached_password
+
+            if pw:
+                self.server_log.append("[System] Stopping server and force-releasing ports (Fast-Track)...")
+                cmd = f"docker compose down; sudo -S bash -c 'systemctl stop docker.socket docker.service; {fuser_cmd} || true'"
+                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=lambda c: self._check_docker_status())
+            else:
+                self.server_log.append("[System] Stopping server containers and clearing ports (Best-Effort)...")
+                # Try to kill what we can as current user, then docker down
+                cmd = f"{fuser_cmd} || true; docker compose down"
+                self._run_command(cmd, self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
         else:
             self._run_command("docker compose down", self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
 
@@ -1068,16 +1089,18 @@ class PretendoManager(QMainWindow):
         self._run_command("sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: on_ready() if c == 0 else None)
 
     def clear_sensitive_data(self):
-        """Wipe passwords, usernames, and miinames from the UI, cache, and disk."""
-        res = QMessageBox.warning(self, "Clear Data", "This will permanently wipe your saved credentials and identity info. Proceed?", QMessageBox.Yes | QMessageBox.No)
+        """Wipe passwords (including sudo), usernames, and miinames from the UI, cache, and disk."""
+        res = QMessageBox.warning(self, "Clear Data", "This will permanently wipe your saved credentials, identity info, and admin password. Proceed?", QMessageBox.Yes | QMessageBox.No)
         if res == QMessageBox.Yes:
             self.cached_password = None
-            self.cemu_username.setText("")
-            self.cemu_password.setText("")
-            self.cemu_miiname.setText("")
+            self.cemu_username.clear()
+            self.cemu_password.clear()
+            self.cemu_miiname.clear()
+            self.server_sudo_pass.clear()
+            self.server_remember_pass.setChecked(False)
             self.settings.clear()
             self.settings.sync()
-            QMessageBox.information(self, "Data Wiped", "All sensitive data has been permanently cleared from this device.")
+            QMessageBox.information(self, "Data Wiped", "All sensitive data and administrator credentials have been permanently cleared.")
 
     def fix_docker_permissions(self):
         """Fix Docker socket permissions on Linux."""
