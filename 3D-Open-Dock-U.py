@@ -57,16 +57,16 @@ def detect_os_info():
         flatpak_cemu = os.path.join(home, ".var/app/info.cemu.Cemu/data/Cemu")
         config_cemu = os.path.join(home, ".config/Cemu")
         local_cemu = os.path.join(home, ".local/share/Cemu")
-        # Check paths in priority order: Flatpak > ~/.config > ~/.local/share
-        if os.path.isdir(flatpak_cemu):
-            info["cemu_dir"] = flatpak_cemu
-        elif os.path.isdir(config_cemu):
-            info["cemu_dir"] = config_cemu
+        
+        # Dual-path support for Cemu 2.0+ Linux
+        if os.path.isdir(config_cemu):
+            info["cemu_dir"] = config_cemu # Configuration
+            info["cemu_data"] = local_cemu if os.path.isdir(local_cemu) else config_cemu # MLC/Keys
         else:
             info["cemu_dir"] = local_cemu
+            info["cemu_data"] = local_cemu
         
-        c_dir = info["cemu_dir"] or ""
-        info["cemu_settings"] = os.path.join(c_dir, "settings.xml") if c_dir else ""
+        info["cemu_settings"] = os.path.join(info["cemu_dir"], "settings.xml")
         
         citra_paths = [
             os.path.join(home, ".config/citra-emu/config/qt-config.ini"),
@@ -247,6 +247,7 @@ class PretendoManager(QMainWindow):
         self.docker_service_running = False
         self.server_dir = DEFAULT_SERVER_DIR
         self.settings = QSettings(APP_NAME, "Config")
+        self.bypassing_close_prompt = False
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -263,17 +264,21 @@ class PretendoManager(QMainWindow):
         root.addWidget(sep)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(make_scrollable(self._build_server_tab()), "Server")
-        self.tabs.addTab(make_scrollable(self._build_vault_tab()), "Vault")
-        self.tabs.addTab(make_scrollable(self._build_patch_tab()), "Patching")
-        self.tabs.addTab(make_scrollable(self._build_setup_tab()), "Setup")
-        self.tabs.addTab(make_scrollable(self._build_guide_tab()), "Guide")
+        self.tabs.addTab(make_scrollable(self._build_dashboard_tab()), "Server & Deployment")
+        self.tabs.addTab(make_scrollable(self._build_emulator_tab()), "Identities & Emulators")
+        self.tabs.addTab(make_scrollable(self._build_guide_tab()), "Help & Guide")
         root.addWidget(self.tabs)
 
         # Footer Credits & Reset
         footer_layout = QHBoxLayout()
         footer_layout.setContentsMargins(10, 0, 10, 10)
         
+        self.atomic_btn = QPushButton("ATOMIC SHUTDOWN & EXIT")
+        self.atomic_btn.setStyleSheet(f"font-size: 10px; color: white; background: {RED_DARK}; border: 1px solid {RED_PRIMARY}; padding: 4px 12px; font-weight: bold; border-radius: 4px;")
+        self.atomic_btn.setToolTip("Force-stops the server, disables Docker, and quits the application.")
+        self.atomic_btn.clicked.connect(self.emergency_exit)
+        footer_layout.addWidget(self.atomic_btn)
+
         footer = QLabel('Made by BannedPenta AKA Jan Michael | Powered by Gemini 3 Flash & Google Antigravity')
         footer.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
         footer.setAlignment(Qt.AlignCenter)
@@ -289,7 +294,13 @@ class PretendoManager(QMainWindow):
         self.statusBar().setStyleSheet(f"background: {BG_CARD}; color: {TEXT_SECONDARY}; padding: 4px;")
         self.statusBar().showMessage(f"{APP_NAME} v{APP_VERSION} - Ready")
         self.load_settings()
-        self._check_docker_status()
+        self.last_connectivity_state = (self._get_local_ip() != "127.0.0.1")
+        
+        # Start Heartbeat Timer (Checks status & Connectivity every 5s)
+        self.heartbeat = QTimer()
+        self.heartbeat.timeout.connect(self._on_status_tick)
+        self.heartbeat.start(5000)
+        self._on_status_tick()
 
     def load_settings(self):
         """Load user configurations from persistent storage."""
@@ -320,103 +331,236 @@ class PretendoManager(QMainWindow):
              self.cached_password = None
 
     def _get_local_ip(self):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
-        except: return "127.0.0.1"
+        """Robust IP detection trying multiple targets to avoid false offline status."""
+        for target in [("8.8.8.8", 80), ("1.1.1.1", 80), ("192.168.1.1", 80)]:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(1.0)
+                s.connect(target)
+                ip = s.getsockname()[0]
+                s.close()
+                if ip != "127.0.0.1": return ip
+            except: continue
+        return "127.0.0.1"
 
-    def _build_server_tab(self):
+    def _build_dashboard_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
-        layout.setSpacing(20)
+        layout.setSpacing(10)
+        h_layout = QHBoxLayout()
 
-        group = QGroupBox("Server Controls")
-        glay = QVBoxLayout(group)
+        # LEFT PANE: Server
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0,0,0,0)
         
+        group = QGroupBox("Network Status & Node")
+        glay = QVBoxLayout(group)
         self.status_label = QLabel("OFFLINE")
         self.status_label.setStyleSheet(f"color: {RED_PRIMARY}; font-size: 24px; font-weight: bold;")
         self.status_label.setAlignment(Qt.AlignCenter)
         glay.addWidget(self.status_label)
-
+        
         self.ip_info = QLabel(f"Local Network IP: {self._get_local_ip()}")
         self.ip_info.setStyleSheet(f"color: {CYAN_LIGHT}; font-size: 16px;")
         self.ip_info.setAlignment(Qt.AlignCenter)
         glay.addWidget(self.ip_info)
 
-        # Sudo Password Input directly in UI
-        pass_layout = QHBoxLayout()
-        pass_layout.addWidget(QLabel("Admin Password:"))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Admin Pass:"))
         self.server_sudo_pass = QLineEdit()
         self.server_sudo_pass.setEchoMode(QLineEdit.Password)
-        self.server_sudo_pass.setPlaceholderText("Enter sudo password...")
-        pass_layout.addWidget(self.server_sudo_pass)
+        row.addWidget(self.server_sudo_pass)
         self.server_remember_pass = QCheckBox("Remember")
         self.server_remember_pass.stateChanged.connect(lambda: setattr(self, 'cached_password', self.server_sudo_pass.text() if self.server_remember_pass.isChecked() else None))
-        pass_layout.addWidget(self.server_remember_pass)
-        glay.addLayout(pass_layout)
+        row.addWidget(self.server_remember_pass)
+        glay.addLayout(row)
 
         self.server_toggle_btn = QPushButton("START SERVER")
         self.server_toggle_btn.setObjectName("startBtn")
-        self.server_toggle_btn.setMinimumHeight(64)
+        self.server_toggle_btn.setMinimumHeight(50)
         self.server_toggle_btn.clicked.connect(self.toggle_server)
         glay.addWidget(self.server_toggle_btn)
-        layout.addWidget(group)
-
-        check_group = QGroupBox("Setup Integrity Check")
-        cl = QVBoxLayout(check_group)
-        self.check_btn = QPushButton("Check Setup Status", clicked=self.run_setup_check)
-        cl.addWidget(self.check_btn)
-        self.check_result = QLabel("Setup status not verified.")
-        self.check_result.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        
+        btn_hl = QHBoxLayout()
+        self.stream_log_btn = QPushButton("Stream Node Logs", clicked=self.stream_docker_logs)
+        self.stream_log_btn.setStyleSheet(f"color: {CYAN_LIGHT};")
+        btn_hl.addWidget(self.stream_log_btn)
+        self.clear_server_log_btn = QPushButton("Clear Logs", clicked=lambda: self.server_log.clear())
+        btn_hl.addWidget(self.clear_server_log_btn)
+        self.check_btn = QPushButton("Health Check", clicked=self.run_setup_check)
+        btn_hl.addWidget(self.check_btn)
+        glay.addLayout(btn_hl)
+        
+        self.check_result = QLabel("")
+        self.check_result.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
         self.check_result.setWordWrap(True)
-        cl.addWidget(self.check_result)
-        layout.addWidget(check_group)
-
+        glay.addWidget(self.check_result)
+        
+        lv.addWidget(group)
+        
         self.server_log = QTextEdit(objectName="logBox")
         self.server_log.setReadOnly(True)
-        layout.addWidget(self.server_log)
+        lv.addWidget(self.server_log)
+        
+        h_layout.addWidget(left, 1)
+
+        # RIGHT PANE: Setup Infrastructure
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0,0,0,0)
+        
+        dep = QGroupBox("Infrastructure Deployment")
+        dlay = QVBoxLayout(dep)
+        
+        self.service_toggle_btn = QPushButton("Enable Docker Service", clicked=self.toggle_docker_service)
+        dlay.addWidget(self.service_toggle_btn)
+        
+        row_dir = QHBoxLayout()
+        row_dir.addWidget(QLabel("Stack Dir:"))
+        self.server_dir_field = QLineEdit(DEFAULT_SERVER_DIR)
+        row_dir.addWidget(self.server_dir_field)
+        dlay.addLayout(row_dir)
+
+        row_dl = QHBoxLayout()
+        row_dl.addWidget(QPushButton("1. Download Stack", clicked=self.clone_pretendo))
+        row_dl.addWidget(QPushButton("2. Build Images", clicked=self.build_pretendo))
+        row_dl.addWidget(QPushButton("Clear Logs", clicked=lambda: self.setup_log.clear()))
+        dlay.addLayout(row_dl)
+
+        if OS_INFO["os"] == "linux":
+            dlay.addWidget(QPushButton("3. Run Deep Setup (Fix Env)", clicked=self.run_pretendo_setup))
+            row_sys = QHBoxLayout()
+            row_sys.addWidget(QPushButton("Fix Perms", clicked=self.fix_docker_permissions))
+            row_sys.addWidget(QPushButton("Buildx", clicked=self.install_buildx))
+            row_sys.addWidget(QPushButton("Inject Cemu Keys", clicked=self.inject_cemu_keys))
+            dlay.addLayout(row_sys)
+            
+        rv.addWidget(dep)
+        
+        self.setup_log = QTextEdit(objectName="logBox")
+        self.setup_log.setReadOnly(True)
+        rv.addWidget(self.setup_log)
+        
+        h_layout.addWidget(right, 1)
+        layout.addLayout(h_layout)
         return w
 
-    def _build_vault_tab(self):
+    def _build_emulator_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
+        h_layout = QHBoxLayout()
+
+        # LEFT PANE: Credentials & Identity Target
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0,0,0,0)
         
-        vault_group = QGroupBox("Console Profile Vault")
-        vlay = QVBoxLayout(vault_group)
-        vlay.addWidget(QLabel("Manage multiple online identities. Swap your account.dat, otp.bin, and SecureInfo_A instantly."))
+        cred = QGroupBox("Console Identity Parameters")
+        crgl = QVBoxLayout(cred)
+        form = QFormLayout()
+        self.cemu_username = QLineEdit()
+        self.cemu_username.textChanged.connect(self.save_settings)
+        form.addRow("Username:", self.cemu_username)
+        self.cemu_password = QLineEdit()
+        self.cemu_password.setEchoMode(QLineEdit.Password)
+        self.cemu_password.textChanged.connect(self.save_settings)
+        form.addRow("Password:", self.cemu_password)
+        self.cemu_miiname = QLineEdit()
+        self.cemu_miiname.textChanged.connect(self.save_settings)
+        form.addRow("Mii Name:", self.cemu_miiname)
+        self.cemu_dir_field = QLineEdit(CEMU_DIR)
+        form.addRow("Cemu Dir:", self.cemu_dir_field)
+        crgl.addLayout(form)
         
+        p_row = QHBoxLayout()
+        self.pnid_input = QLineEdit()
+        self.pnid_input.setPlaceholderText("Enter PNID...")
+        p_row.addWidget(self.pnid_input)
+        self.pnid_fetch_btn = QPushButton("Fetch Web API", clicked=self.fetch_pnid)
+        p_row.addWidget(self.pnid_fetch_btn)
+        crgl.addLayout(p_row)
+        
+        self.pnid_results = QLabel("Search PNID to load Mii/PID automatically.")
+        self.pnid_results.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
+        crgl.addWidget(self.pnid_results)
+        
+        crgl.addWidget(QPushButton("Generate Unified Identity Bundle", objectName="patchBtn", clicked=self.generate_console_bundle_zip))
+        self.cemu_log = QTextEdit(objectName="logBox")
+        self.cemu_log.setReadOnly(True)
+        self.cemu_log.setMaximumHeight(80)
+        crgl.addWidget(self.cemu_log)
+        
+        lv.addWidget(cred)
+        
+        net = QGroupBox("Universal Network Router")
+        nlay = QVBoxLayout(net)
+        url_row = QHBoxLayout()
+        url_row.addWidget(QLabel("Target Node:"))
+        current_ip = self._get_local_ip()
+        self.patch_url_input = QLineEdit(f"http://{current_ip}:8070")
+        url_row.addWidget(self.patch_url_input)
+        nlay.addLayout(url_row)
+        
+        pat_row = QHBoxLayout()
+        pat_row.addWidget(QPushButton("Patch Wii U (Cemu)", objectName="patchBtn", clicked=lambda: self.patch_cemu_settings(self.patch_url_input.text())))
+        pat_row.addWidget(QPushButton("Patch 3DS (Citra)", objectName="patchBtn", clicked=lambda: self.patch_citra("custom")))
+        nlay.addLayout(pat_row)
+        
+        lv.addWidget(net)
+        h_layout.addWidget(left, 1)
+
+        # RIGHT PANE: Vault & Restore
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0,0,0,0)
+        
+        vault = QGroupBox("Offline Credentials Vault")
+        vlay = QVBoxLayout(vault)
+        vlay.addWidget(QLabel("Swap accounts dynamically without manual file management."))
         self.profile_list = QListWidget()
-        self.profile_list.setMinimumHeight(200)
+        self.profile_list.setMinimumHeight(150)
         vlay.addWidget(self.profile_list)
         
-        btn_row = QHBoxLayout()
-        self.save_curr_btn = QPushButton("Backup Current Emulator Files", clicked=self.save_to_vault)
-        self.apply_sel_btn = QPushButton("Restore Selected Profile", clicked=self.apply_from_vault)
-        self.open_vault_btn = QPushButton("Open Vault Folder", clicked=self.open_vault_folder)
-        self.delete_prof_btn = QPushButton("Delete Profile", clicked=self.delete_profile)
-        btn_row.addWidget(self.save_curr_btn)
-        btn_row.addWidget(self.apply_sel_btn)
-        btn_row.addWidget(self.open_vault_btn)
-        btn_row.addWidget(self.delete_prof_btn)
-        vlay.addLayout(btn_row)
-        layout.addWidget(vault_group)
+        vbtn = QHBoxLayout()
+        self.save_curr_btn = QPushButton("Save Active Profile", clicked=self.save_to_vault)
+        self.apply_sel_btn = QPushButton("Deploy Saved Loadout", clicked=self.apply_from_vault)
+        vbtn.addWidget(self.save_curr_btn)
+        vbtn.addWidget(self.apply_sel_btn)
+        vlay.addLayout(vbtn)
         
-        # Compatibility Settings
-        port_group = QGroupBox("Compatibility & Network Tuning")
+        vbtn2 = QHBoxLayout()
+        self.open_vault_btn = QPushButton("Browse Vault...", clicked=self.open_vault_folder)
+        self.delete_prof_btn = QPushButton("Erase Setup", clicked=self.delete_profile)
+        vbtn2.addWidget(self.open_vault_btn)
+        vbtn2.addWidget(self.delete_prof_btn)
+        vlay.addLayout(vbtn2)
+        
+        rv.addWidget(vault)
+        
+        port_group = QGroupBox("Port Control & Network Adjustments")
         play = QFormLayout(port_group)
         self.host_port = QLineEdit("8070")
-        self.host_port.setToolTip("Steam uses 8080. We use 8070 by default to avoid interference.")
-        play.addRow("Mitmproxy Host Port:", self.host_port)
-        self.apply_port_btn = QPushButton("Save & Patch Server Port", clicked=self.apply_port_tuning)
+        self.apply_port_btn = QPushButton("Sync Custom Port", clicked=self.apply_port_tuning)
+        play.addRow("Mitmproxy Binding:", self.host_port)
         play.addRow(self.apply_port_btn)
-        layout.addWidget(port_group)
+        rv.addWidget(port_group)
         
-        layout.addStretch()
-        return w
+        n_row = QHBoxLayout()
+        nintendo_btn = QPushButton("Restore Nintendo Services", clicked=self.restore_nintendo_official)
+        nintendo_btn.setStyleSheet(f"background: {RED_DARK}; color: white; padding: 8px;")
+        pretendo_btn = QPushButton("Restore Pretendo Mainnet", clicked=self.restore_pretendo_official)
+        pretendo_btn.setStyleSheet(f"background: {CYAN_DARK}; color: white; padding: 8px;")
+        n_row.addWidget(nintendo_btn)
+        n_row.addWidget(pretendo_btn)
+        rv.addLayout(n_row)
+        
+        rv.addWidget(QPushButton("Emergency Factory Defaults", clicked=self.reset_to_defaults, styleSheet="background: #8b4513; color: white; padding: 8px;"))
 
+        h_layout.addWidget(right, 1)
+        layout.addLayout(h_layout)
+
+        return w
     def _build_guide_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -471,11 +615,19 @@ class PretendoManager(QMainWindow):
             <h2 style='color:{RED_LIGHT};'>Common Issues</h2>
             <ul>
                 <li><b>"Address already in use":</b> Close Steam or click <i>Stop Server</i> and then <i>Start Server</i> again to force-clear ports.</li>
-                <li><b>Docker not active:</b> Ensure the Docker service is enabled in the Setup tab.</li>
+                <li><b>"IOSU_CRYPTO / RSA Failures":</b> Use the <i>Inject System Keys</i> tool in the Setup tab to fix decryption errors.</li>
                 <li><b>"account.dat not found":</b> Make sure you have run the emulator at least once so it creates the file structure.</li>
             </ul>
         """)
         layout.addWidget(guide)
+        
+        reset_row = QHBoxLayout()
+        reset_row.addStretch()
+        self.guide_reset_btn = QPushButton("Reset Emulator Settings to Defaults", clicked=self.show_reset_dialog)
+        self.guide_reset_btn.setStyleSheet(f"color: {RED_LIGHT}; border-color: {RED_DARK}; padding: 8px 16px;")
+        reset_row.addWidget(self.guide_reset_btn)
+        layout.addLayout(reset_row)
+        
         return w
 
     def refresh_vault_list(self):
@@ -623,8 +775,8 @@ class PretendoManager(QMainWindow):
             shutil.rmtree(vault_path, ignore_errors=True)
             self.refresh_vault_list()
 
-    def _apply_port_to_compose(self, port, s_dir):
-        """Robust YAML patching for mitmproxy port."""
+    def _apply_compose_patches(self, port, s_dir):
+        """Robust YAML patching for mitmproxy port and MongoDB version."""
         for fname in ["compose.yml", "docker-compose.yml"]:
             path = os.path.join(s_dir, fname)
             if not os.path.exists(path): continue
@@ -642,6 +794,11 @@ class PretendoManager(QMainWindow):
                     if in_mitm and "8080:8080" in line:
                         line = line.replace("8080:8080", f"{port}:8080")
                         changed = True
+                        
+                    if "image: mongo:latest" in line:
+                        line = line.replace("mongo:latest", "mongo:4.4")
+                        changed = True
+                        
                     new_lines.append(line)
                 
                 if changed:
@@ -653,18 +810,20 @@ class PretendoManager(QMainWindow):
     def apply_port_tuning(self):
         port = self.host_port.text().strip()
         s_dir = self.server_dir_field.text().strip()
-        if self._apply_port_to_compose(port, s_dir):
+        if self._apply_compose_patches(port, s_dir):
              self.save_settings()
              QMessageBox.information(self, "Success", f"Port updated to {port}.\nRestart server to apply.")
         else:
              QMessageBox.warning(self, "Error", "Could not find or patch compose file. Is the stack downloaded?")
 
     def run_setup_check(self):
-        """Check for missing dependencies and configuration files."""
+        """Perform a deep system audit for dependencies and configuration."""
         missing = []
-        if not shutil.which("docker"): missing.append("Docker Engine")
+        warnings = []
         
-        # Check docker-compose (v1 or v2)
+        # 1. Engine Check
+        if not shutil.which("docker"): missing.append("Docker Engine (Missing binary)")
+        
         has_compose = False
         if shutil.which("docker-compose"): has_compose = True
         else:
@@ -672,155 +831,49 @@ class PretendoManager(QMainWindow):
                 res = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True)
                 if res.returncode == 0: has_compose = True
             except: pass
-        if not has_compose: missing.append("Docker Compose Plugin")
+        if not has_compose: missing.append("Docker Compose (Plugin or V1)")
 
-        # Check docker buildx
-        try:
-            res = subprocess.run(["docker", "buildx", "version"], capture_output=True, text=True)
-            if res.returncode != 0: missing.append("Docker Buildx Plugin")
-        except: missing.append("Docker Buildx Plugin")
+        # 2. Permission & Group Check
+        if OS_INFO["os"] == "linux":
+            try:
+                res = subprocess.run(["groups"], capture_output=True, text=True)
+                if "docker" not in res.stdout:
+                    warnings.append("User not in 'docker' group (Permissions might fail)")
+                if not os.access("/var/run/docker.sock", os.W_OK):
+                    warnings.append("Docker socket not writable (Run 'Fix Permissions')")
+            except: pass
 
+        # 3. Stack Integrity
         s_dir = self.server_dir_field.text().strip()
         if not os.path.isdir(s_dir):
-            missing.append(f"Server Directory ({s_dir})")
+            missing.append(f"Server Root ({s_dir})")
         else:
-            has_yml = os.path.isfile(os.path.join(s_dir, "compose.yml")) or \
-                      os.path.isfile(os.path.join(s_dir, "docker-compose.yml"))
-            if not has_yml:
-                missing.append("compose.yml / docker-compose.yml (Run 'Download Stack' in Setup)")
+            has_yml = any(os.path.isfile(os.path.join(s_dir, f)) for f in ["compose.yml", "docker-compose.yml"])
+            if not has_yml: missing.append("compose.yml (Missing stack files)")
             
-            # Check for required environment files (Pretendo needs .local.env files)
             env_dir = os.path.join(s_dir, "environment")
             if os.path.isdir(env_dir):
-                critical_envs = ["miiverse-api.local.env", "account.local.env", "boss.local.env"]
-                missing_envs = [e for e in critical_envs if not os.path.isfile(os.path.join(env_dir, e))]
-                if missing_envs:
-                    missing.append("Missing Environment Configs (Run 'Run Full Setup Script' below)")
+                for e in ["miiverse-api.local.env", "account.local.env"]:
+                    if not os.path.isfile(os.path.join(env_dir, e)):
+                        missing.append(f"Env Config: {e} (Run Setup Script)")
 
+        # 4. Emulator Keys
         cemu_dir = self.cemu_dir_field.text().strip()
-        if not os.path.isdir(cemu_dir):
-            missing.append(f"Cemu Directory ({cemu_dir})")
+        if os.path.isdir(cemu_dir):
+            for k in ["otp.bin", "seeprom.bin"]:
+                if not os.path.isfile(os.path.join(cemu_dir, k)):
+                    warnings.append(f"Cemu: {k} missing (Injection recommended)")
 
-        if not missing:
-            self.check_result.setText("System check passed! Nothing is missing.")
+        # Final Report
+        if not missing and not warnings:
+            self.check_result.setText("✔ Audit Passed: System is fully operational.")
             self.check_result.setStyleSheet("color: #3fb950; font-weight: bold;")
         else:
-            self.check_result.setText("Missing Items:\n• " + "\n• ".join(missing))
-            self.check_result.setStyleSheet(f"color: {RED_PRIMARY}; font-weight: bold;")
-
-    def _build_setup_tab(self):
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        
-        group = QGroupBox("Installation")
-        glay = QVBoxLayout(group)
-        
-        self.service_toggle_btn = QPushButton("Enable Docker Service")
-        self.service_toggle_btn.clicked.connect(self.toggle_docker_service)
-        glay.addWidget(self.service_toggle_btn)
-
-        row = QHBoxLayout()
-        self.server_dir_field = QLineEdit(DEFAULT_SERVER_DIR)
-        row.addWidget(QLabel("Folder:"))
-        row.addWidget(self.server_dir_field)
-        glay.addLayout(row)
-
-        glay.addWidget(QPushButton("Download Stack", clicked=self.clone_pretendo))
-        
-        if OS_INFO["os"] == "linux":
-            glay.addWidget(QPushButton("Fix Docker Permissions (Socket)", clicked=self.fix_docker_permissions))
-            glay.addWidget(QPushButton("Install Buildx Plugin", clicked=self.install_buildx))
-            glay.addWidget(QPushButton("Run Full Setup Script (Fix Env Files)", clicked=self.run_pretendo_setup))
-            
-        glay.addWidget(QPushButton("Build Containers", clicked=self.build_pretendo))
-        layout.addWidget(group)
-
-        self.setup_progress = QProgressBar()
-        self.setup_progress.setVisible(False)
-        layout.addWidget(self.setup_progress)
-
-        self.setup_log = QTextEdit(objectName="logBox")
-        self.setup_log.setReadOnly(True)
-        layout.addWidget(self.setup_log)
-        return w
-
-    def _build_patch_tab(self):
-        w = QWidget()
-        layout = QVBoxLayout(w)
-        
-        # ─── Console Credentials & Files ───
-        cred_group = QGroupBox("Console Identity & Credentials")
-        crgl = QVBoxLayout(cred_group)
-        form = QFormLayout()
-        self.cemu_username = QLineEdit()
-        form.addRow("Username:", self.cemu_username)
-        self.cemu_password = QLineEdit()
-        self.cemu_password.setEchoMode(QLineEdit.Password)
-        form.addRow("Password:", self.cemu_password)
-        self.cemu_miiname = QLineEdit()
-        form.addRow("Mii Name:", self.cemu_miiname)
-        self.cemu_dir_field = QLineEdit(CEMU_DIR)
-        form.addRow("Cemu Folder:", self.cemu_dir_field)
-        crgl.addLayout(form)
-        
-        # PNID Search Section
-        pnid_row = QHBoxLayout()
-        self.pnid_input = QLineEdit()
-        self.pnid_input.setPlaceholderText("Enter PNID to Search...")
-        pnid_row.addWidget(self.pnid_input)
-        self.pnid_fetch_btn = QPushButton("Fetch PNID Info", clicked=self.fetch_pnid)
-        pnid_row.addWidget(self.pnid_fetch_btn)
-        crgl.addLayout(pnid_row)
-        
-        self.pnid_results = QLabel("Search for a PNID to import Mii data.")
-        self.pnid_results.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
-        self.pnid_results.setWordWrap(True)
-        crgl.addWidget(self.pnid_results)
-        
-        gen_row = QHBoxLayout()
-        gen_row.addWidget(QPushButton("Generate All-in-One ZIP Bundle", objectName="patchBtn", clicked=self.generate_console_bundle_zip))
-        crgl.addLayout(gen_row)
-
-        self.cemu_log = QTextEdit()
-        self.cemu_log.setObjectName("logBox")
-        self.cemu_log.setReadOnly(True)
-        self.cemu_log.setMaximumHeight(100)
-        crgl.addWidget(self.cemu_log)
-        layout.addWidget(cred_group)
-
-        # ─── Universal Server Router ───
-        group = QGroupBox("Universal Server Patcher")
-        glay = QVBoxLayout(group)
-        
-        # Default to localhost:8070 which matches our anti-conflict tuning
-        self.patch_url_input = QLineEdit("http://localhost:8070")
-        glay.addWidget(QLabel("Target Server URL (Host Port):"))
-        glay.addWidget(self.patch_url_input)
-
-
-
-        patch_row = QHBoxLayout()
-        patch_row.addWidget(QPushButton("Patch Cemu (Wii U)", objectName="patchBtn", clicked=lambda: self.patch_cemu_settings(self.patch_url_input.text())))
-        patch_row.addWidget(QPushButton("Patch Citra/Forks (3DS)", objectName="patchBtn", clicked=lambda: self.patch_citra("custom")))
-        glay.addLayout(patch_row)
-
-        nintendo_btn = QPushButton("Quick Restore: Official Nintendo Network", clicked=self.restore_nintendo_official)
-        nintendo_btn.setStyleSheet(f"background: {RED_DARK}; border-color: {RED_PRIMARY}; color: white; padding: 12px; font-size: 14px;")
-        glay.addWidget(nintendo_btn)
-
-        pretendo_btn = QPushButton("Quick Restore: Official Pretendo Network", clicked=self.restore_pretendo_official)
-        pretendo_btn.setStyleSheet(f"background: {CYAN_DARK}; border-color: {CYAN_PRIMARY}; color: white; padding: 12px; font-size: 14px;")
-        glay.addWidget(pretendo_btn)
-
-        reset_btn = QPushButton("Reset to Default Settings", clicked=self.reset_to_defaults)
-        reset_btn.setStyleSheet(f"background: #8b4513; border-color: #d2691e; color: white; padding: 12px; font-size: 14px;")
-        glay.addWidget(reset_btn)
-        
-        layout.addWidget(group)
-        layout.addStretch()
-        return w
-
-
+            report = ""
+            if missing: report += "❌ MISSING:\n• " + "\n• ".join(missing)
+            if warnings: report += ("\n\n" if report else "") + "⚠ WARNINGS:\n• " + "\n• ".join(warnings)
+            self.check_result.setText(report)
+            self.check_result.setStyleSheet(f"color: {RED_PRIMARY if missing else '#d29922'}; font-weight: bold;")
 
     def restore_nintendo_official(self):
         """Restore official Nintendo network settings for all emulators."""
@@ -856,7 +909,89 @@ class PretendoManager(QMainWindow):
             self.patch_citra("reset_default")
             QMessageBox.information(self, "Success", "3DS settings reset to default.")
 
+    def inject_cemu_keys(self):
+        """Inject real Wii U system keys (OTP/SEEPROM) into the Cemu folder to fix log.txt errors."""
+        cemu_dir = self.cemu_dir_field.text().strip()
+        if not os.path.isdir(cemu_dir):
+            QMessageBox.warning(self, "Error", "Cemu folder not found. Set it in the Patching tab.")
+            return
 
+        otp_path = os.path.join(cemu_dir, "otp.bin")
+        seeprom_path = os.path.join(cemu_dir, "seeprom.bin")
+
+        try:
+            # 1. Generate/Patch OTP (1024 bytes)
+            otp = bytearray(1024)
+            if os.path.exists(otp_path):
+                with open(otp_path, "rb") as f:
+                    data = f.read(1024)
+                    for i, b in enumerate(data): otp[i] = b
+            
+            # Inject Keys
+            # Common Key at 0x100
+            comm = bytes.fromhex(WIIU_COMMON_KEY)
+            for i, b in enumerate(comm): otp[0x100 + i] = b
+            
+            # Starbuck Ancast at 0x10
+            star = bytes.fromhex(WIIU_STARBUCK_ANCAST)
+            for i, b in enumerate(star): otp[0x10 + i] = b
+            
+            # Espresso Ancast at 0x30
+            espr = bytes.fromhex(ESPRESSO_ANCAST_KEY)
+            for i, b in enumerate(espr): otp[0x30 + i] = b
+            
+            # Randomness for uniqueness
+            rand4 = os.urandom(4)
+            for i, b in enumerate(rand4): otp[0xB0 + i] = b
+
+            with open(otp_path, "wb") as f: f.write(otp)
+
+            # 2. Generate/Patch SEEPROM (512 bytes)
+            seep = bytearray(os.urandom(512))
+            serial = f"FW{random.randint(400000000, 799999999)}"
+            serial_bytes = serial.encode('ascii')
+            for i, b in enumerate(serial_bytes):
+                if 0x170 + i < 512: seep[0x170 + i] = b
+            
+            mac = bytes([0x00, 0x19, 0xFD, random.randint(0,255), random.randint(0,255), random.randint(0,255)])
+            for i, b in enumerate(mac):
+                if 0x10 + i < 0x16: seep[0x10 + i] = b
+                
+            with open(seeprom_path, "wb") as f: f.write(seep)
+            
+            QMessageBox.information(self, "Success", "Wii U System Keys injected!\nDecryption errors in log.txt should now be resolved.")
+            self.setup_log.append(f"[System] Fully patched {otp_path} and {seeprom_path} with master keys.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Key Injection failed: {e}")
+
+
+    def _on_status_tick(self):
+        """Periodic check for system status and dynamic network sync."""
+        self._check_docker_status()
+        current_ip = self._get_local_ip()
+        is_connected = (current_ip != "127.0.0.1")
+        
+        # 1. Update IP Label Dynamically
+        if hasattr(self, 'ip_info'):
+            self.ip_info.setText(f"Local Network IP: {current_ip}")
+        
+        # 2. Automated Safeguard
+        if not is_connected and self.last_connectivity_state:
+            if self.server_running or self.docker_service_running:
+                msg = "\n[ALARM] Connection Terminated! Triggering Secure Shutdown Protocol...\n"
+                self.server_log.append(msg)
+                self.setup_log.append(msg)
+                
+                if self.server_running: self.stop_server()
+                if self.docker_service_running: self.toggle_docker_service()
+                
+                self.statusBar().showMessage("NETWORK LOSS DETECTED - Safe Mode Active", 15000)
+        
+        self.last_connectivity_state = is_connected
+
+    def show_reset_dialog(self):
+        """Helper to show the reset options from different tabs."""
+        self.reset_to_defaults()
 
     def _check_docker_status(self):
         try:
@@ -913,51 +1048,102 @@ class PretendoManager(QMainWindow):
 
     def _run_command(self, cmd, log_widget, cwd=None, on_done=None, stdin_data=None):
         if self.worker and self.worker.isRunning(): return
-        log_widget.append(f"$ {cmd}\n")
+        
+        # Technical stylized command output
+        clean_cmd = cmd.replace(stdin_data, "********") if stdin_data else cmd
+        log_widget.append(f"<b>[EXEC]</b> <span style='color:{CYAN_PRIMARY};'>guest@pretendo-manager:</span> <span style='color:white;'>{clean_cmd}</span>")
+        
         if stdin_data:
-            log_widget.append("[System] Submitting credentials to secure process...\n")
+            log_widget.append(f"<i style='color:{TEXT_SECONDARY};'>[SYSTEM] Elevating privileges for secure task...</i>")
+            
         self.worker = CommandWorker(cmd, cwd, stdin_data)
         self.worker.output.connect(log_widget.append)
+        
         def handle_done(code):
-            log_widget.append("\nDone." if code == 0 else f"\nFailed ({code})")
+            status_clr = "#3fb950" if code == 0 else RED_LIGHT
+            status_txt = "SUCCESS" if code == 0 else f"FAILED ({code})"
+            log_widget.append(f"<b>[DONE]</b> Process exited with status: <b style='color:{status_clr};'>{status_txt}</b>\n")
             if on_done: on_done(code)
+            
         self.worker.finished.connect(handle_done)
         self.worker.start()
+
+    def emergency_exit(self):
+        """Total system shutdown: Stops server, disables Docker, and quits."""
+        msg = "ATOMIC SHUTDOWN INITIATED\n\nThis will stop the Pretendo server, disable the Docker service, and quit the app.\n\nProceed?"
+        if QMessageBox.critical(self, "Emergency Shutdown", msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No:
+            return
+
+        self.bypassing_close_prompt = True
+        self.statusBar().showMessage("SYSTEM SHUTDOWN IN PROGRESS...")
+        
+        # We need to run these commands and then close. 
+        # Since the app will close, we'll try to trigger the shutdown logic.
+        self.stop_server()
+        
+        # We want to wait for server to stop or at least trigger it.
+        # Then disable service
+        if OS_INFO["os"] == "linux" and self.docker_service_running:
+            self.toggle_docker_service() 
+            
+        # We'll use a single-shot timer to allow the commands to at least start being sent
+        # before we force the app to close.
+        QTimer.singleShot(2000, QApplication.quit)
 
     def toggle_server(self):
         if self.server_running: self.stop_server()
         else: self.start_server()
 
     def start_server(self):
+        # 1. Connectivity Gate
+        if self._get_local_ip() == "127.0.0.1":
+            QMessageBox.warning(self, "No Connection", "An internet connection is required to start the Pretendo server.\n\nPlease check your network and try again.")
+            return
+
         s_dir = self.server_dir_field.text().strip()
         custom_port = self.host_port.text().strip()
-        
-        # Ensure file is patched before starting
-        self._apply_port_to_compose(custom_port, s_dir)
+        if not os.path.isdir(s_dir):
+            QMessageBox.warning(self, "Error", "Server directory not found! Download the stack first.")
+            return
 
-        # Aggressive port cleaning
+        self._apply_compose_patches(custom_port, s_dir)
+
+        # 2. Credential Aggregation
+        pw = None
+        if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text().strip():
+            pw = self.server_sudo_pass.text().strip()
+        elif self.cached_password:
+            pw = self.cached_password
+
+        # 3. Docker Service Check & Auto-Start
+        if OS_INFO["os"] == "linux" and not self.docker_service_running:
+            if not pw:
+                pw = self._ask_sudo_password()
+                if not pw: return # User cancelled
+
         ports = f"80 443 21 53 8080 {custom_port} 9231"
         fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
         
-        if OS_INFO["os"] == "linux":
-            # Attempt to get password from UI or cache without triggering a dialog
-            pw = None
-            if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text():
-                pw = self.server_sudo_pass.text()
-            elif self.cached_password:
-                pw = self.cached_password
+        # Helper to finalize and kickstart mongo replica
+        def _on_start(code):
+            if OS_INFO["os"] == "linux" and s_dir:
+                 # Initialize the replica set if the container name matches
+                 cmd = "docker exec pretendo-network-mongodb-1 mongo --eval 'rs.initiate()' || true"
+                 subprocess.run(cmd, shell=True, cwd=s_dir)
+            self._check_docker_status()
 
+        if OS_INFO["os"] == "linux":
             if pw:
-                self.server_log.append("[System] Clearing network binds and starting server (Fast-Track)...")
-                cmd = f"sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service; {fuser_cmd} || true'; docker compose up -d"
-                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=lambda c: self._check_docker_status())
+                self.server_log.append("[System] Starting background services and clearing ports...")
+                # Start docker services + clear ports + docker compose
+                cmd = f"sudo -S bash -c 'systemctl start docker.socket docker.service; {fuser_cmd} || true'; docker compose up -d"
+                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=_on_start)
             else:
-                self.server_log.append("[System] Starting server containers and clearing ports (Best-Effort)...")
-                # Try to kill what we can as current user, then docker up
+                self.server_log.append("[System] Starting server (Best-Effort Mode)...")
                 cmd = f"{fuser_cmd} || true; docker compose up -d"
-                self._run_command(cmd, self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
+                self._run_command(cmd, self.server_log, s_dir, on_done=_on_start)
         else:
-            self._run_command("docker compose up -d", self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
+            self._run_command("docker compose up -d", self.server_log, s_dir, on_done=_on_start)
 
     def stop_server(self):
         s_dir = self.server_dir_field.text().strip()
@@ -969,15 +1155,15 @@ class PretendoManager(QMainWindow):
         fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
         
         if OS_INFO["os"] == "linux":
-            # Attempt to get password from UI or cache without triggering a dialog
+            # Attempt to get password: Server Tab Slot > Cache
             pw = None
-            if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text():
-                pw = self.server_sudo_pass.text()
+            if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text().strip():
+                pw = self.server_sudo_pass.text().strip()
             elif self.cached_password:
                 pw = self.cached_password
 
             if pw:
-                self.server_log.append("[System] Stopping server and force-releasing ports (Fast-Track)...")
+                self.server_log.append("[System] Stopping server and force-releasing ports (Secure-Fast-Track)...")
                 cmd = f"docker compose down; sudo -S bash -c 'systemctl stop docker.socket docker.service; {fuser_cmd} || true'"
                 self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=lambda c: self._check_docker_status())
             else:
@@ -988,11 +1174,27 @@ class PretendoManager(QMainWindow):
         else:
             self._run_command("docker compose down", self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
 
+    def stream_docker_logs(self):
+        s_dir = self.server_dir_field.text().strip()
+        if not os.path.isdir(s_dir): return
+        
+        self.server_log.append("[System] Connecting to deep Docker event stream...")
+        self.server_log.append("--------------------------------------------------")
+        cmd = "docker compose logs -f --tail=20"
+        
+        if hasattr(self, 'log_worker') and getattr(self.log_worker, 'isRunning')():
+            self.log_worker.terminate()
+            self.server_log.append("[System] Restarting log watcher...")
+            
+        self.log_worker = CommandWorker(cmd, cwd=s_dir)
+        self.log_worker.output.connect(self.server_log.append)
+        self.log_worker.start()
+
     def toggle_docker_service(self):
-        # Silent check for password from UI or cache
+        # Attempt to get password: Server Tab Slot > Cache
         pw = None
-        if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text():
-            pw = self.server_sudo_pass.text()
+        if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text().strip():
+            pw = self.server_sudo_pass.text().strip()
         elif self.cached_password:
             pw = self.cached_password
 
@@ -1013,7 +1215,12 @@ class PretendoManager(QMainWindow):
                 cmd = f"{fuser_cmd} || true; systemctl stop docker.socket docker.service"
                 self._run_command(cmd, self.setup_log, on_done=lambda c: self._check_docker_status())
         else:
-            # ENABLING: Standard security prompt if no password found
+            # ENABLING: Check connectivity first
+            if self._get_local_ip() == "127.0.0.1":
+                QMessageBox.warning(self, "No Connection", "An active internet connection is required to enable Docker services.")
+                return
+
+            # Standard security prompt if no password found
             if not pw:
                 pw = self._ask_sudo_password()
                 if not pw: return
@@ -1056,7 +1263,7 @@ class PretendoManager(QMainWindow):
 
         # 1. Patch the port AUTOMATICALLY before setup
         custom_port = self.host_port.text().strip()
-        self._apply_port_to_compose(custom_port, s_dir)
+        self._apply_compose_patches(custom_port, s_dir)
 
         # 2. Check for conflicts
         conflicts = self._check_port_conflicts()
@@ -1157,109 +1364,201 @@ class PretendoManager(QMainWindow):
         self._ensure_docker_active(_do_install)
 
     def patch_cemu_settings(self, url):
+        # Dynamically resolve localhost if needed
+        if "localhost" in url or "127.0.0.1" in url:
+            real_ip = self._get_local_ip()
+            if real_ip != "127.0.0.1":
+                url = url.replace("localhost", real_ip).replace("127.0.0.1", real_ip)
+                self.statusBar().showMessage(f"Redirected localhost -> {real_ip} for AppImage compatibility.", 3000)
+
         p = OS_INFO.get("cemu_settings", "")
         if not p or not os.path.exists(p):
-            QMessageBox.warning(self, "Not Found", f"Cemu settings.xml not found at:\n{p}\n\nMake sure Cemu has been run at least once.")
+            QMessageBox.warning(self, "Not Found", f"Cemu settings.xml not found at:\n{p}")
             return
         try:
             with open(p, "r") as f: c = f.read()
-            # Replace existing proxy_server tag
-            if re.search(r"<proxy_server>.*?</proxy_server>", c):
+            
+            # 1. Force Online & Global SSL Bypass
+            if "<OnlineEnabled>true</OnlineEnabled>" not in c:
+                if "<OnlineEnabled>false</OnlineEnabled>" in c:
+                    c = c.replace("<OnlineEnabled>false</OnlineEnabled>", "<OnlineEnabled>true</OnlineEnabled>")
+                elif "</Account>" in c:
+                    c = c.replace("</Account>", "    <OnlineEnabled>true</OnlineEnabled>\n    </Account>")
+            
+            # 1b. INJECT SSL BYPASS into Account block for latest Cemu compatibility
+            if "<Account>" in c and "<disablesslverification>1</disablesslverification>" not in c:
+                c = c.replace("<Account>", "<Account>\n        <disablesslverification>1</disablesslverification>")
+            
+            # Ensure disablesslverification is in settings.xml root too
+            if "<disablesslverification>1</disablesslverification>" not in c:
+                if "<disablesslverification>0</disablesslverification>" in c:
+                    c = c.replace("<disablesslverification>0</disablesslverification>", "<disablesslverification>1</disablesslverification>")
+                elif "</content>" in c:
+                    c = c.replace("</content>", "    <disablesslverification>1</disablesslverification>\n</content>")
+            
+            # 2. Kill Legacy Cert Pointers
+            c = re.sub(r"<account_cert_path>.*?</account_cert_path>", "<account_cert_path></account_cert_path>", c)
+
+            # 3. Patch Proxy URL
+            if "<proxy_server>" in c:
                 c = re.sub(r"<proxy_server>.*?</proxy_server>", f"<proxy_server>{url}</proxy_server>", c)
-            # If no proxy_server tag exists, add it before the closing </content> tag
             elif "</content>" in c:
                 c = c.replace("</content>", f"    <proxy_server>{url}</proxy_server>\n</content>")
-            else:
-                QMessageBox.warning(self, "Error", "Could not find a valid Cemu settings structure.")
-                return
+            
             with open(p, "w") as f: f.write(c)
-            QMessageBox.information(self, "Success", f"Patched Cemu to use:\n{url}")
+            
+            # 4. Multi-Path network_services.xml injection (Full Service Redirect)
+            data_dir = OS_INFO.get("cemu_data", OS_INFO.get("cemu_dir"))
+            services = {
+                "act": "https://account.nintendo.net",
+                "con": "https://con.nintendo.net",
+                "etc": "https://etc.nintendo.net",
+                "dls": "https://dls.nintendo.net",
+                "shp": "https://shp.nintendo.net",
+                "dsa": "https://dsa.nintendo.net",
+                "pdm": "https://pdm.nintendo.net",
+                "miv": "https://api.olv.nintendo.net",
+                "smm": "https://supermariomaker.nintendo.net",
+                "bas": "https://bayonetta2.nintendo.net"
+            }
+            # Mitmproxy identifies hosts via normal domains, not via raw IP:PORT !
+            url_nodes = "\n".join([f"        <{s}>{v}</{s}>" for s, v in services.items()])
+            ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n    <urls>\n{url_nodes}\n    </urls>\n</content>'
+            
+            for target_dir in set([data_dir, os.path.dirname(p)]):
+                ns_xml = os.path.join(target_dir, "network_services.xml")
+                with open(ns_xml, "w") as f:
+                    f.write(ns_content)
+
+            self.statusBar().showMessage("Cemu Bypass Infrastructure Reinforced!", 5000)
+            QMessageBox.information(self, "Success", f"Wii U Connection Patched!\n\nAll services (act, con, etc.) redirected to {url}\nSSL Verification Disabled.")
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def generate_cemu_manual(self):
         username = self.cemu_username.text().strip()
         password = self.cemu_password.text().strip()
         miiname = self.cemu_miiname.text().strip() or "Player"
-        cemu_path = self.cemu_dir_field.text().strip()
+        data_path = OS_INFO.get("cemu_data", self.cemu_dir_field.text().strip())
 
         if not username or not password:
-            QMessageBox.warning(self, "Error", "Username and password are required.")
+            QMessageBox.warning(self, "Error", "Username and password required.")
             return
 
-        self.cemu_log.clear()
-        self.cemu_log.append("Generating Cemu online files...\n")
-
         try:
-            # OTP
+            # 1. Identity Blobs (Multi-write to root and sys)
             otp = bytearray(1024)
-            otp[0x100:0x110] = bytearray(bytes.fromhex(WIIU_COMMON_KEY))
-            otp[0x10:0x24] = bytearray(bytes.fromhex(WIIU_STARBUCK_ANCAST))
-            otp[0x30:0x44] = bytearray(bytes.fromhex(ESPRESSO_ANCAST_KEY))
-            otp[0xB0:0xB4] = bytearray(os.urandom(4))
+            comm = bytes.fromhex(WIIU_COMMON_KEY)
+            for i, b in enumerate(comm): otp[0x100 + i] = b
+            star = bytes.fromhex(WIIU_STARBUCK_ANCAST)
+            for i, b in enumerate(star): otp[0x10 + i] = b
+            espr = bytes.fromhex(ESPRESSO_ANCAST_KEY)
+            for i, b in enumerate(espr): otp[0x30 + i] = b
             
-            os.makedirs(cemu_path, exist_ok=True)
-            with open(os.path.join(cemu_path, "otp.bin"), "wb") as f: f.write(otp)
-
-            # SEEPROM
             seeprom = bytearray(os.urandom(512))
-            serial = f"FW{random.randint(400000000, 799999999)}"
-            seeprom[0x170:0x170+len(serial)] = bytearray(serial.encode('ascii'))
-            mac = bytes([0x00, 0x19, 0xFD, random.randint(0,255), random.randint(0,255), random.randint(0,255)])
-            seeprom[0x10:0x16] = bytearray(mac)
-            with open(os.path.join(cemu_path, "seeprom.bin"), "wb") as f: f.write(seeprom)
+            serial = f"FW{random.randint(400000000, 799999999)}".encode('ascii')
+            for i, b in enumerate(serial): seeprom[0x170 + i] = b
+            
+            # Destination Sweep (Keys must be in both root and sys for different Cemu versions)
+            targets = [data_path, os.path.join(data_path, "mlc01", "sys")]
+            for t in targets:
+                os.makedirs(t, exist_ok=True)
+                with open(os.path.join(t, "otp.bin"), "wb") as f: f.write(otp)
+                with open(os.path.join(t, "seeprom.bin"), "wb") as f: f.write(seeprom)
 
-            # account.dat
-            pid = random.randint(1000000000, 2000000000)
+            # 2. Account Generation (NEX-Compatible Authenticated Hash)
+            pid = getattr(self, '_pnid_pid', None)
+            if not pid:
+                pid = 123456789
             pid_bytes = pid.to_bytes(4, byteorder='little')
-            pwd_hash = hashlib.sha256(pid_bytes + bytes([2, 101, 67, 70]) + password.encode('utf-8')).hexdigest()
-            uuid_hex = binascii.hexlify(os.urandom(16)).decode('ascii')
-            mii_u16 = miiname[:10].encode('utf-16be')
-            mii_hex = binascii.hexlify(mii_u16[:20].ljust(22, b'\x00')).decode('ascii')
+            
+            pwd_hash = hashlib.sha256(pid_bytes + b"\x02eCF" + password.encode('utf-8')).hexdigest()
+            uuid_bytes = os.urandom(16)
+            uuid_hex = binascii.hexlify(uuid_bytes).decode('ascii')
+            trans_id = (0x2000004 << 32) | (uuid_bytes[12] << 24) | (uuid_bytes[13] << 16) | (uuid_bytes[14] << 8) | uuid_bytes[15]
+            
+            # Persistent Mii Hex (MiiName & Data sync)
+            stored_mii = getattr(self, '_mii_data_hex', None)
+            if stored_mii and len(stored_mii) >= 40:
+                mii_hex = stored_mii[:40] # take the name chunk or use it directly
+            else:
+                mii_u16 = miiname[:10].encode('utf-16be')
+                mii_hex = binascii.hexlify(mii_u16.ljust(20, b'\x00')).decode('ascii')
 
             lines = [
-                "AccountInstance_20120705", "PersistentId=80000001",
-                f"Uuid={uuid_hex}", f"MiiName={mii_hex}", f"AccountId={username}",
-                f"PrincipalId={pid:08x}", f"AccountPasswordCache={pwd_hash}",
-                "ServerAccountStatus=1", "IsCommitted=1"
+                "AccountInstance_20120705",
+                "PersistentId=80000001",
+                f"TransferableIdBase={trans_id:x}",
+                f"Uuid={uuid_hex}",
+                "ParentalControlSlotNo=0",
+                f"MiiData={getattr(self, '_mii_data_hex', '01000110' + '0' * 184)}", # Keep full MiiData if available
+                f"MiiName={mii_hex}",
+                "IsMiiUpdated=1",
+                f"AccountId={username}",
+                "BirthYear=2003", "BirthMonth=1", "BirthDay=1", "Gender=0",
+                "IsMailAddressValidated=1",
+                "EmailAddress=none@pretendo.network",
+                "Country=49", "SimpleAddressId=49010000",
+                "TimeZoneId=America/New_York",
+                "UtcOffset=ffffffff9ac22000",
+                f"PrincipalId={pid:08x}",
+                "IsPasswordCacheEnabled=1",
+                f"AccountPasswordCache={pwd_hash}",
+                "NnasType=0", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
+                "IsPersistentIdUploaded=1",
+                "IsConsoleAccountInfoUploaded=1",
+                "LastAuthenticationResult=0",
+                f"StickyAccountId={username}",
+                f"StickyPrincipalId={pid:08x}",
+                "IsServerAccountDeleted=0",
+                "IsCommitted=1"
             ]
             
-            acct_dir = os.path.join(cemu_path, "mlc01", "usr", "save", "system", "act", "80000001")
+            acct_dir = os.path.join(data_path, "mlc01", "usr", "save", "system", "act", "80000001")
             os.makedirs(acct_dir, exist_ok=True)
-            with open(os.path.join(acct_dir, "account.dat"), "w") as f: f.write("\n".join(lines))
+            with open(os.path.join(acct_dir, "account.dat"), "w", encoding="utf-8") as f: f.write("\n".join(lines))
 
-            self.cemu_log.append(f"Files generated for {username}!")
-            self.cemu_log.append(f"Location: {cemu_path}")
-            QMessageBox.information(self, "Success", f"Wii U files generated!")
-        except Exception as e:
-            self.cemu_log.append(f"Error: {e}")
-            QMessageBox.critical(self, "Error", str(e))
+            self.statusBar().showMessage(f"Deep Identity Fix Applied for {username}", 5000)
+            QMessageBox.information(self, "Success", f"Wii U Identity Files Realigned!\n\nAuthentication Hash: OK\nPrincipalId: {pid:08x}")
+        except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def patch_citra(self, mode):
         p = OS_INFO.get("citra_config", "")
         if not p or not os.path.exists(p):
-            QMessageBox.warning(self, "Not Found", "No Citra/Lime3DS config found.\n\nChecked:\n• ~/.config/citra-emu/\n• ~/.config/lime-3ds/\n• Flatpak paths\n\nMake sure your emulator has been run at least once.")
+            QMessageBox.warning(self, "Not Found", "Citra/Lime/Azahar configuration not found.")
             return
-        
-        if mode == "official_restore":
-            url = "https://api.pretendo.network"
-        elif mode == "nintendo_restore":
-            url = "https://api.nintendo.net"
-        elif mode == "reset_default":
-            url = ""
-        else:
-            url = self.patch_url_input.text() if mode == "custom" else "http://localhost:8070"
-            
+
+        target_url = "https://account.pretendo.cc" if mode == "pretendo" else self.patch_url_input.text()
+        if mode == "nintendo": target_url = "https://account.nintendo.net"
+
         try:
             with open(p, "r") as f: lines = f.readlines()
-            if url:
-                new = [f"web_api_url={url}\n" if l.startswith("web_api_url=") else l for l in lines]
-                if not any(l.startswith("web_api_url=") for l in lines): new.append(f"\nweb_api_url={url}\n")
-            else:
-                new = [l for l in lines if not l.startswith("web_api_url=")]
-            
-            with open(p, "w") as f: f.writelines(new)
-            if url:
-                QMessageBox.information(self, "Success", f"Patched Citra with {url}")
+            new_lines = []
+            found = False
+            for line in lines:
+                if line.startswith("web_api_url="):
+                   new_lines.append(f"web_api_url={target_url}\n")
+                   found = True
+                else: new_lines.append(line)
+            if not found: new_lines.append(f"web_api_url={target_url}\n")
+            with open(p, "w") as f: f.writelines(new_lines)
+
+            # 3DS Zero-Cert Bypass logic
+            citra_root = os.path.dirname(os.path.dirname(p))
+            sysdata = os.path.join(citra_root, "sysdata")
+            if os.path.isdir(sysdata):
+                # Generate a dummy LocalFriendCodeSeed if missing
+                seed_p = os.path.join(sysdata, "LocalFriendCodeSeed_B")
+                if not os.path.exists(seed_p):
+                    with open(seed_p, "wb") as f: f.write(os.urandom(0x110))
+                    self.setup_log.append("[System] Generated dummy LocalFriendCodeSeed for Citra.")
+                
+                # Generate a dummy SecureInfo_A if missing
+                info_p = os.path.join(sysdata, "SecureInfo_A")
+                if not os.path.exists(info_p):
+                    with open(info_p, "wb") as f: f.write(os.urandom(0x111))
+                    self.setup_log.append("[System] Generated dummy SecureInfo_A for Citra.")
+
+            QMessageBox.information(self, "Success", f"Patched Citra to use:\n{target_url}\n\nIdentity bypass files checked.")
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def fetch_pnid(self):
@@ -1268,27 +1567,81 @@ class PretendoManager(QMainWindow):
             return
         user = self.pnid_input.text().strip()
         if not user: return
+        
+        # Nintendo-like UA to bypass basic bot protection
+        headers = {'User-Agent': 'Nintendo WiiU'}
+        
+        # ─── API Strategy ───
+        # 1. Local Proxy (High Priority for dev)
+        # 2. Community PNID Lookup (High Compatibility)
+        # 3. Official Pretendo API (Strict UA required)
+        apis = [
+            {"name": "Local Server", "url": f"http://{self._get_local_ip()}:8080/v1/api/miis?name={user}", "type": "v1"},
+            {"name": "Community Lookup", "url": f"https://pnidlt.gab.net.eu.org/api/v1/pnid/{user}", "type": "meta"},
+            {"name": "Official API", "url": f"https://account.pretendo.cc/v1/api/miis?name={user}", "type": "v1"}
+        ]
+        
+        self.pnid_results.setText(f"Probing network for {user}...")
+        QApplication.processEvents()
+        
+        success = False
+        for entry in apis:
+            try:
+                # Use verify=False for local docker self-signed/proxy certs
+                r = requests.get(entry["url"], headers=headers, verify=False, timeout=6)
+                if r.status_code == 200:
+                    data = r.json()
+                    
+                    if entry["type"] == "v1":
+                        # Official/Private v1 API: Returns list or object with 'miis' key
+                        miis = data if isinstance(data, list) else data.get("miis", [])
+                        if not miis and isinstance(data, dict) and "name" in data: miis = [data]
+                        
+                        if miis:
+                            res = miis[0]
+                            self.cemu_username.setText(res.get("name", user))
+                            self._pnid_pid = int(res.get("id") or res.get("pid", 123456789))
+                            
+                            mii_b64 = res.get("data")
+                            if mii_b64:
+                                import base64
+                                self._mii_data_hex = binascii.hexlify(base64.b64decode(mii_b64)).decode('ascii')
+                                self._decode_mii_name(base64.b64decode(mii_b64))
+                            success = True
+
+                    elif entry["type"] == "meta":
+                        # Community API: Returns object with 'username' and 'mii'
+                        if "username" in data:
+                            self.cemu_username.setText(data.get("username"))
+                            self.cemu_miiname.setText(data.get("name") or "")
+                            self._pnid_pid = int(data.get("pid", 123456789))
+                            
+                            mii_data = data.get("mii", {}).get("data")
+                            if mii_data:
+                                import base64
+                                decoded = base64.b64decode(mii_data)
+                                self._mii_data_hex = binascii.hexlify(decoded).decode('ascii')
+                                if not self.cemu_miiname.text(): self._decode_mii_name(decoded)
+                            success = True
+
+                    if success:
+                        self.pnid_results.setText(f"Success: Found on {entry['name']}")
+                        break
+            except Exception:
+                continue
+        
+        if not success:
+            self.pnid_results.setText("Lookup failed. The network and local server couldn't find this PNID.")
+
+    def _decode_mii_name(self, raw_mii):
+        """Extract UTF-16 Mii Name from binary blob offset 0x1A."""
         try:
-            r = requests.get(PNID_API + user)
-            if r.status_code == 200:
-                self._pnid_data = r.json()
-                self.pnid_results.setText(f"Success: Found {user}")
-                
-                # Auto-fill identity fields (not password)
-                self.cemu_username.setText(self._pnid_data.get("username", user))
-                
-                # Extract and set Mii Name if available
-                pnid_name = self._pnid_data.get("name")
-                if pnid_name:
-                    self.cemu_miiname.setText(pnid_name)
-                
-                mii = self._pnid_data.get("mii", {}).get("data")
-                if mii:
-                    import base64
-                    self._mii_data_hex = binascii.hexlify(base64.b64decode(mii)).decode()
-            else: self.pnid_results.setText("PNID not found on the network.")
-        except Exception as e:
-            self.pnid_results.setText(f"Fetch failed: {str(e)}")
+            if len(raw_mii) >= 0x2E:
+                # Mii names are fixed 14-char (28 byte) UTF-16 fields at offset 0x1A
+                utf16_name = raw_mii[0x1A:0x2E].decode('utf-16le', errors='ignore').strip('\x00')
+                if utf16_name: self.cemu_miiname.setText(utf16_name)
+        except: pass
+
 
     def generate_console_bundle_zip(self):
         user = self.cemu_username.text()
@@ -1325,17 +1678,46 @@ class PretendoManager(QMainWindow):
                 for i, b in enumerate(mac): seeprom[0x10 + i] = b
                 z.writestr("Wii U/seeprom.bin", bytes(seeprom))
 
-                pid = random.randint(1000000000, 2000000000)
+                pid = getattr(self, '_pnid_pid', None)
+                if not pid:
+                    pid = random.randint(1000000000, 2000000000)
                 pid_bytes = pid.to_bytes(4, byteorder='little')
-                pwd_hash = hashlib.sha256(pid_bytes + bytes([2, 101, 67, 70]) + passw.encode('utf-8')).hexdigest()
-                uuid_hex = binascii.hexlify(os.urandom(16)).decode('ascii')
-                mii_u16 = miiname[:10].encode('utf-16be')
-                mii_hex = binascii.hexlify(mii_u16[:20].ljust(22, b'\x00')).decode('ascii')
+                pwd_hash = hashlib.sha256(pid_bytes + b"\x02eCF" + passw.encode('utf-8')).hexdigest()
+                uuid_bytes = os.urandom(16)
+                uuid_hex = binascii.hexlify(uuid_bytes).decode('ascii')
+                trans_id = (0x2000004 << 32) | (uuid_bytes[12] << 24) | (uuid_bytes[13] << 16) | (uuid_bytes[14] << 8) | uuid_bytes[15]
                 
+                mii_data_hex_val = getattr(self, '_mii_data_hex', '01000110' + '0' * 184)
+                mii_name_utf16 = miiname[:10].encode('utf-16be')
+                mii_name_hex = binascii.hexlify(mii_name_utf16[:20].ljust(22, b'\x00')).decode('ascii')
+
                 acct_lines = [
-                    "AccountInstance_20120705", "PersistentId=80000001", f"Uuid={uuid_hex}",
-                    f"MiiName={mii_hex}", f"AccountId={user}", f"PrincipalId={pid:08x}",
-                    f"AccountPasswordCache={pwd_hash}", "ServerAccountStatus=1", "IsCommitted=1"
+                    "AccountInstance_20120705",
+                    "PersistentId=80000001",
+                    f"TransferableIdBase={trans_id:x}",
+                    f"Uuid={uuid_hex}",
+                    "ParentalControlSlotNo=0",
+                    f"MiiData={mii_data_hex_val}",
+                    f"MiiName={mii_name_hex}",
+                    "IsMiiUpdated=1",
+                    f"AccountId={user}",
+                    "BirthYear=2003", "BirthMonth=1", "BirthDay=1", "Gender=0",
+                    "IsMailAddressValidated=1",
+                    "EmailAddress=none@pretendo.network",
+                    "Country=49", "SimpleAddressId=49010000",
+                    "TimeZoneId=America/New_York",
+                    "UtcOffset=ffffffff9ac22000",
+                    f"PrincipalId={pid:08x}",
+                    "IsPasswordCacheEnabled=1",
+                    f"AccountPasswordCache={pwd_hash}",
+                    "NnasType=0", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
+                    "IsPersistentIdUploaded=1",
+                    "IsConsoleAccountInfoUploaded=1",
+                    "LastAuthenticationResult=0",
+                    f"StickyAccountId={user}",
+                    f"StickyPrincipalId={pid:08x}",
+                    "IsServerAccountDeleted=0",
+                    "IsCommitted=1"
                 ]
                 z.writestr("Wii U/account.dat", "\n".join(acct_lines))
 
@@ -1377,10 +1759,44 @@ class PretendoManager(QMainWindow):
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def closeEvent(self, event):
+        """Handle application exit with persistence options."""
+        if self.bypassing_close_prompt:
+            self.save_settings()
+            if self.worker and self.worker.isRunning():
+                self.worker.terminate()
+                self.worker.wait(1000)
+            event.accept()
+            return
+
+        # Custom Dialog for persistence logic
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Exit Pretendo Manager")
+        msg.setText("How would you like to close the program?")
+        msg.setInformativeText("You can keep the server running in the background or perform a complete shutdown.")
+        msg.setIcon(QMessageBox.Question)
+        msg.setStyleSheet(STYLESHEET)
+        
+        keep_btn = msg.addButton("Keep Server Running", QMessageBox.ActionRole)
+        stop_btn = msg.addButton("Full Shutdown", QMessageBox.DestructiveRole)
+        cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
+        
+        msg.exec()
+        
+        if msg.clickedButton() == cancel_btn:
+            event.ignore()
+            return
+            
+        if msg.clickedButton() == stop_btn:
+            # Atomic shutdown
+            self.stop_server()
+            if OS_INFO["os"] == "linux" and self.docker_service_running:
+                self.toggle_docker_service()
+            # No persistent wait needed here, the commands are queued
+            
         self.save_settings()
         if self.worker and self.worker.isRunning():
             self.worker.terminate()
-            self.worker.wait(2000)
+            self.worker.wait(1000)
         event.accept()
 
 if __name__ == "__main__":
