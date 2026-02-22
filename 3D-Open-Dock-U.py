@@ -12,6 +12,14 @@ import re
 import socket
 import zipfile
 import io
+import shlex
+
+try:
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, hard), hard))
+except Exception:
+    pass
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -32,9 +40,8 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 APP_NAME = "3D Open Dock U"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 PRETENDO_REPO = "https://github.com/MatthewL246/pretendo-docker.git"
-PNID_API = "https://pnidlt.gab.net.eu.org/api/v1/pnid/"
 
 def detect_os_info():
     """Detect OS, package manager, and default emulator paths."""
@@ -312,8 +319,12 @@ class PretendoManager(QMainWindow):
         
         # Load the new password field if remembered
         if self.cached_password:
-            self.server_sudo_pass.setText(str(self.cached_password))
+            self.server_sudo_pass.blockSignals(True)
+            self.server_remember_pass.blockSignals(True)
             self.server_remember_pass.setChecked(True)
+            self.server_sudo_pass.setText(str(self.cached_password))
+            self.server_sudo_pass.blockSignals(False)
+            self.server_remember_pass.blockSignals(False)
             
         self.refresh_vault_list()
 
@@ -326,6 +337,7 @@ class PretendoManager(QMainWindow):
         
         if self.server_remember_pass.isChecked() and self.server_sudo_pass.text().strip():
              self.settings.setValue("sudo_cache", self.server_sudo_pass.text().strip())
+             self.cached_password = self.server_sudo_pass.text().strip()
         else:
              self.settings.remove("sudo_cache")
              self.cached_password = None
@@ -365,16 +377,6 @@ class PretendoManager(QMainWindow):
         self.ip_info.setStyleSheet(f"color: {CYAN_LIGHT}; font-size: 16px;")
         self.ip_info.setAlignment(Qt.AlignCenter)
         glay.addWidget(self.ip_info)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Admin Pass:"))
-        self.server_sudo_pass = QLineEdit()
-        self.server_sudo_pass.setEchoMode(QLineEdit.Password)
-        row.addWidget(self.server_sudo_pass)
-        self.server_remember_pass = QCheckBox("Remember")
-        self.server_remember_pass.stateChanged.connect(lambda: setattr(self, 'cached_password', self.server_sudo_pass.text() if self.server_remember_pass.isChecked() else None))
-        row.addWidget(self.server_remember_pass)
-        glay.addLayout(row)
 
         self.server_toggle_btn = QPushButton("START SERVER")
         self.server_toggle_btn.setObjectName("startBtn")
@@ -422,20 +424,16 @@ class PretendoManager(QMainWindow):
         row_dir.addWidget(self.server_dir_field)
         dlay.addLayout(row_dir)
 
-        row_dl = QHBoxLayout()
-        row_dl.addWidget(QPushButton("1. Download Stack", clicked=self.clone_pretendo))
-        row_dl.addWidget(QPushButton("2. Build Images", clicked=self.build_pretendo))
-        row_dl.addWidget(QPushButton("Clear Logs", clicked=lambda: self.setup_log.clear()))
-        dlay.addLayout(row_dl)
+        self.deploy_stack_btn = QPushButton("Deploy Server Stack (Automated Setup)", clicked=self.automated_install_stack)
+        self.deploy_stack_btn.setMinimumHeight(40)
+        self.deploy_stack_btn.setStyleSheet(f"background: {CYAN_DARK}; color: white; font-weight: bold;")
+        dlay.addWidget(self.deploy_stack_btn)
 
-        if OS_INFO["os"] == "linux":
-            dlay.addWidget(QPushButton("3. Run Deep Setup (Fix Env)", clicked=self.run_pretendo_setup))
-            row_sys = QHBoxLayout()
-            row_sys.addWidget(QPushButton("Fix Perms", clicked=self.fix_docker_permissions))
-            row_sys.addWidget(QPushButton("Buildx", clicked=self.install_buildx))
-            row_sys.addWidget(QPushButton("Inject Cemu Keys", clicked=self.inject_cemu_keys))
-            dlay.addLayout(row_sys)
-            
+        row_sys = QHBoxLayout()
+        row_sys.addWidget(QPushButton("Fix Perms", clicked=self.fix_docker_permissions))
+        row_sys.addWidget(QPushButton("Clear Logs", clicked=lambda: self.setup_log.clear()))
+        dlay.addLayout(row_sys)
+
         rv.addWidget(dep)
         
         self.setup_log = QTextEdit(objectName="logBox")
@@ -474,18 +472,16 @@ class PretendoManager(QMainWindow):
         crgl.addLayout(form)
         
         p_row = QHBoxLayout()
-        self.pnid_input = QLineEdit()
-        self.pnid_input.setPlaceholderText("Enter PNID...")
-        p_row.addWidget(self.pnid_input)
-        self.pnid_fetch_btn = QPushButton("Fetch Web API", clicked=self.fetch_pnid)
-        p_row.addWidget(self.pnid_fetch_btn)
+        self.create_account_btn = QPushButton("Register Database Account", clicked=self.create_local_account)
+        self.create_account_btn.setStyleSheet(f"background: {CYAN_DARK}; color: white; padding: 10px; font-weight: bold; border-radius: 8px;")
+        p_row.addWidget(self.create_account_btn)
+        
+        self.bundle_btn = QPushButton("Gen Console Zip", objectName="patchBtn", clicked=self.generate_console_bundle_zip)
+        self.bundle_btn.setStyleSheet(f"padding: 10px; font-weight: bold; border-radius: 8px;")
+        p_row.addWidget(self.bundle_btn)
         crgl.addLayout(p_row)
         
-        self.pnid_results = QLabel("Search PNID to load Mii/PID automatically.")
-        self.pnid_results.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
-        crgl.addWidget(self.pnid_results)
-        
-        crgl.addWidget(QPushButton("Generate Unified Identity Bundle", objectName="patchBtn", clicked=self.generate_console_bundle_zip))
+
         self.cemu_log = QTextEdit(objectName="logBox")
         self.cemu_log.setReadOnly(True)
         self.cemu_log.setMaximumHeight(80)
@@ -1046,11 +1042,11 @@ class PretendoManager(QMainWindow):
             return pw
         return None
 
-    def _run_command(self, cmd, log_widget, cwd=None, on_done=None, stdin_data=None):
+    def _run_command(self, cmd, log_widget, cwd=None, on_done=None, stdin_data=None, display_cmd=None):
         if self.worker and self.worker.isRunning(): return
         
         # Technical stylized command output
-        clean_cmd = cmd.replace(stdin_data, "********") if stdin_data else cmd
+        clean_cmd = display_cmd if display_cmd else (cmd.replace(stdin_data, "********") if stdin_data else cmd)
         log_widget.append(f"<b>[EXEC]</b> <span style='color:{CYAN_PRIMARY};'>guest@pretendo-manager:</span> <span style='color:white;'>{clean_cmd}</span>")
         
         if stdin_data:
@@ -1102,6 +1098,10 @@ class PretendoManager(QMainWindow):
 
         s_dir = self.server_dir_field.text().strip()
         custom_port = self.host_port.text().strip()
+        if not custom_port.isdigit():
+            QMessageBox.warning(self, "Security Verification", "Warning: Port must be numeric to assign network bindings safely.")
+            return
+
         if not os.path.isdir(s_dir):
             QMessageBox.warning(self, "Error", "Server directory not found! Download the stack first.")
             return
@@ -1127,9 +1127,15 @@ class PretendoManager(QMainWindow):
         # Helper to finalize and kickstart mongo replica
         def _on_start(code):
             if OS_INFO["os"] == "linux" and s_dir:
-                 # Initialize the replica set if the container name matches
-                 cmd = "docker exec pretendo-network-mongodb-1 mongo --eval 'rs.initiate()' || true"
-                 subprocess.run(cmd, shell=True, cwd=s_dir)
+                # Initialize the replica set if the container name matches, with retries since Mongo takes time
+                 cmd = "for i in {1..15}; do docker exec pretendo-network-mongodb-1 mongo --eval 'rs.initiate()' && break; sleep 2; done;"
+                 
+                 # Initialize Postgres databases by executing the script if necessary
+                 cmd += " for i in {1..15}; do docker exec pretendo-network-postgres-1 sh -c 'chmod +x /docker-entrypoint-initdb.d/postgres-init.sh && /docker-entrypoint-initdb.d/postgres-init.sh' && break; sleep 2; done;"
+                 
+                 # Go applications fail their connections if DBs are not ready, and don't exit. Force restart them after boot.
+                 cmd += " sleep 10; docker compose restart friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss || true"
+                 subprocess.Popen(cmd, shell=True, cwd=s_dir)
             self._check_docker_status()
 
         if OS_INFO["os"] == "linux":
@@ -1137,19 +1143,21 @@ class PretendoManager(QMainWindow):
                 self.server_log.append("[System] Starting background services and clearing ports...")
                 # Start docker services + clear ports + docker compose
                 cmd = f"sudo -S bash -c 'systemctl start docker.socket docker.service; {fuser_cmd} || true'; docker compose up -d"
-                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=_on_start)
+                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=_on_start, display_cmd="[Elevated] Clean Ports & Start Framework")
             else:
                 self.server_log.append("[System] Starting server (Best-Effort Mode)...")
                 cmd = f"{fuser_cmd} || true; docker compose up -d"
-                self._run_command(cmd, self.server_log, s_dir, on_done=_on_start)
+                self._run_command(cmd, self.server_log, s_dir, on_done=_on_start, display_cmd="[Standard] Clean Ports & Start Framework")
         else:
-            self._run_command("docker compose up -d", self.server_log, s_dir, on_done=_on_start)
+            self._run_command("docker compose up -d", self.server_log, s_dir, on_done=_on_start, display_cmd="docker compose up -d")
 
     def stop_server(self):
         s_dir = self.server_dir_field.text().strip()
         if not os.path.isdir(s_dir): return
         
         custom_port = self.host_port.text().strip()
+        if not custom_port.isdigit(): return
+        
         ports = f"80 443 21 53 8080 {custom_port} 9231"
         # Optional fuser command for deep cleaning
         fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
@@ -1165,14 +1173,14 @@ class PretendoManager(QMainWindow):
             if pw:
                 self.server_log.append("[System] Stopping server and force-releasing ports (Secure-Fast-Track)...")
                 cmd = f"docker compose down; sudo -S bash -c 'systemctl stop docker.socket docker.service; {fuser_cmd} || true'"
-                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=lambda c: self._check_docker_status())
+                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=lambda c: self._check_docker_status(), display_cmd="[Elevated] Stop Framework & Clean Ports")
             else:
                 self.server_log.append("[System] Stopping server containers and clearing ports (Best-Effort)...")
                 # Try to kill what we can as current user, then docker down
                 cmd = f"{fuser_cmd} || true; docker compose down"
-                self._run_command(cmd, self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
+                self._run_command(cmd, self.server_log, s_dir, on_done=lambda c: self._check_docker_status(), display_cmd="[Standard] Stop Framework & Clean Ports")
         else:
-            self._run_command("docker compose down", self.server_log, s_dir, on_done=lambda c: self._check_docker_status())
+            self._run_command("docker compose down", self.server_log, s_dir, on_done=lambda c: self._check_docker_status(), display_cmd="docker compose down")
 
     def stream_docker_logs(self):
         s_dir = self.server_dir_field.text().strip()
@@ -1200,6 +1208,7 @@ class PretendoManager(QMainWindow):
 
         # Aggressive port cleaning logic
         custom_port = self.host_port.text().strip()
+        if not custom_port.isdigit(): return
         ports = f"80 443 21 53 8080 {custom_port} 9231"
         fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
 
@@ -1228,83 +1237,63 @@ class PretendoManager(QMainWindow):
             self.setup_log.append("[System] Activating Docker services...")
             self._run_command("sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: self._check_docker_status())
 
-    def clone_pretendo(self):
-        target = self.server_dir_field.text()
-        self._run_command(f"git clone --recurse-submodules {PRETENDO_REPO} {target}", self.setup_log)
-
-    def _check_port_conflicts(self):
-        """Check for common port conflicts and return a list of process descriptions."""
-        conflicts = []
-        c_port = 8080
-        try: c_port = int(self.host_port.text().strip())
-        except: pass
-        
-        for port in [80, 443, 8080, c_port, 53, 21]:
-            if port < 1: continue
-            try:
-                # Use lsof to find listeners on the port
-                res = subprocess.run(f"lsof -i :{port} -sTCP:LISTEN -t", shell=True, capture_output=True, text=True)
-                if res.stdout.strip():
-                    pids = sorted(list(set(res.stdout.strip().split('\n'))))
-                    for pid in pids:
-                        name_res = subprocess.run(f"ps -p {pid} -o comm=", shell=True, capture_output=True, text=True)
-                        name = name_res.stdout.strip()
-                        if name:
-                            conflicts.append(f"Port {port}: {name} (PID {pid})")
-            except: pass
-        return conflicts
+    def automated_install_stack(self):
+        """Combined multi-step workflow for deployment."""
+        s_dir = self.server_dir_field.text().strip()
+        if not os.path.isdir(s_dir):
+            reply = QMessageBox.question(self, "Proceed", f"Directory '{s_dir}' not found. Clone repository here?", QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.setup_log.append("[System] Cloning repository...")
+                self._run_command(f"git clone --recurse-submodules {PRETENDO_REPO} {shlex.quote(s_dir)}", self.setup_log, on_done=lambda c: self._continue_installation(c))
+        else:
+            self._continue_installation(0)
+            
+    def _continue_installation(self, code):
+        if code != 0: return
+        self.setup_log.append("\n[System] Stack downloaded. Initiating Deep Config...")
+        self.run_pretendo_setup()
 
     def run_pretendo_setup(self):
         """Run the official Pretendo setup script in non-interactive mode."""
         s_dir = self.server_dir_field.text().strip()
         if not os.path.isdir(s_dir):
-            QMessageBox.warning(self, "Error", "Server directory not found. Download the stack first.")
             return
 
-        # 1. Patch the port AUTOMATICALLY before setup
         custom_port = self.host_port.text().strip()
+        if not custom_port.isdigit(): return
         self._apply_compose_patches(custom_port, s_dir)
 
-        # 2. Check for conflicts
         conflicts = self._check_port_conflicts()
         if conflicts:
-            msg = "Warning: The following processes are using ports required by the server:\n\n" + \
-                  "\n".join(conflicts) + \
-                  "\n\nClose these applications (especially Steam) before continuing, or they may be force-killed."
-            if QMessageBox.warning(self, "Port Conflicts Detected", msg, QMessageBox.Ok | QMessageBox.Cancel) == QMessageBox.Cancel:
+            msg = "Warning: Setup conflicts detected:\n" + "\n".join(conflicts) + "\n\nThese will be force-killed."
+            if QMessageBox.warning(self, "Conflicts", msg, QMessageBox.Ok | QMessageBox.Cancel) == QMessageBox.Cancel:
                 return
             
         local_ip = self._get_local_ip()
-        # Aggressive port killing including the custom port
-        # We use -n tcp and -k to be more thorough
         ports_to_kill = f"80 443 21 53 8080 {custom_port} 9231"
         
-        # We need sudo to kill ports like 80/443
-        pw = self._ask_sudo_password()
-        if not pw: return
+        pw = None
+        if OS_INFO["os"] == "linux":
+            pw = self._ask_sudo_password()
+            if not pw: return
 
-        # Pre-cleanup ports AND remove orphans to avoid 'address already in use' errors
         self.setup_log.append("[System] Wiping port conflicts and removing old containers...")
-        # Note: we use ; instead of && so setup.sh runs even if docker down fails due to missing net
-        # Use a more aggressive fuser command: fuser -k -n tcp <port>
         fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports_to_kill.split()])
-        fuser_cmd += "; " + "; ".join([f"fuser -k -n udp {p}" for p in ["53", "9231"]])
         
         cmd = f"docker compose down --remove-orphans; sudo -S bash -c '{fuser_cmd} || true' && ./setup.sh --force --server-ip {local_ip}"
         
         self.setup_log.append(f"[System] Starting comprehensive setup with IP: {local_ip}...")
         self._run_command(cmd, self.setup_log, cwd=s_dir, stdin_data=pw, 
-                          on_done=lambda c: QMessageBox.information(self, "Setup", "Setup script finished!") if c == 0 else None)
+                          on_done=lambda c: self._post_setup_build(c))
 
-    def build_pretendo(self):
-        def _do_build():
-            t = self.server_dir_field.text()
-            self._run_command("docker compose build", self.setup_log, cwd=t)
-        
+    def _post_setup_build(self, code):
+        if code != 0: return
+        self.setup_log.append("\n[System] Deep Config Complete. Orchestrating container build process...")
+        t = self.server_dir_field.text().strip()
         if OS_INFO["os"] == "linux":
-            self._ensure_docker_active(_do_build)
+            self._ensure_docker_active(lambda: self._run_command("docker compose build", self.setup_log, cwd=t, on_done=lambda c: QMessageBox.information(self, "Success", "Full Stack Deployment Finished! Ready to boot.")))
         else:
-            _do_build()
+             self._run_command("docker compose build", self.setup_log, cwd=t, on_done=lambda c: QMessageBox.information(self, "Success", "Full Stack Deployment Finished! Ready to boot."))
 
     def _ensure_docker_active(self, on_ready):
         """Ensure Docker service is running on Linux before proceeding."""
@@ -1315,24 +1304,13 @@ class PretendoManager(QMainWindow):
                 return
         except: pass
         
-        pw = self._ask_sudo_password()
-        if not pw: return
+        pw = None
+        if OS_INFO["os"] == "linux":
+            pw = self._ask_sudo_password()
+            if not pw: return
+            
         self.setup_log.append("[System] Resetting and starting Docker services...")
         self._run_command("sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: on_ready() if c == 0 else None)
-
-    def clear_sensitive_data(self):
-        """Wipe passwords (including sudo), usernames, and miinames from the UI, cache, and disk."""
-        res = QMessageBox.warning(self, "Clear Data", "This will permanently wipe your saved credentials, identity info, and admin password. Proceed?", QMessageBox.Yes | QMessageBox.No)
-        if res == QMessageBox.Yes:
-            self.cached_password = None
-            self.cemu_username.clear()
-            self.cemu_password.clear()
-            self.cemu_miiname.clear()
-            self.server_sudo_pass.clear()
-            self.server_remember_pass.setChecked(False)
-            self.settings.clear()
-            self.settings.sync()
-            QMessageBox.information(self, "Data Wiped", "All sensitive data and administrator credentials have been permanently cleared.")
 
     def fix_docker_permissions(self):
         """Fix Docker socket permissions on Linux."""
@@ -1349,19 +1327,98 @@ class PretendoManager(QMainWindow):
         
         self._ensure_docker_active(_do_fix)
 
-    def install_buildx(self):
-        """Install Docker Buildx plugin."""
-        def _do_install():
-            if not OS_INFO.get("pkg_mgr"):
-                QMessageBox.warning(self, "Error", "No supported package manager found (pacman, apt, dnf).")
-                return
-            pw = self._ask_sudo_password()
-            if not pw: return
-            pkg = "docker-buildx-plugin" if OS_INFO["pkg_mgr"] == "apt" else "docker-buildx"
-            cmd = f"sudo -S {OS_INFO['pkg_install'].replace('docker docker-compose', pkg)}"
-            self._run_command(cmd, self.setup_log, stdin_data=pw)
+    def clear_sensitive_data(self):
+        """Wipe passwords (including sudo), usernames, and miinames from the UI, cache, and disk."""
+        res = QMessageBox.warning(self, "Clear Data", "This will permanently wipe your saved credentials, identity info, and admin password. Proceed?", QMessageBox.Yes | QMessageBox.No)
+        if res == QMessageBox.Yes:
+            self.cached_password = None
+            self.cemu_username.clear()
+            self.cemu_password.clear()
+            self.cemu_miiname.clear()
+            self.server_sudo_pass.clear()
+            self.server_remember_pass.setChecked(False)
+            self.settings.clear()
+            self.settings.sync()
+            QMessageBox.information(self, "Data Wiped", "All sensitive data and administrator credentials have been permanently cleared.")
 
-        self._ensure_docker_active(_do_install)
+    def create_local_account(self):
+        """Execute a node.js script inside the container to inject an account."""
+        username = self.cemu_username.text().strip()
+        password = self.cemu_password.text()
+        miiname = self.cemu_miiname.text().strip() or "Player"
+        
+        if not username or not password or not username.isalnum():
+            QMessageBox.warning(self, "Input Error", "Please provide a valid alphanumeric Username and a Password.")
+            return
+            
+        if not self.server_running:
+            QMessageBox.warning(self, "Network Error", "The Pretendo Server must be RUNNING (ONLINE) to create an account in the database.")
+            return
+
+        js_script = f"""
+const {{ connect }} = require("./dist/database");
+const {{ PNID }} = require("./dist/models/pnid");
+const {{ nintendoPasswordHash }} = require("./dist/util");
+const crypto = require("crypto");
+
+(async () => {{
+    try {{
+        await connect();
+        const username = "{username}";
+        const pass = "{password}";
+        const miiName = "{miiname}";
+        const email = username + "@pretendo.local";
+
+        let user = await PNID.findOne({{ usernameLower: username.toLowerCase() }});
+        if (user) {{
+            console.log("[Notice] " + username + " is already registered.");
+            process.exit(0);
+        }}
+
+        const pid = Math.floor(Math.random() * 1000000000) + 1000000000;
+        const hashedPw = await nintendoPasswordHash(pass, pid);
+        const miiDataHex = "010001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+
+        user = new PNID({{
+            pid: pid,
+            creation_date: new Date(),
+            updated_at: new Date(),
+            username: username,
+            usernameLower: username.toLowerCase(),
+            password: hashedPw,
+            birthdate: "2000-01-01",
+            gender: "M",
+            country: "US",
+            language: "en",
+            email: {{ address: email, validated: true }},
+            mii: {{
+                name: miiName,
+                primary: true,
+                data: Buffer.from(miiDataHex, "hex").toString("base64"),
+                hash: crypto.randomBytes(16).toString("hex"),
+                id: crypto.randomBytes(4).readUInt32BE(0),
+                image_url: "",
+                author: miiName
+            }},
+            flags: {{ active: true, is_admin: true, is_dev: true }},
+            access_level: 2
+        }});
+
+        await user.save();
+        console.log("[Success] User " + username + " injected with Admin privileges! PID: " + pid);
+        process.exit(0);
+    }} catch(e) {{
+        console.error(e);
+        process.exit(1);
+    }}
+}})();
+"""
+        s_dir = self.server_dir_field.text().strip()
+        cmd = f"docker exec -i pretendo-network-account-1 node -e '{js_script}'"
+        
+        self.cemu_log.append("[System] Injecting Account into Local Service Layer...")
+        self._run_command(cmd, self.cemu_log, cwd=s_dir, on_done=lambda c: QMessageBox.information(self, "Registration", f"Account '{username}' Registration task completed!") if c == 0 else None)
+
 
     def patch_cemu_settings(self, url):
         # Dynamically resolve localhost if needed
@@ -1561,86 +1618,7 @@ class PretendoManager(QMainWindow):
             QMessageBox.information(self, "Success", f"Patched Citra to use:\n{target_url}\n\nIdentity bypass files checked.")
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
-    def fetch_pnid(self):
-        if not HAS_REQUESTS:
-            QMessageBox.warning(self, "Missing Dependency", "The 'requests' Python library is not installed.\nInstall it with: pip install requests")
-            return
-        user = self.pnid_input.text().strip()
-        if not user: return
-        
-        # Nintendo-like UA to bypass basic bot protection
-        headers = {'User-Agent': 'Nintendo WiiU'}
-        
-        # ─── API Strategy ───
-        # 1. Local Proxy (High Priority for dev)
-        # 2. Community PNID Lookup (High Compatibility)
-        # 3. Official Pretendo API (Strict UA required)
-        apis = [
-            {"name": "Local Server", "url": f"http://{self._get_local_ip()}:8080/v1/api/miis?name={user}", "type": "v1"},
-            {"name": "Community Lookup", "url": f"https://pnidlt.gab.net.eu.org/api/v1/pnid/{user}", "type": "meta"},
-            {"name": "Official API", "url": f"https://account.pretendo.cc/v1/api/miis?name={user}", "type": "v1"}
-        ]
-        
-        self.pnid_results.setText(f"Probing network for {user}...")
-        QApplication.processEvents()
-        
-        success = False
-        for entry in apis:
-            try:
-                # Use verify=False for local docker self-signed/proxy certs
-                r = requests.get(entry["url"], headers=headers, verify=False, timeout=6)
-                if r.status_code == 200:
-                    data = r.json()
-                    
-                    if entry["type"] == "v1":
-                        # Official/Private v1 API: Returns list or object with 'miis' key
-                        miis = data if isinstance(data, list) else data.get("miis", [])
-                        if not miis and isinstance(data, dict) and "name" in data: miis = [data]
-                        
-                        if miis:
-                            res = miis[0]
-                            self.cemu_username.setText(res.get("name", user))
-                            self._pnid_pid = int(res.get("id") or res.get("pid", 123456789))
-                            
-                            mii_b64 = res.get("data")
-                            if mii_b64:
-                                import base64
-                                self._mii_data_hex = binascii.hexlify(base64.b64decode(mii_b64)).decode('ascii')
-                                self._decode_mii_name(base64.b64decode(mii_b64))
-                            success = True
 
-                    elif entry["type"] == "meta":
-                        # Community API: Returns object with 'username' and 'mii'
-                        if "username" in data:
-                            self.cemu_username.setText(data.get("username"))
-                            self.cemu_miiname.setText(data.get("name") or "")
-                            self._pnid_pid = int(data.get("pid", 123456789))
-                            
-                            mii_data = data.get("mii", {}).get("data")
-                            if mii_data:
-                                import base64
-                                decoded = base64.b64decode(mii_data)
-                                self._mii_data_hex = binascii.hexlify(decoded).decode('ascii')
-                                if not self.cemu_miiname.text(): self._decode_mii_name(decoded)
-                            success = True
-
-                    if success:
-                        self.pnid_results.setText(f"Success: Found on {entry['name']}")
-                        break
-            except Exception:
-                continue
-        
-        if not success:
-            self.pnid_results.setText("Lookup failed. The network and local server couldn't find this PNID.")
-
-    def _decode_mii_name(self, raw_mii):
-        """Extract UTF-16 Mii Name from binary blob offset 0x1A."""
-        try:
-            if len(raw_mii) >= 0x2E:
-                # Mii names are fixed 14-char (28 byte) UTF-16 fields at offset 0x1A
-                utf16_name = raw_mii[0x1A:0x2E].decode('utf-16le', errors='ignore').strip('\x00')
-                if utf16_name: self.cemu_miiname.setText(utf16_name)
-        except: pass
 
 
     def generate_console_bundle_zip(self):
