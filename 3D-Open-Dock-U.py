@@ -385,7 +385,6 @@ class PretendoManager(QMainWindow):
         self.cemu_username.blockSignals(True)
         self.cemu_password.blockSignals(True)
         self.cemu_miiname.blockSignals(True)
-        if hasattr(self, 'host_port'): self.host_port.blockSignals(True)
         if hasattr(self, 'server_sudo_pass'): self.server_sudo_pass.blockSignals(True)
         if hasattr(self, 'cemu_dir_field'): self.cemu_dir_field.blockSignals(True)
         if hasattr(self, 'citra_dir_field'): self.citra_dir_field.blockSignals(True)
@@ -398,8 +397,6 @@ class PretendoManager(QMainWindow):
             self.cemu_password.setText(dec_pw)
             
             self.cemu_miiname.setText(str(self.settings.value("miiname", "")))
-            if hasattr(self, 'host_port'):
-                self.host_port.setText(str(self.settings.value("host_port", "8070")))
             
             if hasattr(self, 'cemu_dir_field'):
                 self.cemu_dir_field.setText(str(self.settings.value("cemu_dir", CEMU_DIR)))
@@ -419,7 +416,6 @@ class PretendoManager(QMainWindow):
             self.cemu_username.blockSignals(False)
             self.cemu_password.blockSignals(False)
             self.cemu_miiname.blockSignals(False)
-            if hasattr(self, 'host_port'): self.host_port.blockSignals(False)
             if hasattr(self, 'server_sudo_pass'): self.server_sudo_pass.blockSignals(False)
             if hasattr(self, 'cemu_dir_field'): self.cemu_dir_field.blockSignals(False)
             if hasattr(self, 'citra_dir_field'): self.citra_dir_field.blockSignals(False)
@@ -445,8 +441,6 @@ class PretendoManager(QMainWindow):
         self.settings.setValue("password", _obs(self.cemu_password.text()))
         self.settings.setValue("miiname", self.cemu_miiname.text())
         
-        if hasattr(self, 'host_port'):
-            self.settings.setValue("host_port", self.host_port.text())
         if hasattr(self, 'cemu_dir_field'):
             self.settings.setValue("cemu_dir", self.cemu_dir_field.text())
         if hasattr(self, 'citra_dir_field'):
@@ -463,6 +457,20 @@ class PretendoManager(QMainWindow):
         if mii_h: self.settings.setValue("mii_hex", mii_h)
         
         self.settings.sync()
+
+    def _get_target_port(self):
+        """Extract port from the patch URL input, fallback to 8070."""
+        text = self.patch_url_input.text().strip()
+        if not text:
+            return "8070"
+        # Match :port at the end or before a path
+        match = re.search(r":(\d+)(?:/|$)", text)
+        if match:
+            return match.group(1)
+        # Default web ports if not specified
+        if text.startswith("https:"):
+            return "443"
+        return "80"
 
     def _get_local_ip(self):
         """Robust IP detection trying multiple targets to avoid false offline status."""
@@ -695,13 +703,6 @@ class PretendoManager(QMainWindow):
         
         rv.addWidget(vault)
         
-        port_group = QGroupBox("Port Control & Network Adjustments")
-        play = QFormLayout(port_group)
-        self.host_port = QLineEdit("8070")
-        self.apply_port_btn = QPushButton("Sync Custom Port", clicked=self.apply_port_tuning)
-        play.addRow("Mitmproxy Binding:", self.host_port)
-        play.addRow(self.apply_port_btn)
-        rv.addWidget(port_group)
         
         n_row = QHBoxLayout()
         nintendo_btn = QPushButton("Restore Nintendo Services", clicked=self.restore_nintendo_official)
@@ -745,10 +746,10 @@ class PretendoManager(QMainWindow):
             </ol>
 
             <h2 style='color:{CYAN_PRIMARY};'>Phase 3: Network & Ports</h2>
-            <p>Steam often uses port <b>8080</b>, which clashes with Pretendo. We have automatically tuned your 
-            installation to use port <b>8070</b> to avoid crashes.</p>
+            <p>Steam often uses port <b>8080</b>, which clashes with Pretendo. We automatically adapt your 
+            installation to use the port specified in the <b>Target Node URL</b> (default 8070) to avoid crashes.</p>
             <ul>
-                <li>When patching your emulator, use: <code>http://localhost:8070</code></li>
+                <li>When patching your emulator, ensure the URL matches your server IP and Port.</li>
                 <li>The <i>Start Server</i> button will automatically clear any port conflicts before launching.</li>
             </ul>
 
@@ -1013,9 +1014,12 @@ class PretendoManager(QMainWindow):
                         # Heuristic: if we see a non-indented or new service, we might be out of mitmproxy
                         if not line.startswith(" ") and line.strip() != "": in_mitm = False
                     
-                    if in_mitm and "8080:8080" in line:
-                        line = line.replace("8080:8080", f"{port}:8080")
-                        changed = True
+                    if in_mitm and ":8080" in line:
+                        # Robustly replace any port mapping to internal 8080
+                        new_line = re.sub(r'(\d+):8080', f"{port}:8080", line)
+                        if new_line != line:
+                            line = new_line
+                            changed = True
                         
                     if "image: mongo:latest" in line:
                         line = line.replace("mongo:latest", "mongo:4.4")
@@ -1029,14 +1033,6 @@ class PretendoManager(QMainWindow):
             except: pass
         return False
 
-    def apply_port_tuning(self):
-        port = self.host_port.text().strip()
-        s_dir = self.server_dir_field.text().strip()
-        if self._apply_compose_patches(port, s_dir):
-             self.save_settings()
-             QMessageBox.information(self, "Success", f"Port updated to {port}.\nRestart server to apply.")
-        else:
-             QMessageBox.warning(self, "Error", "Could not find or patch compose file. Is the stack downloaded?")
 
     def run_setup_check(self):
         """Perform a deep system audit for dependencies and configuration."""
@@ -1271,7 +1267,7 @@ class PretendoManager(QMainWindow):
         """Blocking shutdown: kills containers, stops Docker, terminates workers. ALWAYS succeeds."""
         s_dir = self.server_dir_field.text().strip()
         pw = self.cached_password or (self.server_sudo_pass.text().strip() if hasattr(self, 'server_sudo_pass') else None)
-        custom_port = self.host_port.text().strip() if self.host_port.text().strip().isdigit() else "8070"
+        custom_port = self._get_target_port()
 
         if show_progress:
             self.statusBar().showMessage("FORCE SHUTDOWN IN PROGRESS — DO NOT CLOSE...")
@@ -1347,7 +1343,7 @@ class PretendoManager(QMainWindow):
             return
 
         s_dir = self.server_dir_field.text().strip()
-        custom_port = self.host_port.text().strip()
+        custom_port = self._get_target_port()
         if not custom_port.isdigit():
             QMessageBox.warning(self, "Security Verification", "Warning: Port must be numeric to assign network bindings safely.")
             return
@@ -1377,15 +1373,16 @@ class PretendoManager(QMainWindow):
         # Helper to finalize and kickstart mongo replica
         def _on_start(code):
             if OS_INFO["os"] == "linux" and s_dir:
-                # Initialize the replica set if the container name matches, with retries since Mongo takes time
-                 cmd = "for i in {1..15}; do docker exec pretendo-network-mongodb-1 mongo --eval 'rs.initiate()' && break; sleep 2; done;"
-                 
-                 # Initialize Postgres databases by executing the script if necessary
-                 cmd += " for i in {1..15}; do docker exec pretendo-network-postgres-1 sh -c 'chmod +x /docker-entrypoint-initdb.d/postgres-init.sh && /docker-entrypoint-initdb.d/postgres-init.sh' && break; sleep 2; done;"
-                 
-                 # Go applications fail their connections if DBs are not ready, and don't exit. Force restart them after boot.
-                 cmd += " sleep 10; docker compose restart friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss || true"
-                 subprocess.Popen(cmd, shell=True, cwd=s_dir)
+                # Initialize the replica set using service names, with retries since Mongo takes time
+                exec_prefix = "sudo -S " if pw else ""
+                cmd = f"for i in {{1..15}}; do {exec_prefix}docker compose exec -T mongodb mongo --eval 'rs.initiate()' && break; sleep 2; done;"
+                
+                # Initialize Postgres databases by executing the script if necessary
+                cmd += f" for i in {{1..15}}; do {exec_prefix}docker compose exec -T postgres sh -c 'chmod +x /docker-entrypoint-initdb.d/postgres-init.sh && /docker-entrypoint-initdb.d/postgres-init.sh' && break; sleep 2; done;"
+                
+                # Go applications fail their connections if DBs are not ready, and don't exit. Force restart them after boot.
+                cmd += " sleep 10; docker compose restart friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss || true"
+                subprocess.Popen(cmd, shell=True, cwd=s_dir)
             self._check_docker_status()
 
         if OS_INFO["os"] == "linux":
@@ -1405,7 +1402,7 @@ class PretendoManager(QMainWindow):
         s_dir = self.server_dir_field.text().strip()
         if not os.path.isdir(s_dir): return
         
-        custom_port = self.host_port.text().strip()
+        custom_port = self._get_target_port()
         if not custom_port.isdigit(): return
         
         ports = f"80 443 21 53 8080 {custom_port} 9231"
@@ -1457,7 +1454,7 @@ class PretendoManager(QMainWindow):
             pw = self.cached_password
 
         # Aggressive port cleaning logic
-        custom_port = self.host_port.text().strip()
+        custom_port = self._get_target_port()
         if not custom_port.isdigit(): return
         ports = f"80 443 21 53 8080 {custom_port} 9231"
         fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
@@ -1579,7 +1576,7 @@ class PretendoManager(QMainWindow):
             self.setup_log.append("[ERROR] Server directory not found. Cannot proceed with setup.")
             return
 
-        custom_port = self.host_port.text().strip()
+        custom_port = self._get_target_port()
         if not custom_port.isdigit():
             self.setup_log.append("[ERROR] Port must be numeric.")
             return
@@ -1850,7 +1847,7 @@ Server IP address: {server_ip}
     def _check_port_conflicts(self):
         """Check for processes occupying critical Pretendo ports."""
         conflicts = []
-        custom_port = self.host_port.text().strip()
+        custom_port = self._get_target_port()
         ports = [80, 443, 21, 53, 8080, 9231]
         if custom_port.isdigit():
             ports.append(int(custom_port))
@@ -1873,7 +1870,7 @@ Server IP address: {server_ip}
             self.setup_log.append("[ERROR] Server directory not found. Cannot proceed with setup.")
             return
 
-        custom_port = self.host_port.text().strip()
+        custom_port = self._get_target_port()
         if not custom_port.isdigit():
             self.setup_log.append("[ERROR] Port must be numeric.")
             return
@@ -2062,10 +2059,17 @@ const crypto = require("crypto");
 }})();
 """
         s_dir = self.server_dir_field.text().strip()
-        cmd = f"docker exec -i pretendo-network-account-1 node -e '{js_script}'"
+        # Use docker compose exec -T for robust service targeting and project name handling
+        cmd = f"docker compose exec -T account node -e {shlex.quote(js_script)}"
+        
+        pw = self.cached_password or (self.server_sudo_pass.text().strip() if hasattr(self, 'server_sudo_pass') else None)
+        if pw and OS_INFO["os"] == "linux":
+            # Direct sudo execution for reliable docker access
+            cmd = f"sudo -S {cmd}"
         
         self.cemu_log.append("[System] Injecting Account into Local Service Layer...")
-        self._run_command(cmd, self.cemu_log, cwd=s_dir, on_done=lambda c: QMessageBox.information(self, "Registration", f"Account '{username}' Registration task completed!") if c == 0 else None)
+        self._run_command(cmd, self.cemu_log, cwd=s_dir, stdin_data=pw, 
+                          on_done=lambda c: QMessageBox.information(self, "Registration", f"Account '{username}' Registration task completed!") if c == 0 else None)
 
     def _ensure_console_certs(self, data_path):
         """Deploy essential ccerts and scerts matching BannedPenta OTP to resolve decryption errors."""
@@ -2137,20 +2141,8 @@ const crypto = require("crypto");
             
             # 4. Multi-Path network_services.xml injection (Full Service Redirect)
             data_dir = cemu_dir or OS_INFO.get("cemu_data", OS_INFO.get("cemu_dir"))
-            services = {
-                "act": "https://account.nintendo.net",
-                "con": "https://con.nintendo.net",
-                "etc": "https://etc.nintendo.net",
-                "dls": "https://dls.nintendo.net",
-                "shp": "https://shp.nintendo.net",
-                "dsa": "https://dsa.nintendo.net",
-                "pdm": "https://pdm.nintendo.net",
-                "miv": "https://api.olv.nintendo.net",
-                "smm": "https://supermariomaker.nintendo.net",
-                "bas": "https://bayonetta2.nintendo.net"
-            }
-            # Mitmproxy identifies hosts via normal domains, not via raw IP:PORT !
-            url_nodes = "\n".join([f"        <{s}>{v}</{s}>" for s, v in services.items()])
+            services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas"]
+            url_nodes = "\n".join([f"        <{s}>{url}</{s}>" for s in services])
             ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n    <urls>\n{url_nodes}\n    </urls>\n</content>'
             
             for target_dir in set([str(data_dir), str(os.path.dirname(p))]):
@@ -2407,7 +2399,7 @@ const crypto = require("crypto");
 
                 # ─── 3DS Folder ───
                 local_ip = self._get_local_ip()
-                p_port = self.host_port.text().strip()
+                p_port = self._get_target_port()
                 z.writestr("3DS/local_server_url.txt", f"http://{local_ip}:{p_port}\n(Use this in Citra or Nimbus)")
                 z.writestr("3DS/mii_data.bin", safe_unhex(getattr(self, '_mii_data_hex', '01000100' + '0'*184)))
                 
