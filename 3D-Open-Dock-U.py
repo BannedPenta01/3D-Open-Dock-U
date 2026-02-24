@@ -16,6 +16,7 @@ import socket
 import zipfile
 import io
 import shlex
+from datetime import datetime
 
 try:
     import resource
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QSettings, QTimer, QDir
+from PySide6.QtGui import QColor
 
 try:
     import requests
@@ -204,6 +206,8 @@ BORDER = "#252535"
 BORDER_ACTIVE = "#353550"
 TEXT_PRIMARY = "#E8E8F0"
 TEXT_SECONDARY = "#8888AA"
+ORANGE_ACCOUNT = "#FF8C00"
+GREEN_MONEY = "#85BB65"
 
 STYLESHEET = f"""
 QMainWindow {{ background-color: {BG_DARKEST}; }}
@@ -245,41 +249,77 @@ class CommandWorker(QThread):
             if "TERM" not in env or not env["TERM"]:
                 env["TERM"] = "xterm-256color"
 
+            # Use binary mode to handle \r and mixed encodings safely
             proc = subprocess.Popen(
                 self.cmd, shell=True, cwd=self.cwd, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE if self.stdin_data is not None else None,
-                text=True, bufsize=1
+                bufsize=0 
             )
+            
             if self.stdin_data is not None and proc.stdin:
-                # Write password immediately with flush
-                proc.stdin.write(self.stdin_data + "\n")
-                proc.stdin.flush()
-                # Do NOT block output reading with sleep here. 
-                # Instead, we rely on the pipe staying open until we close it after a brief spin
+                try:
+                    # Write password + newline
+                    proc.stdin.write((self.stdin_data + "\n").encode())
+                    proc.stdin.flush()
+                    # A tiny delay ensures the OS pipe has processed the data 
+                    # before EOF is signaled. Important for sudo -S.
+                    import time
+                    time.sleep(0.05) 
+                    proc.stdin.close()
+                except Exception as e:
+                    self.output.emit(f"[DEBUG] Stdin write error: {e}")
             
-            # Use a non-blocking way to eventually close stdin if it's still open
-            stdin_closed = False
-
-            for line in iter(proc.stdout.readline, ''):
-                # We no longer close stdin here to avoid race conditions with sudo.
-                # It will be closed after the process finishes or the loop ends.
-
-                stripped = line.rstrip()
-                # Only filter out the specific password prompt, show other errors
-                if 'password for' in stripped.lower() or '[sudo] password' in stripped.lower():
-                    continue
-                if stripped:
-                    self.output.emit(stripped)
+            buffer = []
+            while True:
+                char = proc.stdout.read(1)
+                if not char:
+                    break
+                
+                c = char.decode(errors='ignore')
+                if c == '\n' or c == '\r':
+                    line = "".join(buffer).strip()
+                    if line:
+                        # Improved prompt filtering: ignore lines that are JUST the password prompt or variants
+                        low = line.lower()
+                        is_p = ('password for' in low or '[sudo] password' in low or '___sudo___' in low)
+                        # Only skip if it's a short line (likely just the prompt)
+                        if not is_p or len(line) > 50:
+                            self.output.emit(self._colorize_log(line))
+                    buffer = []
+                else:
+                    buffer.append(c)
+                    if len(buffer) > 250:
+                        self.output.emit("".join(buffer))
+                        buffer = []
             
-            if proc.stdin:
-                try: proc.stdin.close()
-                except: pass
+            # Clean up
+            try:
+                if proc.stdin: proc.stdin.close()
+            except: pass
             proc.wait()
             self.finished.emit(proc.returncode)
         except Exception as e:
-            self.output.emit(f"ERROR: {e}")
+            self.output.emit(self._colorize_log(f"ERROR inside Worker: {e}"))
             self.finished.emit(1)
+
+    @staticmethod
+    def _colorize_log(line):
+        """Apply HTML color formatting to log lines based on severity keywords."""
+        import html as html_mod
+        safe = html_mod.escape(line)
+        low = line.lower()
+        # Strip ANSI escape codes for keyword detection
+        stripped = re.sub(r'\x1b\[[0-9;]*m', '', low)
+        if any(k in stripped for k in ['[success]', 'success:', 'started', 'created', 'connected', 'ready to accept', ' started on port']):
+            return f"<span style='color:#3fb950;'>{safe}</span>"
+        elif any(k in stripped for k in ['[error]', 'error:', 'error]', 'fatal:', 'fatal]', 'panic:', 'panic ', 'segmentation', 'module_not_found', 'typeerror', 'exited with code 1', 'exited with code 2', 'connection refused']):
+            return f"<span style='color:#f85149;'>{safe}</span>"
+        elif any(k in stripped for k in ['[warn', 'warning', 'deprecated', 'deprecation']):
+            return f"<span style='color:#d29922;'>{safe}</span>"
+        elif any(k in stripped for k in ['[info]', '[debug]']):
+            return f"<span style='color:#8b949e;'>{safe}</span>"
+        return safe
 
 def make_scrollable(widget):
     scroll = QScrollArea()
@@ -292,7 +332,7 @@ def make_scrollable(widget):
     return scroll
 
 class SudoPasswordDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, current_pw=""):
         super().__init__(parent)
         self.setWindowTitle("Administrator Password")
         self.setMinimumWidth(360)
@@ -300,16 +340,36 @@ class SudoPasswordDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Sudo Access Required", styleSheet="font-size: 18px; font-weight: bold;"))
         layout.addWidget(QLabel("Enter your Linux password:"))
-        self.pass_field = QLineEdit()
+        
+        pass_row = QHBoxLayout()
+        self.pass_field = QLineEdit(current_pw)
         self.pass_field.setEchoMode(QLineEdit.Password)
-        layout.addWidget(self.pass_field)
+        pass_row.addWidget(self.pass_field)
+        
+        self.eye_btn = QPushButton("👁")
+        self.eye_btn.setCheckable(True)
+        self.eye_btn.setFixedSize(32, 32)
+        self.eye_btn.setStyleSheet("font-size: 18px; padding: 0;")
+        self.eye_btn.clicked.connect(self.toggle_visibility)
+        pass_row.addWidget(self.eye_btn)
+        layout.addLayout(pass_row)
+
         self.remember_cb = QCheckBox("Remember for this session")
         self.remember_cb.setStyleSheet("color: #8888AA;")
+        self.remember_cb.setChecked(True)
         layout.addWidget(self.remember_cb)
+        
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
+        
+    def toggle_visibility(self):
+        if self.eye_btn.isChecked():
+            self.pass_field.setEchoMode(QLineEdit.Normal)
+        else:
+            self.pass_field.setEchoMode(QLineEdit.Password)
+            
     def get_data(self):
         return self.pass_field.text().strip(), self.remember_cb.isChecked()
 
@@ -566,7 +626,14 @@ class PretendoManager(QMainWindow):
         self.server_sudo_pass.setEchoMode(QLineEdit.Password)
         self.server_sudo_pass.setPlaceholderText("Enter sudo password (auto-saved)")
         self.server_sudo_pass.textChanged.connect(self.save_settings)
-        sudo_row.addWidget(self.server_sudo_pass)
+        sudo_row.addWidget(self.server_sudo_pass, 1)
+        
+        self.dash_sudo_eye = QPushButton("👁")
+        self.dash_sudo_eye.setCheckable(True)
+        self.dash_sudo_eye.setFixedSize(30, 24)
+        self.dash_sudo_eye.setStyleSheet("padding: 0; font-size: 14px;")
+        self.dash_sudo_eye.clicked.connect(lambda: self.server_sudo_pass.setEchoMode(QLineEdit.Normal if self.dash_sudo_eye.isChecked() else QLineEdit.Password))
+        sudo_row.addWidget(self.dash_sudo_eye)
         dlay.addLayout(sudo_row)
 
         row_sys = QHBoxLayout()
@@ -598,6 +665,8 @@ class PretendoManager(QMainWindow):
         crgl = QVBoxLayout(cred)
         form = QFormLayout()
         self.cemu_username = QLineEdit()
+        self.cemu_username.setMaxLength(16)
+        self.cemu_username.setPlaceholderText("6-16 chars (alnum, ., -, _)")
         self.cemu_username.textChanged.connect(self.save_settings)
         form.addRow("Username:", self.cemu_username)
         self.cemu_password = QLineEdit()
@@ -605,6 +674,8 @@ class PretendoManager(QMainWindow):
         self.cemu_password.textChanged.connect(self.save_settings)
         form.addRow("Password:", self.cemu_password)
         self.cemu_miiname = QLineEdit()
+        self.cemu_miiname.setMaxLength(10)
+        self.cemu_miiname.setPlaceholderText("Max 10 chars")
         self.cemu_miiname.textChanged.connect(self.save_settings)
         form.addRow("Mii Name:", self.cemu_miiname)
         
@@ -666,10 +737,14 @@ class PretendoManager(QMainWindow):
         nlay.addLayout(url_row)
         
         pat_row = QHBoxLayout()
-        pat_btn = QPushButton("Patch Wii U (Cemu)", objectName="patchBtn")
+        pat_btn = QPushButton("Patch \u0026 Connect (Cemu)", objectName="patchBtn")
+        pat_btn.setToolTip("Syncs Docker services to the target port, patches Cemu settings, generates identity files, and registers your account.")
         pat_btn.clicked.connect(lambda: self.apply_cemu_patch_all())
         pat_row.addWidget(pat_btn)
-        pat_row.addWidget(QPushButton("Patch 3DS (Citra)", objectName="patchBtn", clicked=lambda: self.patch_citra("custom")))
+        citra_btn = QPushButton("Patch \u0026 Connect (Citra)", objectName="patchBtn")
+        citra_btn.setToolTip("Syncs Docker services to the target port, patches Citra config, generates identity files, and registers your account.")
+        citra_btn.clicked.connect(lambda: self.patch_citra("custom"))
+        pat_row.addWidget(citra_btn)
         nlay.addLayout(pat_row)
         
         lv.addWidget(net)
@@ -753,16 +828,17 @@ class PretendoManager(QMainWindow):
                 <li>The <i>Start Server</i> button will automatically clear any port conflicts before launching.</li>
             </ul>
 
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 4: Patching Emulators</h2>
+            <h2 style='color:{CYAN_PRIMARY};'>Phase 4: Patch & Connect</h2>
             <h3>Wii U (Cemu)</h3>
             <ul>
-                <li>In the <b>Patching</b> tab, enter your PNID credentials.</li>
+                <li>In the <b>Identities & Emulators</b> tab, enter your PNID credentials.</li>
                 <li>Ensure your Cemu folder is correctly detected.</li>
-                <li>Click <b>Patch Cemu (Wii U)</b>. The manager will update your <code>settings.xml</code> to point to your local server.</li>
+                <li>Set the <b>Target Node</b> URL to your server's address and port.</li>
+                <li>Click <b>Patch & Connect (Cemu)</b>. This will sync Docker services to your target port, update Cemu's <code>settings.xml</code>, generate identity files, and register your account — all in one step.</li>
             </ul>
             <h3>3DS (Citra/Lime3DS)</h3>
             <ul>
-                <li>Click <b>Patch Citra (3DS)</b> with the Local Server option selected.</li>
+                <li>Click <b>Patch & Connect (Citra)</b> with the Target Node pointing to your local server. Docker services, Citra config, and identity files will all be synced automatically.</li>
             </ul>
 
             <h2 style='color:{CYAN_PRIMARY};'>Phase 5: The Vault (Profile Management)</h2>
@@ -792,9 +868,38 @@ class PretendoManager(QMainWindow):
         self.profile_list.clear()
         vault_dir = os.path.join(os.path.expanduser("~"), ".config", APP_NAME, "vault")
         if not os.path.exists(vault_dir): return
+        
         for name in sorted(os.listdir(vault_dir)):
-            if os.path.isdir(os.path.join(vault_dir, name)):
-                self.profile_list.addItem(name)
+            path = os.path.join(vault_dir, name)
+            if os.path.isdir(path):
+                meta_path = os.path.join(path, "profile_meta.json")
+                item = QListWidgetItem(name)
+                
+                is_account = False
+                is_backup = False
+                
+                if os.path.exists(meta_path):
+                    try:
+                        with open(meta_path, "r") as f:
+                            meta = json.load(f)
+                        t = str(meta.get("type", "")).lower()
+                        if t == "account": is_account = True
+                        elif t == "backup": is_backup = True
+                        elif meta.get("username"): is_account = True
+                    except: pass
+                
+                # Heuristics if metadata is silent
+                if not (is_account or is_backup):
+                    lname = name.lower()
+                    if "backup" in lname or "vault" in lname: is_backup = True
+                    else: is_account = True # Default to account
+                
+                if is_backup:
+                    item.setForeground(QColor(GREEN_MONEY))
+                else:
+                    item.setForeground(QColor(ORANGE_ACCOUNT))
+                
+                self.profile_list.addItem(item)
 
     def open_vault_folder(self):
         vault_dir = os.path.join(os.path.expanduser("~"), ".config", APP_NAME, "vault")
@@ -879,13 +984,17 @@ class PretendoManager(QMainWindow):
         return paths
 
     def save_to_vault(self):
-        name, ok = QInputDialog.getText(self, "New Vault Entry", "Profile Name (e.g. My_Backup):")
+        # 1. Ask for name and type
+        name, ok = QInputDialog.getText(self, "New Vault Entry", "Profile Name (e.g. My_Account):")
         if not (ok and name): return
+        
+        type_res = QMessageBox.question(self, "Vault Entry Type", "Is this a specific PNID Account? (Choose No for a generic Backup Folder)", QMessageBox.Yes | QMessageBox.No)
+        entry_type = "account" if type_res == QMessageBox.Yes else "backup"
         
         vault_path = os.path.join(os.path.expanduser("~"), ".config", APP_NAME, "vault", name)
         os.makedirs(vault_path, exist_ok=True)
 
-        # 1. Save Files
+        # 2. Save Files (Harvesting)
         found_paths = self._get_emulator_paths()
         count = 0
         for rel_path, src in found_paths.items():
@@ -895,12 +1004,14 @@ class PretendoManager(QMainWindow):
                 shutil.copy2(src, dest)
                 count += 1
         
-        # 2. Save Metadata (Username, Password, Mii)
+        # 3. Save Metadata
         meta = {
+            "type": entry_type,
             "username": self.cemu_username.text(),
             "password": _obs(self.cemu_password.text()),
             "miiname": self.cemu_miiname.text(),
-            "mii_hex": getattr(self, '_mii_data_hex', "")
+            "mii_hex": getattr(self, '_mii_data_hex', ""),
+            "timestamp": datetime.now().isoformat()
         }
         try:
             with open(os.path.join(vault_path, "profile_meta.json"), "w") as f:
@@ -1009,17 +1120,32 @@ class PretendoManager(QMainWindow):
                 in_mitm = False
                 changed = False
                 for line in lines:
-                    if "mitmproxy-pretendo:" in line: in_mitm = True
-                    elif line.strip() == "" or (line.lstrip().startswith("-") == False and line.lstrip() != line and "ports:" not in line and "image:" not in line):
-                        # Heuristic: if we see a non-indented or new service, we might be out of mitmproxy
-                        if not line.startswith(" ") and line.strip() != "": in_mitm = False
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        pass
+                    elif line.startswith("  ") and not line.startswith("   ") and stripped.endswith(":"):
+                        if line.startswith("  mitmproxy-pretendo:"):
+                            in_mitm = True
+                        else:
+                            in_mitm = False
                     
-                    if in_mitm and ":8080" in line:
+                    if in_mitm and ":8080" in line and "ports:" not in line:
                         # Robustly replace any port mapping to internal 8080
-                        new_line = re.sub(r'(\d+):8080', f"{port}:8080", line)
+                        new_line = re.sub(r'(?:^\s*-\s*|:)(\d+):8080', lambda m: m.group(0).replace(m.group(1), str(port)), line)
                         if new_line != line:
                             line = new_line
                             changed = True
+
+                    if in_mitm and "command: mitmweb" in line and "pretendo_addon.py" not in line:
+                        line = line.replace("mitmweb --web-host 0.0.0.0", "mitmweb --web-host 0.0.0.0 --set confdir=./.mitmproxy -s ./pretendo_addon.py --set pretendo_redirect=true --set pretendo_host=nginx --set pretendo_host_port=80 --set pretendo_http=true --set client_certs=./client-certificates/WiiU-common.pem --set ssl_insecure=true --set tls_version_client_min=UNBOUNDED --set tls_version_server_min=UNBOUNDED")
+                        changed = True
+
+                    # Fix accidentally patched adminer
+                    if "adminer:" in line:
+                        in_adminer = True
+                    if "in_adminer" in locals() and in_adminer and "127.0.0.1:8070:8080" in line:
+                        line = line.replace("127.0.0.1:8070:8080", "127.0.0.1:8088:8080")
+                        changed = True
                         
                     if "image: mongo:latest" in line:
                         line = line.replace("mongo:latest", "mongo:4.4")
@@ -1095,14 +1221,14 @@ class PretendoManager(QMainWindow):
 
     def restore_nintendo_official(self):
         """Restore official Nintendo network settings for all emulators."""
-        res = QMessageBox.question(self, "Restore Official Nintendo", "This will patch Cemu and Citra to point to official Nintendo servers. Proceed?", QMessageBox.Yes | QMessageBox.No)
+        res = QMessageBox.question(self, "Restore Official Nintendo", "This will reconnect Cemu and Citra to official Nintendo servers. Proceed?", QMessageBox.Yes | QMessageBox.No)
         if res == QMessageBox.Yes:
             self.patch_cemu_settings("https://api.nintendo.net")
             self.patch_citra("nintendo_restore")
 
     def restore_pretendo_official(self):
         """Restore official Pretendo network settings for all emulators."""
-        res = QMessageBox.question(self, "Restore Official Pretendo", "This will patch Cemu and Citra to point to https://api.pretendo.network. Proceed?", QMessageBox.Yes | QMessageBox.No)
+        res = QMessageBox.question(self, "Restore Official Pretendo", "This will reconnect Cemu and Citra to https://api.pretendo.network. Proceed?", QMessageBox.Yes | QMessageBox.No)
         if res == QMessageBox.Yes:
             self.patch_cemu_settings("https://api.pretendo.network")
             self.patch_citra("official_restore")
@@ -1160,7 +1286,8 @@ class PretendoManager(QMainWindow):
             s_dir = self.server_dir_field.text().strip()
             stack_exists = os.path.isdir(s_dir) and (os.path.isfile(os.path.join(s_dir, "compose.yml")) or os.path.isfile(os.path.join(s_dir, "docker-compose.yml")))
             
-            res = subprocess.run(["docker", "ps", "--filter", "name=pretendo", "--format", "{{.Names}}"], capture_output=True, text=True)
+            # Use a timeout to prevent GUI freezes if the docker socket is unresponsive
+            res = subprocess.run(["docker", "ps", "--filter", "name=pretendo", "--format", "{{.Names}}"], capture_output=True, text=True, timeout=3)
             self.server_running = bool(res.stdout.strip())
             
             if not stack_exists:
@@ -1200,18 +1327,22 @@ class PretendoManager(QMainWindow):
                         self.service_toggle_btn.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1a7f37, stop:1 #2ea043); border-color: #1a5c1a; color: white; font-weight: bold; border-radius: 8px; padding: 12px;")
         except: pass
 
-    def _ask_sudo_password(self):
-        # 1. Check the dedicated UI field first
+    def _get_effective_sudo_password(self):
+        """Unified helper to get password from UI field or cache."""
         if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text().strip():
             pw = self.server_sudo_pass.text().strip()
             self.cached_password = pw
             return pw
+        return self.cached_password
 
-        # 2. Check cache
-        if self.cached_password: return self.cached_password
+    def _ask_sudo_password(self):
+        # 1. Check existing sources
+        pw = self._get_effective_sudo_password()
+        if pw: return pw
         
-        # 3. Fallback to dialog — always persist the entered password
-        dlg = SudoPasswordDialog(self)
+        # 2. Fallback to dialog — pass current text just in case
+        current_in_field = self.server_sudo_pass.text() if hasattr(self, 'server_sudo_pass') else ""
+        dlg = SudoPasswordDialog(self, current_pw=current_in_field)
         if dlg.exec():
             pw, _ = dlg.get_data()
             if not pw: return None
@@ -1354,46 +1485,71 @@ class PretendoManager(QMainWindow):
 
         self._apply_compose_patches(custom_port, s_dir)
 
-        # 2. Credential Aggregation
-        pw = None
-        if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text().strip():
-            pw = self.server_sudo_pass.text().strip()
-        elif self.cached_password:
-            pw = self.cached_password
+        # 2. Unified Credential Aggregation
+        pw = self._get_effective_sudo_password()
 
-        # 3. Docker Service Check & Auto-Start
-        if OS_INFO["os"] == "linux" and not self.docker_service_running:
+        # 3. Docker Service Check & Auto-Start (Prompt if password still missing on Linux)
+        if OS_INFO["os"] == "linux":
             if not pw:
                 pw = self._ask_sudo_password()
                 if not pw: return # User cancelled
 
         ports = f"80 443 21 53 8080 {custom_port} 9231"
-        fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
+        # Add timeout to fuser to prevent long hangs on busy sockets
+        fuser_cmd = " ; ".join([f"timeout 2 fuser -k -n tcp {p} || true" for p in ports.split()])
         
         # Helper to finalize and kickstart mongo replica
         def _on_start(code):
+            if code != 0:
+                self.server_log.append("<b>[System] Skipping initialization tasks due to start failure.</b>")
+                return
             if OS_INFO["os"] == "linux" and s_dir:
                 # Initialize the replica set using service names, with retries since Mongo takes time
-                exec_prefix = "sudo -S " if pw else ""
-                cmd = f"for i in {{1..15}}; do {exec_prefix}docker compose exec -T mongodb mongo --eval 'rs.initiate()' && break; sleep 2; done;"
+                setup_cmds = []
+                # Quietly initiate MongoDB RS if not already done
+                # Note: No 'sudo -S' here, the wrapper will handle elevation
+                setup_cmds.append("for i in {1..15}; do docker compose exec -T mongodb mongo --eval 'rs.status()' >/dev/null 2>&1 && break; docker compose exec -T mongodb mongo --eval 'rs.initiate()' >/dev/null 2>&1 && break; sleep 2; done")
                 
-                # Initialize Postgres databases by executing the script if necessary
-                cmd += f" for i in {{1..15}}; do {exec_prefix}docker compose exec -T postgres sh -c 'chmod +x /docker-entrypoint-initdb.d/postgres-init.sh && /docker-entrypoint-initdb.d/postgres-init.sh' && break; sleep 2; done;"
+                # Check for postgres init script on host and execute it if found
+                pg_host_script = os.path.join(s_dir, "scripts/run-in-container/postgres-init.sh")
+                if os.path.exists(pg_host_script):
+                    try:
+                        with open(pg_host_script, 'r') as f:
+                            pg_content = f.read().replace("'", "'\"'\"'")
+                        setup_cmds.append(f"for i in {{1..15}}; do docker compose exec -T postgres sh -c '{pg_content}' >/dev/null 2>&1 && break; sleep 2; done")
+                    except: pass
                 
-                # Go applications fail their connections if DBs are not ready, and don't exit. Force restart them after boot.
-                cmd += " sleep 10; docker compose restart friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss || true"
-                subprocess.Popen(cmd, shell=True, cwd=s_dir)
+                setup_cmds.append("sleep 8; docker compose restart friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website >/dev/null 2>&1 || true")
+                
+                full_setup_cmd = " ; ".join(setup_cmds)
+                
+                # IMPORTANT: Use CommandWorker or a piped Popen to pass the password to the sudo calls inside
+                if pw:
+                    self.server_log.append("[System] Running post-boot database initialization...")
+                    # Wrap everything in a single sudo bash -c to avoid multi-elevations consuming same stdin password
+                    inner_cmds = " ; ".join(setup_cmds).replace("'", "'\"'\"'")
+                    full_cmd = f"sudo -S bash -c '{inner_cmds}'"
+                    self._run_command(full_cmd, self.server_log, s_dir, stdin_data=pw, display_cmd="[Elevated] Post-Boot Initialization")
+                else:
+                    self.server_log.append("[System] Running post-boot database initialization (Best-Effort)...")
+                    full_cmd = " ; ".join(setup_cmds)
+                    self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Standard] Post-Boot Initialization")
+
             self._check_docker_status()
 
         if OS_INFO["os"] == "linux":
             if pw:
                 self.server_log.append("[System] Starting background services and clearing ports...")
-                # Start docker services + clear ports + docker compose
-                cmd = f"sudo -S bash -c 'systemctl start docker.socket docker.service; {fuser_cmd} || true'; docker compose up -d"
+                # Wrap everything in sudo to ensure permissions for systemctl, fuser, AND docker
+                inner = f"systemctl start docker.socket docker.service ; {fuser_cmd} ; docker compose up -d"
+                # Safe shell quoting for the inner command string
+                import shlex
+                quoted_inner = shlex.quote(inner)
+                cmd = f"sudo -S bash -c {quoted_inner}"
                 self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=_on_start, display_cmd="[Elevated] Clean Ports & Start Framework")
             else:
                 self.server_log.append("[System] Starting server (Best-Effort Mode)...")
-                cmd = f"{fuser_cmd} || true; docker compose up -d"
+                cmd = f"({fuser_cmd}) ; docker compose up -d"
                 self._run_command(cmd, self.server_log, s_dir, on_done=_on_start, display_cmd="[Standard] Clean Ports & Start Framework")
         else:
             self._run_command("docker compose up -d", self.server_log, s_dir, on_done=_on_start, display_cmd="docker compose up -d")
@@ -1406,16 +1562,12 @@ class PretendoManager(QMainWindow):
         if not custom_port.isdigit(): return
         
         ports = f"80 443 21 53 8080 {custom_port} 9231"
-        # Optional fuser command for deep cleaning
-        fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
+        # Ensure fuser doesn't cause the whole chain to fail
+        fuser_cmd = " ; ".join([f"fuser -k -n tcp {p} || true" for p in ports.split()])
         
         if OS_INFO["os"] == "linux":
-            # Attempt to get password: Server Tab Slot > Cache
-            pw = None
-            if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text().strip():
-                pw = self.server_sudo_pass.text().strip()
-            elif self.cached_password:
-                pw = self.cached_password
+            # Unified Credential Aggregation
+            pw = self._get_effective_sudo_password()
 
             if pw:
                 self.server_log.append("[System] Stopping server and force-releasing ports (Secure-Fast-Track)...")
@@ -1446,18 +1598,14 @@ class PretendoManager(QMainWindow):
         self.log_worker.start()
 
     def toggle_docker_service(self):
-        # Attempt to get password: Server Tab Slot > Cache
-        pw = None
-        if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text().strip():
-            pw = self.server_sudo_pass.text().strip()
-        elif self.cached_password:
-            pw = self.cached_password
+        # Unified Credential Aggregation
+        pw = self._get_effective_sudo_password()
 
         # Aggressive port cleaning logic
         custom_port = self._get_target_port()
         if not custom_port.isdigit(): return
         ports = f"80 443 21 53 8080 {custom_port} 9231"
-        fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports.split()])
+        fuser_cmd = " ; ".join([f"fuser -k -n tcp {p} || true" for p in ports.split()])
 
         if self.docker_service_running:
             # DISABLING: Make it popup-free and clear ports
@@ -1776,7 +1924,7 @@ Server IP address: {server_ip}
     def _deploy_step2_clear_and_pull(self, s_dir, local_ip, custom_port, pw=None):
         """Step 2: Clear ports and remove old containers."""
         ports_to_kill = f"80 443 21 53 8080 {custom_port} 9231"
-        fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports_to_kill.split()])
+        fuser_cmd = " ; ".join([f"fuser -k -n tcp {p} || true" for p in ports_to_kill.split()])
         
         self.setup_log.append("[System] Wiping port conflicts and removing old containers...")
         
@@ -1970,6 +2118,9 @@ Server IP address: {server_ip}
         """Wipe passwords (including sudo), usernames, and miinames from the UI, cache, and disk."""
         res = QMessageBox.warning(self, "Clear Data", "This will permanently wipe your saved credentials, identity info, and admin password. Proceed?", QMessageBox.Yes | QMessageBox.No)
         if res == QMessageBox.Yes:
+            # Disable docker server and services before deleting credentials to prevent softlock
+            self._force_shutdown_sync(show_progress=True)
+            
             self.cached_password = None
             self.cemu_username.clear()
             self.cemu_password.clear()
@@ -1997,31 +2148,34 @@ Server IP address: {server_ip}
         js_script = f"""
 const {{ connect }} = require("./dist/database");
 const {{ PNID }} = require("./dist/models/pnid");
+const {{ NEXAccount }} = require("./dist/models/nex-account");
 const {{ nintendoPasswordHash }} = require("./dist/util");
+const bcrypt = require("bcrypt");
 const crypto = require("crypto");
 
 (async () => {{
-    try {{
-        await connect();
-        const username = "{username}";
-        const pass = "{password}";
-        const miiName = "{miiname}";
-        const email = username + "@pretendo.local";
-        const pid = {pid};
+try {{
+    await connect();
+    const username = "{username}";
+    const pass = "{password}";
+    const miiName = "{miiname}";
+    const email = username + "@pretendo.local";
+    const pid = {pid};
 
-        const hashedPw = await nintendoPasswordHash(pass, pid);
+    const nintendoPw = await nintendoPasswordHash(pass, pid);
+    const hashedPw = await bcrypt.hash(nintendoPw, 10);
 
-        let user = await PNID.findOne({{ usernameLower: username.toLowerCase() }});
-        if (user) {{
-            user.password = hashedPw;
-            user.pid = pid;
-            await user.save();
-            console.log("[Notice] " + username + " is already registered! Updated Password and PID to align locally: " + pid);
-            process.exit(0);
-        }}
-
+    let user = await PNID.findOne({{ usernameLower: username.toLowerCase() }});
+    if (user) {{
+        user.password = hashedPw;
+        user.pid = pid;
+        await user.save();
+        console.log("[Notice] " + username + " is already registered! Updated Password and PID to align locally: " + pid);
+    }} else {{
         // name at offset 0x1A (char 52)
-        const nameHex = Buffer.from(miiName.padEnd(10, '\\0').slice(0, 10), "utf16be").toString("hex");
+        const nameBuf = Buffer.from(miiName.padEnd(10, '\\0').slice(0, 10), "utf16le");
+        nameBuf.swap16(); 
+        const nameHex = nameBuf.toString("hex");
         const miiDataHex = ("01000100" + "00".repeat(22) + nameHex).padEnd(192, "0");
 
         user = new PNID({{
@@ -2045,17 +2199,44 @@ const crypto = require("crypto");
                 image_url: "",
                 author: miiName
             }},
+            identification: {{
+                email_code: crypto.randomBytes(4).toString('hex'),
+                email_token: crypto.randomBytes(32).toString('hex')
+            }},
             flags: {{ active: true, is_admin: true, is_dev: true }},
             access_level: 2
         }});
 
         await user.save();
-        console.log("[Success] User " + username + " injected with Admin privileges! PID: " + pid);
-        process.exit(0);
-    }} catch(e) {{
-        console.error(e);
-        process.exit(1);
+        console.log("[Success] User " + username + " injected! PID: " + pid);
     }}
+
+    // Ensure NEX Account exists (Friend Server credentials)
+    let nex = await NEXAccount.findOne({{ owning_pid: user.pid }});
+    if (!nex) {{
+        const charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let nexPass = "";
+        for (let i = 0; i < 16; i++) nexPass += charset.charAt(Math.floor(Math.random() * charset.length));
+
+        nex = new NEXAccount({{
+            pid: user.pid,
+            owning_pid: user.pid,
+            password: nexPass,
+            device_type: "wiiu",
+            access_level: 0,
+            server_access_level: "prod"
+        }});
+        await nex.save();
+        console.log("[Success] NEX-Account linked! Password: " + nexPass);
+    }} else {{
+        console.log("[Notice] NEX-Account already synchronized.");
+    }}
+
+    process.exit(0);
+}} catch(e) {{
+    console.error(e);
+    process.exit(1);
+}}
 }})();
 """
         s_dir = self.server_dir_field.text().strip()
@@ -2068,8 +2249,32 @@ const crypto = require("crypto");
             cmd = f"sudo -S {cmd}"
         
         self.cemu_log.append("[System] Injecting Account into Local Service Layer...")
-        self._run_command(cmd, self.cemu_log, cwd=s_dir, stdin_data=pw, 
-                          on_done=lambda c: QMessageBox.information(self, "Registration", f"Account '{username}' Registration task completed!") if c == 0 else None)
+        
+        def _on_reg_done(code):
+            if code == 0:
+                self._track_account_in_vault(username, password, miiname)
+                QMessageBox.information(self, "Registration", f"Account '{username}' Registration task completed!\n\nAdded to Credentials Vault as: Account:{username}")
+
+        self._run_command(cmd, self.cemu_log, cwd=s_dir, stdin_data=pw, on_done=_on_reg_done)
+
+    def _track_account_in_vault(self, username, password, miiname):
+        """Automatically create a metadata-only vault entry for newly created/patched accounts."""
+        vname = f"Account:{username}"
+        vpath = os.path.join(os.path.expanduser("~"), ".config", APP_NAME, "vault", vname)
+        os.makedirs(vpath, exist_ok=True)
+        vmeta = {
+            "type": "account",
+            "username": username,
+            "password": _obs(password),
+            "miiname": miiname,
+            "mii_hex": getattr(self, '_mii_data_hex', ""),
+            "timestamp": datetime.now().isoformat()
+        }
+        try:
+            with open(os.path.join(vpath, "profile_meta.json"), "w") as f:
+                json.dump(vmeta, f, indent=4)
+            self.refresh_vault_list()
+        except: pass
 
     def _ensure_console_certs(self, data_path):
         """Deploy essential ccerts and scerts matching BannedPenta OTP to resolve decryption errors."""
@@ -2142,8 +2347,18 @@ const crypto = require("crypto");
             # 4. Multi-Path network_services.xml injection (Full Service Redirect)
             data_dir = cemu_dir or OS_INFO.get("cemu_data", OS_INFO.get("cemu_dir"))
             services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas"]
-            url_nodes = "\n".join([f"        <{s}>{url}</{s}>" for s in services])
-            ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n    <urls>\n{url_nodes}\n    </urls>\n</content>'
+            
+            is_proxy = url.count(":") == 2 and "http" in url
+            if is_proxy:
+                # If using mitmproxy, do NOT override Cemu's internal URLs with the proxy IP.
+                # Let Cemu send requests for account.nintendo.net to the proxy, so the proxy
+                # can rewrite them to pretendo.cc and route them internally without looping.
+                urls_block = "    <urls>\n    </urls>"
+            else:
+                url_nodes = "\n".join([f"        <{s}>{url}</{s}>" for s in services])
+                urls_block = f"    <urls>\n{url_nodes}\n    </urls>"
+
+            ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n{urls_block}\n</content>'
             
             for target_dir in set([str(data_dir), str(os.path.dirname(p))]):
                 if target_dir and target_dir != ".":
@@ -2151,17 +2366,68 @@ const crypto = require("crypto");
                     with open(ns_xml, "w") as f:
                         f.write(ns_content)
 
-            self.statusBar().showMessage("Cemu Bypass Infrastructure Reinforced!", 5000)
-            QMessageBox.information(self, "Success", f"Wii U Connection Patched!\n\nAll services (act, con, etc.) redirected to {url}\nSSL Verification Disabled.")
+            self.statusBar().showMessage("Cemu Patch & Connect Complete!", 5000)
+            QMessageBox.information(self, "Success", f"Wii U Patched & Connected!\n\nAll services (act, con, etc.) redirected to {url}\nSSL Verification Disabled.\nDocker services synced.")
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
+
+    def _sync_docker_services_to_port(self, target_url):
+        """Patch Docker compose.yml mitmproxy port to match the Target Node URL and restart key services.
+        This ensures that the emulator's configured URL correctly reaches the mitmproxy reverse-proxy,
+        which in turn routes traffic through nginx to the account service — fixing 502 errors on
+        /oauth20/access_token/generate."""
+        s_dir = self.server_dir_field.text().strip()
+        if not os.path.isdir(s_dir):
+            self.cemu_log.append("[Docker Sync] Server directory not found — skipping Docker patching.")
+            return
+
+        custom_port = self._get_target_port()
+        if not custom_port.isdigit():
+            self.cemu_log.append(f"[Docker Sync] Invalid port '{custom_port}' — skipping Docker patching.")
+            return
+
+        # 1. Patch compose.yml mitmproxy port binding
+        compose_changed = self._apply_compose_patches(custom_port, s_dir)
+        if compose_changed:
+            self.cemu_log.append(f"[Docker Sync] compose.yml updated: mitmproxy external port → {custom_port}")
+        else:
+            self.cemu_log.append(f"[Docker Sync] compose.yml already configured for port {custom_port} (no change needed).")
+
+        # 2. Restart the critical service chain ONLY if needed
+        #    mitmproxy-pretendo: the entry-point proxy that emulators connect to
+        
+        if not compose_changed:
+            self.cemu_log.append("[Docker Sync] Docker services are stable. No restart required.")
+            return
+
+        pw = self._get_effective_sudo_password()
+
+        restart_services = "mitmproxy-pretendo"
+        # Port changed in compose → need docker compose up -d to re-create the port binding
+        restart_cmd = f"docker compose up -d --no-deps {restart_services}"
+
+        if pw and OS_INFO["os"] == "linux":
+            restart_cmd = f"sudo -S {restart_cmd}"
+
+        self.cemu_log.append(f"[Docker Sync] Applying changes to services: {restart_services}")
+        self._run_command(
+            restart_cmd, self.cemu_log, cwd=s_dir,
+            stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
+            display_cmd=f"[Docker Sync] Refreshing mitmproxy on port {custom_port}"
+        )
 
     def apply_cemu_patch_all(self):
         url = self.patch_url_input.text().strip()
+
+        # Sync Docker services to the target port BEFORE patching the emulator
+        self._sync_docker_services_to_port(url)
+
         self.patch_cemu_settings(url)
         self.generate_cemu_manual()
-        
-        self.cemu_log.append("[System] Syncing Identity with Local Database...")
         self.create_local_account()
+        
+        # Track in vault if local server
+        if "127.0.0.1" in url or "localhost" in url:
+            self._track_account_in_vault(self.cemu_username.text(), self.cemu_password.text(), self.cemu_miiname.text())
 
     def generate_cemu_manual(self):
         username = self.cemu_username.text().strip()
@@ -2275,6 +2541,10 @@ const crypto = require("crypto");
         self.cemu_log.append("[System] Syncing Identity with Local Database...")
         self.create_local_account()
 
+        # Sync Docker services when patching to custom/local target
+        if mode == "custom":
+            self._sync_docker_services_to_port(self.patch_url_input.text().strip())
+
         # Determine config path based on chosen directory
         citra_dir = self.citra_dir_field.text().strip()
         p = os.path.join(citra_dir, "config", "qt-config.ini") if citra_dir else OS_INFO.get("citra_config", "")
@@ -2314,7 +2584,14 @@ const crypto = require("crypto");
                     with open(info_p, "wb") as f: f.write(os.urandom(0x111))
                     self.setup_log.append("[System] Generated dummy SecureInfo_A for Citra.")
 
-            QMessageBox.information(self, "Success", f"Patched Citra to use:\n{target_url}\n\nIdentity bypass files checked.")
+            if mode == "custom":
+                username = self.cemu_username.text().strip()
+                password = self.cemu_password.text()
+                miiname = self.cemu_miiname.text().strip() or "Player"
+                QMessageBox.information(self, "Success", f"3DS Patched & Connected!\n\nTarget: {target_url}\nDocker services synced to port {self._get_target_port()}.\nIdentity bypass files verified.")
+                self._track_account_in_vault(username, password, miiname)
+            else:
+                QMessageBox.information(self, "Success", f"Patched Citra to use:\n{target_url}\n\nIdentity bypass files checked.")
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
 
