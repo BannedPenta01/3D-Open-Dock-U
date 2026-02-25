@@ -620,25 +620,31 @@ class PretendoManager(QMainWindow):
         dlay.addWidget(self.deploy_stack_btn)
 
         # Sudo Password Field (persisted across sessions until Reset Sensitive Data)
-        sudo_row = QHBoxLayout()
-        sudo_row.addWidget(QLabel("Sudo Pass:"))
-        self.server_sudo_pass = QLineEdit()
-        self.server_sudo_pass.setEchoMode(QLineEdit.Password)
-        self.server_sudo_pass.setPlaceholderText("Enter sudo password (auto-saved)")
-        self.server_sudo_pass.textChanged.connect(self.save_settings)
-        sudo_row.addWidget(self.server_sudo_pass, 1)
-        
-        self.dash_sudo_eye = QPushButton("👁")
-        self.dash_sudo_eye.setCheckable(True)
-        self.dash_sudo_eye.setFixedSize(30, 24)
-        self.dash_sudo_eye.setStyleSheet("padding: 0; font-size: 14px;")
-        self.dash_sudo_eye.clicked.connect(lambda: self.server_sudo_pass.setEchoMode(QLineEdit.Normal if self.dash_sudo_eye.isChecked() else QLineEdit.Password))
-        sudo_row.addWidget(self.dash_sudo_eye)
-        dlay.addLayout(sudo_row)
+        if OS_INFO["os"] == "linux":
+            sudo_row = QHBoxLayout()
+            sudo_row.addWidget(QLabel("Sudo Pass:"))
+            self.server_sudo_pass = QLineEdit()
+            self.server_sudo_pass.setEchoMode(QLineEdit.Password)
+            self.server_sudo_pass.setPlaceholderText("Enter sudo password (auto-saved)")
+            self.server_sudo_pass.textChanged.connect(self.save_settings)
+            sudo_row.addWidget(self.server_sudo_pass, 1)
+            
+            self.dash_sudo_eye = QPushButton("👁")
+            self.dash_sudo_eye.setCheckable(True)
+            self.dash_sudo_eye.setFixedSize(30, 24)
+            self.dash_sudo_eye.setStyleSheet("padding: 0; font-size: 14px;")
+            self.dash_sudo_eye.clicked.connect(lambda: self.server_sudo_pass.setEchoMode(QLineEdit.Normal if self.dash_sudo_eye.isChecked() else QLineEdit.Password))
+            sudo_row.addWidget(self.dash_sudo_eye)
+            dlay.addLayout(sudo_row)
+        else:
+            self.server_sudo_pass = None
 
         row_sys = QHBoxLayout()
-        row_sys.addWidget(QPushButton("Fix Perms", clicked=self.fix_docker_permissions))
-        row_sys.addWidget(QPushButton("Clear Logs", clicked=lambda: self.setup_log.clear()))
+        if OS_INFO["os"] == "linux":
+            row_sys.addWidget(QPushButton("Fix Perms", clicked=self.fix_docker_permissions))
+            row_sys.addWidget(QPushButton("Reset Per-Session Sudo", clicked=lambda: setattr(self, 'cached_password', None) or (self.server_sudo_pass.clear() if self.server_sudo_pass else None)))
+        
+        row_sys.addWidget(QPushButton("Health Check", clicked=self.run_setup_check))
         dlay.addLayout(row_sys)
 
         rv.addWidget(dep)
@@ -1336,6 +1342,8 @@ class PretendoManager(QMainWindow):
         return self.cached_password
 
     def _ask_sudo_password(self):
+        if OS_INFO["os"] != "linux":
+            return "" # Windows/Docker Desktop handles its own elevation usually
         # 1. Check existing sources
         pw = self._get_effective_sudo_password()
         if pw: return pw
@@ -1428,22 +1436,18 @@ class PretendoManager(QMainWindow):
 
         # Step 3: Kill any lingering port processes + stop Docker service (Linux)
         if OS_INFO["os"] == "linux":
-            ports = f"80 443 21 53 8080 {custom_port} 9231"
-            fuser_cmd = " ; ".join([f"fuser -k -n tcp {p}" for p in ports.split()]) + " || true"
+            self._kill_port_processes(ports_to_kill, pw)
             if pw:
                 try:
                     subprocess.run(
-                        f"sudo -S bash -c 'systemctl stop docker.socket docker.service; {fuser_cmd}'",
+                        f"sudo -S bash -c 'systemctl stop docker.socket docker.service'",
                         shell=True, input=pw + "\n", env=env,
                         capture_output=True, text=True, timeout=10
                     )
                 except Exception:
                     pass
-            else:
-                try:
-                    subprocess.run(fuser_cmd, shell=True, env=env, timeout=5)
-                except Exception:
-                    pass
+        elif OS_INFO["os"] == "windows":
+            self._kill_port_processes(ports_to_kill)
 
     def emergency_exit(self):
         """ATOMIC SHUTDOWN: force stops everything and kills the process unconditionally."""
@@ -1503,7 +1507,7 @@ class PretendoManager(QMainWindow):
             if code != 0:
                 self.server_log.append("<b>[System] Skipping initialization tasks due to start failure.</b>")
                 return
-            if OS_INFO["os"] == "linux" and s_dir:
+            if s_dir:
                 # Initialize the replica set using service names, with retries since Mongo takes time
                 setup_cmds = []
                 # Quietly initiate MongoDB RS if not already done
@@ -1524,7 +1528,7 @@ class PretendoManager(QMainWindow):
                 full_setup_cmd = " ; ".join(setup_cmds)
                 
                 # IMPORTANT: Use CommandWorker or a piped Popen to pass the password to the sudo calls inside
-                if pw:
+                if pw and OS_INFO["os"] == "linux": # Only Linux needs sudo for these commands if they are wrapped
                     self.server_log.append("[System] Running post-boot database initialization...")
                     # Wrap everything in a single sudo bash -c to avoid multi-elevations consuming same stdin password
                     inner_cmds = " ; ".join(setup_cmds).replace("'", "'\"'\"'")
@@ -1661,16 +1665,18 @@ class PretendoManager(QMainWindow):
                         pw = self._ask_sudo_password()
                         if pw:
                             try:
-                                result = subprocess.run(
-                                    f"sudo -S rm -rf {shlex.quote(s_dir)}",
-                                    shell=True, input=pw + "\n",
-                                    capture_output=True, text=True
-                                )
+                                if OS_INFO["os"] == "linux":
+                                    cmd = f"sudo -S rm -rf {shlex.quote(s_dir)}"
+                                    result = subprocess.run(cmd, shell=True, input=pw + "\n", capture_output=True, text=True)
+                                else:
+                                    cmd = f"rmdir /s /q {shlex.quote(s_dir)}"
+                                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                                
                                 if result.returncode == 0:
                                     removed = True
                                     self.setup_log.append("[OK] Directory removed with elevated privileges.")
                                 else:
-                                    self.setup_log.append(f"[ERROR] sudo rm -rf failed: {result.stderr.strip()}")
+                                    self.setup_log.append(f"[ERROR] Elevated removal failed: {result.stderr.strip()}")
                             except Exception as e2:
                                 self.setup_log.append(f"[ERROR] Elevated removal failed: {e2}")
                         else:
@@ -1713,9 +1719,26 @@ class PretendoManager(QMainWindow):
             self.setup_log.append("[ERROR] Clone completed but compose.yml still missing. Repository may be corrupted.")
             return
         
-        self.setup_log.append("\n[System] Stack downloaded. Initiating Deep Config...")
-        # Defer to allow the previous worker thread to fully terminate
-        QTimer.singleShot(1000, self._run_environment_setup)
+        self.setup_log.append("\n[System] Stack downloaded. Applying submodule patches...")
+        
+        # Run submodule patches (CRITICAL for Super Mario Maker and other fixes)
+        patch_script = os.path.join(s_dir, "scripts", "setup-submodule-patches.sh")
+        if os.path.isfile(patch_script):
+            if OS_INFO["os"] == "linux":
+                patch_cmd = f"chmod +x {shlex.quote(patch_script)} && {shlex.quote(patch_script)}"
+            else:
+                # On Windows, try to run it with bash (if available via Git Bash) or just try to execute
+                patch_cmd = f"bash {shlex.quote(patch_script)}" if shutil.which("bash") else shlex.quote(patch_script)
+                
+            self._run_command(
+                patch_cmd,
+                self.setup_log,
+                cwd=s_dir,
+                on_done=lambda c: QTimer.singleShot(1000, self._run_environment_setup)
+            )
+        else:
+            self.setup_log.append("[WARN] scripts/setup-submodule-patches.sh not found. Skipping patches.")
+            QTimer.singleShot(1000, self._run_environment_setup)
 
     def _run_environment_setup(self):
         """Generate environment files and run the setup pipeline."""
@@ -1736,6 +1759,9 @@ class PretendoManager(QMainWindow):
         self.setup_log.append("[System] Generating environment configuration...")
         try:
             self._generate_env_files(s_dir, local_ip)
+            self._ensure_smm_metadata(s_dir)
+            self._fix_go_build_compatibility(s_dir)
+            self._fix_juxtaposition_ui_aliases(s_dir)
             self.setup_log.append("[OK] Environment files generated successfully.")
         except Exception as e:
             self.setup_log.append(f"[ERROR] Failed to generate environment: {e}")
@@ -1770,23 +1796,34 @@ class PretendoManager(QMainWindow):
             self.setup_log.append(f"[WARN] Environment directory not found at {env_dir}, creating it...")
             os.makedirs(env_dir, exist_ok=True)
         
-        # Generate all secrets
-        account_aes_key = gen_hex(64)
-        account_datastore_secret = gen_hex(32)
-        account_grpc_api_key = gen_password(32)
-        minio_secret_key = gen_password(32)
-        postgres_password = gen_password(32)
-        friends_auth_pw = gen_password(32)
-        friends_secure_pw = gen_password(32)
-        friends_api_key = gen_password(32)
-        friends_aes_key = gen_hex(64)
-        chat_kerberos_pw = gen_password(32)
-        smm_kerberos_pw = gen_password(32)
-        splat_kerberos_pw = gen_password(32)
-        minecraft_kerberos_pw = gen_password(32)
-        pikmin3_kerberos_pw = gen_password(32)
-        miiverse_aes_key = gen_hex(64)
-        boss_api_key = gen_password(32)
+        # Helper to load existing secrets to prevent rotating them unnecessarily on every deploy
+        def get_existing(fname, key, fallback):
+            val = self._grep_env_file(os.path.join(env_dir, fname), key)
+            return val if val else fallback
+
+        # Load or generate all secrets
+        account_aes_key = get_existing("account.local.env", "PN_ACT_CONFIG_AES_KEY", gen_hex(64))
+        account_datastore_secret = get_existing("account.local.env", "PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET", gen_hex(32))
+        account_grpc_api_key = get_existing("account.local.env", "PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT", gen_password(32))
+        minio_secret_key = get_existing("account.local.env", "PN_ACT_CONFIG_S3_ACCESS_SECRET", gen_password(32))
+        postgres_password = get_existing("postgres.local.env", "POSTGRES_PASSWORD", gen_password(32))
+        
+        friends_auth_pw = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD", gen_password(32))
+        friends_secure_pw = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_SECURE_PASSWORD", gen_password(32))
+        friends_api_key = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_GRPC_API_KEY", gen_password(32))
+        friends_aes_key = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_AES_KEY", gen_hex(64))
+        
+        chat_kerberos_pw = get_existing("wiiu-chat.local.env", "PN_WIIU_CHAT_KERBEROS_PASSWORD", gen_password(32))
+        smm_kerberos_pw = get_existing("super-mario-maker.local.env", "PN_SMM_KERBEROS_PASSWORD", gen_password(32))
+        smm_aes_key = get_existing("super-mario-maker.local.env", "PN_SMM_CONFIG_AES_KEY", gen_hex(64))
+        
+        splat_kerberos_pw = get_existing("splatoon.local.env", "PN_SPLATOON_KERBEROS_PASSWORD", gen_password(32))
+        splat_aes_key = get_existing("splatoon.local.env", "PN_SPLATOON_CONFIG_AES_KEY", gen_hex(64))
+        
+        minecraft_kerberos_pw = get_existing("minecraft-wiiu.local.env", "PN_MINECRAFT_WIIU_KERBEROS_PASSWORD", gen_password(32))
+        pikmin3_kerberos_pw = get_existing("pikmin-3.local.env", "PN_PIKMIN3_KERBEROS_PASSWORD", gen_password(32))
+        
+        boss_api_key = get_existing("boss.local.env", "PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY", gen_password(32))
         
         # Build all env file contents
         env_files = {}
@@ -1798,6 +1835,8 @@ class PretendoManager(QMainWindow):
             f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT={account_grpc_api_key}",
             f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_API={account_grpc_api_key}",
             f"PN_ACT_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
+            f"PN_ACT_CONFIG_S3_ENDPOINT=http://minio:9000",
+            f"PN_ACT_CONFIG_S3_ACCESS_KEY=minio_pretendo",
         ]
         
         # friends.local.env
@@ -1815,22 +1854,28 @@ class PretendoManager(QMainWindow):
         env_files["miiverse-api.local.env"] = [
             f"PN_MIIVERSE_API_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
             f"PN_MIIVERSE_API_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
+            f"PN_MIIVERSE_API_CONFIG_S3_ENDPOINT=http://minio:9000",
+            f"PN_MIIVERSE_API_CONFIG_S3_ACCESS_KEY=minio_pretendo",
             f"PN_MIIVERSE_API_CONFIG_GRPC_FRIENDS_API_KEY={friends_api_key}",
-            f"PN_MIIVERSE_API_CONFIG_AES_KEY={miiverse_aes_key}",
+            f"PN_MIIVERSE_API_CONFIG_AES_KEY={account_aes_key}", # Sync with account server
         ]
         
         # juxtaposition-ui.local.env
         env_files["juxtaposition-ui.local.env"] = [
             f"JUXT_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
             f"JUXT_CONFIG_AWS_SPACES_SECRET={minio_secret_key}",
+            f"JUXT_CONFIG_AWS_SPACES_ENDPOINT=http://minio:9000",
+            f"JUXT_CONFIG_AWS_SPACES_ACCESS_KEY=minio_pretendo",
             f"JUXT_CONFIG_GRPC_FRIENDS_API_KEY={friends_api_key}",
-            f"JUXT_CONFIG_AES_KEY={miiverse_aes_key}",
+            f"JUXT_CONFIG_AES_KEY={account_aes_key}", # Sync with account server
         ]
         
         # boss.local.env
         env_files["boss.local.env"] = [
             f"PN_BOSS_CONFIG_GRPC_ACCOUNT_SERVER_API_KEY={account_grpc_api_key}",
             f"PN_BOSS_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
+            f"PN_BOSS_CONFIG_S3_ENDPOINT=http://minio:9000",
+            f"PN_BOSS_CONFIG_S3_ACCESS_KEY=minio_pretendo",
             f"PN_BOSS_CONFIG_GRPC_FRIENDS_SERVER_API_KEY={friends_api_key}",
             f"PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY={boss_api_key}",
         ]
@@ -1839,7 +1884,10 @@ class PretendoManager(QMainWindow):
         env_files["super-mario-maker.local.env"] = [
             f"PN_SMM_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
             f"PN_SMM_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
+            f"PN_SMM_CONFIG_S3_ENDPOINT=http://minio:9000",
+            f"PN_SMM_CONFIG_S3_ACCESS_KEY=minio_pretendo",
             f"PN_SMM_KERBEROS_PASSWORD={smm_kerberos_pw}",
+            f"PN_SMM_CONFIG_AES_KEY={smm_aes_key}",
             f"PN_SMM_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/super_mario_maker?sslmode=disable",
             f"PN_SMM_SECURE_SERVER_HOST={server_ip}",
         ]
@@ -1848,6 +1896,7 @@ class PretendoManager(QMainWindow):
         env_files["splatoon.local.env"] = [
             f"PN_SPLATOON_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
             f"PN_SPLATOON_KERBEROS_PASSWORD={splat_kerberos_pw}",
+            f"PN_SPLATOON_CONFIG_AES_KEY={splat_aes_key}",
             f"PN_SPLATOON_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/splatoon?sslmode=disable",
             f"PN_SPLATOON_SECURE_SERVER_HOST={server_ip}",
         ]
@@ -1921,24 +1970,110 @@ Server IP address: {server_ip}
 """)
         self.setup_log.append("  [ENV] Created secrets.txt")
 
+    def _ensure_smm_metadata(self, s_dir):
+        """Ensure 900000.bin exists to prevent 'specified key does not exist' S3 error."""
+        dest_path = os.path.join(s_dir, "environment", "900000.bin")
+        if os.path.exists(dest_path):
+            self.setup_log.append("[INFO] SMM metadata file already exists.")
+            return
+            
+        self.setup_log.append("[System] Ensuring Super Mario Maker metadata (900000.bin)...")
+        
+        # Attempt download from a known mirror first
+        mirror_url = "https://raw.githubusercontent.com/MatthewL246/pretendo-docker/master/console-files/900000.bin"
+        if HAS_REQUESTS:
+            try:
+                self.setup_log.append(f"  [HTTP] Attempting to download metadata from known mirror...")
+                r = requests.get(mirror_url, timeout=10)
+                if r.status_code == 200:
+                    with open(dest_path, "wb") as f:
+                        f.write(r.content)
+                    self.setup_log.append("[OK] SMM metadata downloaded successfully.")
+                    return
+            except: pass
+
+        # Fallback: Create placeholder to satisfy the Stat check (patch handles rest)
+        try:
+            with open(dest_path, "wb") as f:
+                f.write(b"") 
+            self.setup_log.append("[OK] SMM metadata placeholder created (0 bytes).")
+        except Exception as e:
+            self.setup_log.append(f"[WARN] Failed to create SMM metadata placeholder: {e}")
+
+    def _fix_go_build_compatibility(self, s_dir):
+        """Fix build errors where latest Delve requires Go 1.24+ by pinning dlv to v1.22.0."""
+        self.setup_log.append("[System] Patching Go Dockerfiles for build compatibility...")
+        repos_dir = os.path.join(s_dir, "repos")
+        if not os.path.isdir(repos_dir):
+            return
+
+        cnt = 0
+        for root, _, files in os.walk(repos_dir):
+            if "Dockerfile" in files:
+                fpath = os.path.join(root, "Dockerfile")
+                try:
+                    with open(fpath, "r") as f:
+                        content = f.read()
+                    
+                    if "dlv@latest" in content:
+                        new_content = content.replace("dlv@latest", "dlv@v1.22.0")
+                        if new_content != content:
+                            with open(fpath, "w") as f:
+                                f.write(new_content)
+                            cnt += 1
+                except Exception as e:
+                    self.setup_log.append(f"  [WARN] Failed to patch {fpath}: {e}")
+        if cnt > 0:
+            self.setup_log.append(f"[OK] Pinned Delve to v1.22.0 in {cnt} Dockerfiles.")
+
+    def _fix_juxtaposition_ui_aliases(self, s_dir):
+        """Fix Juxtaposition UI crash caused by incorrect module aliases in package.json."""
+        self.setup_log.append("[System] Patching Juxtaposition UI module aliases...")
+        pkg_path = os.path.join(s_dir, "repos", "juxtaposition-ui", "package.json")
+        if not os.path.isfile(pkg_path):
+            self.setup_log.append("[WARN] Juxtaposition UI package.json not found. Skipping alias fix.")
+            return
+
+        try:
+            with open(pkg_path, "r") as f:
+                data = json.load(f)
+            
+            if "_moduleAliases" in data:
+                # The upstream aliases point to invalid absolute paths like "/app/config.js"
+                # We need them to point to the actual locations in our container setup.
+                # Since we bind-mount config.json to the app root, we can just point them there.
+                aliases = data["_moduleAliases"]
+                changed = False
+                
+                # recursive check for all keys ending in config.json as they cause crashes
+                for key in list(aliases.keys()):
+                    if key.endswith("config.json"):
+                        # Point to the actual config.json in the container's app workdir
+                        aliases[key] = "/home/node/app/config.json"
+                        changed = True
+                
+                if changed:
+                    with open(pkg_path, "w") as f:
+                        json.dump(data, f, indent=2)
+                    self.setup_log.append("[OK] Corrected Juxtaposition UI module aliases.")
+        except Exception as e:
+            self.setup_log.append(f"[WARN] Failed to patch Juxtaposition UI aliases: {e}")
+
     def _deploy_step2_clear_and_pull(self, s_dir, local_ip, custom_port, pw=None):
         """Step 2: Clear ports and remove old containers."""
         ports_to_kill = f"80 443 21 53 8080 {custom_port} 9231"
-        fuser_cmd = " ; ".join([f"fuser -k -n tcp {p} || true" for p in ports_to_kill.split()])
-        
         self.setup_log.append("[System] Wiping port conflicts and removing old containers...")
         
-        # Down any existing containers + kill ports
-        if pw:
-            down_cmd = f"docker compose down --remove-orphans 2>/dev/null; sudo -S bash -c '{fuser_cmd} || true'"
-            self._run_command(down_cmd, self.setup_log, cwd=s_dir, stdin_data=pw,
-                              on_done=lambda c: self._deploy_step3_pull(s_dir, pw),
-                              display_cmd="[Elevated] Clean Ports & Remove Old Containers")
-        else:
-            down_cmd = f"docker compose down --remove-orphans 2>/dev/null; {fuser_cmd} || true"
-            self._run_command(down_cmd, self.setup_log, cwd=s_dir,
-                              on_done=lambda c: self._deploy_step3_pull(s_dir, None),
-                              display_cmd="Clean Ports & Remove Old Containers")
+        # Build commands for port killing and container downing
+        kill_cmd = self._get_kill_ports_cmd(ports_to_kill, pw)
+        down_cmd = "docker compose down --remove-orphans 2>/dev/null || docker-compose down --remove-orphans 2>/dev/null || true"
+        
+        # Chain them together and run in background worker
+        full_cmd = f"{kill_cmd} ; {down_cmd}"
+        
+        self._run_command(full_cmd, self.setup_log, cwd=s_dir, stdin_data=pw,
+                          on_done=lambda c: self._deploy_step3_pull(s_dir, pw),
+                          display_cmd="Clean Ports & Down Containers")
 
     def _deploy_step3_pull(self, s_dir, pw):
         """Step 3: Pull docker images."""
@@ -2041,14 +2176,14 @@ Server IP address: {server_ip}
                 return
 
         self.setup_log.append("[System] Wiping port conflicts and removing old containers...")
-        fuser_cmd = "; ".join([f"fuser -k -n tcp {p}" for p in ports_to_kill.split()])
+        kill_cmd = self._get_kill_ports_cmd(ports_to_kill, pw)
         
         # Check if setup.sh exists and has its required dependencies
         setup_script = os.path.join(s_dir, "setup.sh")
         framework_script = os.path.join(s_dir, "scripts", "internal", "framework.sh")
         
-        if os.path.isfile(setup_script) and os.path.isfile(framework_script):
-            cmd = f"docker compose down --remove-orphans; sudo -S bash -c '{fuser_cmd} || true' && chmod +x ./setup.sh && ./setup.sh --force --server-ip {local_ip}"
+        if os.path.isfile(setup_script) and os.path.isfile(framework_script) and OS_INFO["os"] == "linux":
+            cmd = f"docker compose down --remove-orphans ; {kill_cmd} ; chmod +x ./setup.sh && ./setup.sh --force --server-ip {local_ip}"
         else:
             # Fallback: generate env files in Python, then pull + build
             if not os.path.isfile(setup_script):
@@ -2083,7 +2218,11 @@ Server IP address: {server_ip}
             _do_build()
 
     def _ensure_docker_active(self, on_ready):
-        """Ensure Docker service is running on Linux before proceeding."""
+        """Ensure Docker service is running appropriately for the platform."""
+        if OS_INFO["os"] != "linux":
+            on_ready()
+            return
+
         try:
             res = subprocess.run(["systemctl", "is-active", "docker"], capture_output=True, text=True)
             if res.stdout.strip() == "active":
@@ -2091,13 +2230,28 @@ Server IP address: {server_ip}
                 return
         except: pass
         
-        pw = None
-        if OS_INFO["os"] == "linux":
-            pw = self._ask_sudo_password()
-            if not pw: return
+        pw = self._ask_sudo_password()
+        if not pw: return
             
         self.setup_log.append("[System] Resetting and starting Docker services...")
         self._run_command("sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: on_ready() if c == 0 else None)
+
+    def _get_kill_ports_cmd(self, ports_str, pw=None):
+        """Generate a shell command string to kill processes on specified ports."""
+        ports = ports_str.split()
+        if OS_INFO["os"] == "windows":
+            # PowerShell one-liner
+            ps_parts = []
+            for p in ports:
+                ps_parts.append(f'try {{ Get-NetTCPConnection -LocalPort {p} -ErrorAction Stop | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force }} }} catch {{}}')
+            return 'powershell -Command "' + "; ".join(ps_parts) + '"'
+        else:
+            # Linux: build fuser sequence
+            f_parts = [f"fuser -k -n tcp {p}" for p in ports]
+            inner = " ; ".join(f_parts) + " ; true"
+            if pw:
+                return f"sudo -S bash -c '{inner}'"
+            return inner
 
     def fix_docker_permissions(self):
         """Fix Docker socket permissions on Linux."""
@@ -2144,12 +2298,22 @@ Server IP address: {server_ip}
             QMessageBox.warning(self, "Network Error", "The Pretendo Server must be RUNNING (ONLINE) to create an account in the database.")
             return
         pid = int(hashlib.sha256(username.lower().encode('utf-8')).hexdigest(), 16) % 1000000000 + 1000000000
+        local_ip = self._get_local_ip()
+        s_dir = self.server_dir_field.text().strip()
+        
+        # Pull AES keys from host env files to sync into the container's database
+        friends_aes = self._grep_env_file(os.path.join(s_dir, "environment", "friends.local.env"), "PN_FRIENDS_CONFIG_AES_KEY") or ""
+        splatoon_aes = self._grep_env_file(os.path.join(s_dir, "environment", "splatoon.local.env"), "PN_SPLATOON_CONFIG_AES_KEY") or ""
+        smm_aes = self._grep_env_file(os.path.join(s_dir, "environment", "super-mario-maker.local.env"), "PN_SMM_CONFIG_AES_KEY") or ""
+        miiverse_aes = self._grep_env_file(os.path.join(s_dir, "environment", "miiverse-api.local.env"), "PN_MIIVERSE_API_CONFIG_AES_KEY") or ""
         
         js_script = f"""
 const {{ connect }} = require("./dist/database");
 const {{ PNID }} = require("./dist/models/pnid");
 const {{ NEXAccount }} = require("./dist/models/nex-account");
+const {{ Server }} = require("./dist/models/server");
 const {{ nintendoPasswordHash }} = require("./dist/util");
+const mongoose = require("mongoose");
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
 
@@ -2161,6 +2325,7 @@ try {{
     const miiName = "{miiname}";
     const email = username + "@pretendo.local";
     const pid = {pid};
+    const local_ip = "{local_ip}";
 
     const nintendoPw = await nintendoPasswordHash(pass, pid);
     const hashedPw = await bcrypt.hash(nintendoPw, 10);
@@ -2176,7 +2341,7 @@ try {{
         const nameBuf = Buffer.from(miiName.padEnd(10, '\\0').slice(0, 10), "utf16le");
         nameBuf.swap16(); 
         const nameHex = nameBuf.toString("hex");
-        const miiDataHex = ("01000100" + "00".repeat(22) + nameHex).padEnd(192, "0");
+        const miiDataHex = ("03000100" + "00".repeat(22) + nameHex).padEnd(192, "0");
 
         user = new PNID({{
             pid: pid,
@@ -2230,6 +2395,55 @@ try {{
         console.log("[Success] NEX-Account linked! Password: " + nexPass);
     }} else {{
         console.log("[Notice] NEX-Account already synchronized.");
+    }}
+
+    // --- Server Synchronization (Splatoon, SMM, Friends, Miiverse) ---
+    async function upsertNexServer(name, gid, titles, port, aes, cid) {{
+        for (const mode of ["prod", "test", "dev"]) {{
+            const query = gid ? {{ game_server_id: gid, access_mode: mode }} : {{ client_id: cid, access_mode: mode }};
+            await Server.findOneAndUpdate(
+                query,
+                {{
+                    service_name: name,
+                    service_type: gid ? "nex" : "service",
+                    title_ids: titles,
+                    ip: local_ip,
+                    port: port || 80,
+                    maintenance_mode: false,
+                    device: 1,
+                    aes_key: aes || "0".repeat(64),
+                    client_id: cid
+                }},
+                {{ upsert: true }}
+            );
+        }}
+    }}
+
+    console.log("[Notice] Patching Game Server Definitions...");
+    await upsertNexServer("Splatoon", "10162B00", ["0005000010176A00", "0005000010176900", "0005000010162B00"], 6006, "{splatoon_aes}");
+    await upsertNexServer("Super Mario Maker", "1018DB00", ["000500001018DB00", "000500001018DC00", "000500001018DD00"], 6004, "{smm_aes}");
+    await upsertNexServer("Friend List", "00003200", ["0005001010001C00", "000500301001500A", "000500301001510A", "000500301001520A"], 6000, "{friends_aes}");
+    await upsertNexServer("Miiverse", null, ["000500301001600A", "000500301001610A", "000500301001620A"], 80, "{miiverse_aes}", "87cd32617f1985439ea608c2746e4610");
+
+    // --- Miiverse Discovery Patch (Fixes 400 error) ---
+    try {{
+        const miiverseDb = mongoose.connection.useDb("pretendo_miiverse");
+        const Endpoint = miiverseDb.model("Endpoint", new mongoose.Schema({{}}, {{ strict: false }}), "endpoints");
+        await Endpoint.findOneAndUpdate(
+            {{ server_access_level: "prod" }},
+            {{
+                status: 0,
+                host: "discovery.olv.pretendo.cc",
+                api_host: "api.olv.pretendo.cc",
+                portal_host: "portal.olv.pretendo.cc",
+                n3ds_host: "n3ds.olv.pretendo.cc",
+                server_access_level: "prod"
+            }},
+            {{ upsert: true }}
+        );
+        console.log("[Notice] Miiverse Discovery endpoints synchronized.");
+    }} catch (mErr) {{
+        console.log("[Notice] Miiverse sync error: " + mErr.message);
     }}
 
     process.exit(0);
@@ -2528,9 +2742,17 @@ try {{
                 "IsCommitted=1"
             ]
             
-            acct_dir = os.path.join(data_path, "mlc01", "usr", "save", "system", "act", "80000001")
-            os.makedirs(acct_dir, exist_ok=True)
-            with open(os.path.join(acct_dir, "account.dat"), "w", encoding="utf-8") as f: f.write("\n".join(lines))
+            # Destinations: BOTH usr/act (1.x) and accounts/ folder (2.x)
+            acct_dir_1x = os.path.join(data_path, "mlc01", "usr", "save", "system", "act", "80000001")
+            acct_dir_2x = os.path.join(data_path, "accounts", "80000001")
+            
+            for d in [acct_dir_1x, acct_dir_2x]:
+                try:
+                    os.makedirs(d, exist_ok=True)
+                    # Write both account.dat and account.ini for hybrid compatibility
+                    with open(os.path.join(d, "account.dat"), "w", encoding="utf-8") as f: f.write("\n".join(lines))
+                    with open(os.path.join(d, "account.ini"), "w", encoding="utf-8") as f: f.write("\n".join(lines))
+                except: pass
 
             self.statusBar().showMessage(f"Deep Identity Fix Applied for {username}", 5000)
             QMessageBox.information(self, "Success", f"Wii U Identity Files Realigned!\n\nAuthentication Hash: OK\nPrincipalId: {pid:08x}")
@@ -2772,6 +2994,17 @@ try {{
             worker.terminate()
             worker.wait(1000)
         event.accept()
+
+    def _grep_env_file(self, path, key):
+        """Helper to safely extract a key from a local env file if it exists."""
+        if not os.path.exists(path): return None
+        try:
+            with open(path, "r") as f:
+                for line in f:
+                    if line.startswith(f"{key}="):
+                        return line.split("=", 1)[1].strip()
+        except: pass
+        return None
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
