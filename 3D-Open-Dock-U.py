@@ -259,13 +259,13 @@ class CommandWorker(QThread):
             
             if self.stdin_data is not None and proc.stdin:
                 try:
-                    # Write password + newline
-                    proc.stdin.write((self.stdin_data + "\n").encode())
+                    # Write password directly
+                    # Added multiple newlines to ensure it flushes
+                    proc.stdin.write((self.stdin_data + "\n\n").encode('utf-8'))
                     proc.stdin.flush()
                     # A tiny delay ensures the OS pipe has processed the data 
-                    # before EOF is signaled. Important for sudo -S.
                     import time
-                    time.sleep(0.05) 
+                    time.sleep(0.1) 
                     proc.stdin.close()
                 except Exception as e:
                     self.output.emit(f"[DEBUG] Stdin write error: {e}")
@@ -371,7 +371,7 @@ class SudoPasswordDialog(QDialog):
             self.pass_field.setEchoMode(QLineEdit.Password)
             
     def get_data(self):
-        return self.pass_field.text().strip(), self.remember_cb.isChecked()
+        return self.pass_field.text(), self.remember_cb.isChecked()
 
 class PretendoManager(QMainWindow):
     def __init__(self):
@@ -508,7 +508,7 @@ class PretendoManager(QMainWindow):
         
         # Always persist sudo password if entered, heavily obfuscated
         if hasattr(self, 'server_sudo_pass'):
-            sudo_pw = self.server_sudo_pass.text().strip()
+            sudo_pw = self.server_sudo_pass.text()
             if sudo_pw:
                 self.settings.setValue("sudo_cache", _obs(sudo_pw))
                 self.cached_password = sudo_pw
@@ -575,13 +575,8 @@ class PretendoManager(QMainWindow):
         glay.addWidget(self.server_toggle_btn)
         
         btn_hl = QHBoxLayout()
-        self.stream_log_btn = QPushButton("Stream Node Logs", clicked=self.stream_docker_logs)
-        self.stream_log_btn.setStyleSheet(f"color: {CYAN_LIGHT};")
-        btn_hl.addWidget(self.stream_log_btn)
         self.clear_server_log_btn = QPushButton("Clear Logs", clicked=lambda: self.server_log.clear())
         btn_hl.addWidget(self.clear_server_log_btn)
-        self.check_btn = QPushButton("Health Check", clicked=self.run_setup_check)
-        btn_hl.addWidget(self.check_btn)
         glay.addLayout(btn_hl)
         
         self.check_result = QLabel("")
@@ -644,7 +639,6 @@ class PretendoManager(QMainWindow):
             row_sys.addWidget(QPushButton("Fix Perms", clicked=self.fix_docker_permissions))
             row_sys.addWidget(QPushButton("Reset Per-Session Sudo", clicked=lambda: setattr(self, 'cached_password', None) or (self.server_sudo_pass.clear() if self.server_sudo_pass else None)))
         
-        row_sys.addWidget(QPushButton("Health Check", clicked=self.run_setup_check))
         dlay.addLayout(row_sys)
 
         rv.addWidget(dep)
@@ -1116,54 +1110,134 @@ class PretendoManager(QMainWindow):
             self.refresh_vault_list()
 
     def _apply_compose_patches(self, port, s_dir):
-        """Robust YAML patching for mitmproxy port and MongoDB version."""
+        """Robust YAML patching for mitmproxy port and MongoDB version/stability."""
         for fname in ["compose.yml", "docker-compose.yml"]:
             path = os.path.join(s_dir, fname)
             if not os.path.exists(path): continue
             try:
                 with open(path, "r") as f: lines = f.readlines()
                 new_lines = []
-                in_mitm = False
+                current_service = None
                 changed = False
-                for line in lines:
+                for i, line in enumerate(lines):
                     stripped = line.strip()
-                    if not stripped or stripped.startswith("#"):
-                        pass
-                    elif line.startswith("  ") and not line.startswith("   ") and stripped.endswith(":"):
-                        if line.startswith("  mitmproxy-pretendo:"):
-                            in_mitm = True
-                        else:
-                            in_mitm = False
-                    
-                    if in_mitm and ":8080" in line and "ports:" not in line:
-                        # Robustly replace any port mapping to internal 8080
-                        new_line = re.sub(r'(?:^\s*-\s*|:)(\d+):8080', lambda m: m.group(0).replace(m.group(1), str(port)), line)
-                        if new_line != line:
-                            line = new_line
+                    # Identify current service block
+                    if line.startswith("  ") and not line.startswith("   ") and stripped.endswith(":") and not stripped.startswith("-"):
+                        current_service = stripped[:-1].lower()
+
+                    if current_service == "mitmproxy-pretendo":
+                        if ":8080" in line and "ports:" not in line:
+                            # Robustly replace any port mapping to internal 8080
+                            new_line = re.sub(r'(?:^\s*-\s*|:)(\d+):8080', lambda m: m.group(0).replace(m.group(1), str(port)), line)
+                            if new_line != line:
+                                line = new_line
+                                changed = True
+                        if "command: mitmweb" in line and "pretendo_addon.py" not in line:
+                            line = line.replace("mitmweb --web-host 0.0.0.0", "mitmweb --web-host 0.0.0.0 --set confdir=./.mitmproxy -s ./pretendo_addon.py --set pretendo_redirect=true --set pretendo_host=nginx --set pretendo_host_port=80 --set pretendo_http=true --set client_certs=./client-certificates/WiiU-common.pem --set ssl_insecure=true --set tls_version_client_min=UNBOUNDED --set tls_version_server_min=UNBOUNDED")
                             changed = True
 
-                    if in_mitm and "command: mitmweb" in line and "pretendo_addon.py" not in line:
-                        line = line.replace("mitmweb --web-host 0.0.0.0", "mitmweb --web-host 0.0.0.0 --set confdir=./.mitmproxy -s ./pretendo_addon.py --set pretendo_redirect=true --set pretendo_host=nginx --set pretendo_host_port=80 --set pretendo_http=true --set client_certs=./client-certificates/WiiU-common.pem --set ssl_insecure=true --set tls_version_client_min=UNBOUNDED --set tls_version_server_min=UNBOUNDED")
-                        changed = True
+                    if current_service == "adminer":
+                        if "127.0.0.1:8070:8080" in line:
+                            line = line.replace("127.0.0.1:8070:8080", "127.0.0.1:8088:8080")
+                            changed = True
+                        
+                    if current_service == "mongodb":
+                        if "image: mongo:latest" in line:
+                            line = line.replace("mongo:latest", "mongo:4.4")
+                            changed = True
+                        # Add 'mongo' alias for legacy service compatibility
+                        if "networks:" in line:
+                            # Check if 'internal:' is present in the next few lines
+                            for j in range(i + 1, min(i + 5, len(lines))):
+                                if "internal:" in lines[j]:
+                                    # Check if 'aliases:' is already present under 'internal:'
+                                    aliases_found = False
+                                    for k in range(j + 1, min(j + 5, len(lines))):
+                                        if "aliases:" in lines[k]:
+                                            aliases_found = True
+                                            break
+                                        if lines[k].strip() == "" or not lines[k].startswith("      "): # Stop if indentation changes or empty line
+                                            break
+                                    if not aliases_found:
+                                        # We can't easily insert into the list we are iterating over safely without index management
+                                        # but since we append to new_lines, we can just append there.
+                                        pass
+                                    break
 
-                    # Fix accidentally patched adminer
-                    if "adminer:" in line:
-                        in_adminer = True
-                    if "in_adminer" in locals() and in_adminer and "127.0.0.1:8070:8080" in line:
-                        line = line.replace("127.0.0.1:8070:8080", "127.0.0.1:8088:8080")
-                        changed = True
+                    if current_service == "mongo-express":
+                        if "image: mongo-express:latest" in line:
+                            # Fix for the broken /dev/tcp entrypoint in recent mongo-express images on Alpine
+                            # Pinning to 0.54.0 resolves the shell compatibility issue
+                            line = line.replace("mongo-express:latest", "mongo-express:0.54.0")
+                            changed = True
                         
-                    if "image: mongo:latest" in line:
-                        line = line.replace("mongo:latest", "mongo:4.4")
-                        changed = True
-                        
+                        # Inject connection compatibility vars if using the pinned version
+                        if "env_file:" in line and "mongo-express:0.54.0" in "".join(new_lines[-5:]):
+                             # If we see the pinned version, ensure we use the older MB_CONFIG vars
+                             # We'll handle this in _generate_env_files instead for persistence.
+                             pass
+
+                # Ensure mongo-express has its .local.env file included for the MB_CONFIG variables
+                if current_service == "mongo-express" and "mongo-express.env" in line and "mongo-express.local.env" not in "".join(lines[i:i+3]):
                     new_lines.append(line)
+                    indent = line[:line.find("-")]
+                    new_lines.append(f"{indent}- ./environment/mongo-express.local.env\n")
+                    changed = True
+                    continue
+
+                    new_lines.append(line)
+                    
+                    # Special case: Insert aliases after the 'internal:' line in mongodb service
+                    if current_service == "mongodb" and "internal:" in line:
+                        # Look ahead to see if aliases already exist
+                        already_has = False
+                        for j in range(i + 1, min(i + 5, len(lines))):
+                            if "aliases:" in lines[j]:
+                                already_has = True
+                                break
+                            if lines[j].strip() == "" or (len(lines[j]) > 0 and not lines[j].startswith("      ")):
+                                break
+                        if not already_has:
+                            new_lines.append("        aliases:\n")
+                            new_lines.append("          - mongo\n")
+                            changed = True
                 
                 if changed:
+                    self._patch_mitmproxy_addon(s_dir)
                     with open(path, "w") as f: f.writelines(new_lines)
                     return True
-            except: pass
+            except Exception as e:
+                print(f"Error patching {path}: {e}")
         return False
+
+    def _patch_mitmproxy_addon(self, s_dir):
+        """Fix the mitmproxy addon to prevent infinite loops when patching via IP address."""
+        addon_path = os.path.join(s_dir, "repos/mitmproxy-pretendo/pretendo_addon.py")
+        if not os.path.exists(addon_path): return
+        
+        try:
+            with open(addon_path, "r") as f: content = f.read()
+            changed = False
+            
+            if "import re" not in content and "from mitmproxy" in content:
+                content = content.replace("from mitmproxy", "import re\nfrom mitmproxy")
+                changed = True
+                
+            loop_fix = 'or re.match(r"^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$", flow.request.pretty_host)'
+            if loop_fix not in content:
+                # Find the pretendo condition block
+                if "or \"pretendo-cdn.b-cdn.net\" in flow.request.pretty_host" in content:
+                    content = content.replace(
+                        "or \"pretendo-cdn.b-cdn.net\" in flow.request.pretty_host",
+                        "or \"pretendo-cdn.b-cdn.net\" in flow.request.pretty_host\n                " + loop_fix
+                    )
+                    changed = True
+            
+            if changed:
+                with open(addon_path, "w") as f: f.write(content)
+                self.setup_log.append("[System] mitmproxy addon patched for IP-based loop prevention.")
+        except Exception as e:
+            self.setup_log.append(f"[WARN] Failed to patch mitmproxy addon: {e}")
 
 
     def run_setup_check(self):
@@ -1335,8 +1409,8 @@ class PretendoManager(QMainWindow):
 
     def _get_effective_sudo_password(self):
         """Unified helper to get password from UI field or cache."""
-        if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text().strip():
-            pw = self.server_sudo_pass.text().strip()
+        if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text():
+            pw = self.server_sudo_pass.text()
             self.cached_password = pw
             return pw
         return self.cached_password
@@ -1405,8 +1479,9 @@ class PretendoManager(QMainWindow):
     def _force_shutdown_sync(self, show_progress=True):
         """Blocking shutdown: kills containers, stops Docker, terminates workers. ALWAYS succeeds."""
         s_dir = self.server_dir_field.text().strip()
-        pw = self.cached_password or (self.server_sudo_pass.text().strip() if hasattr(self, 'server_sudo_pass') else None)
+        pw = self.cached_password or (self.server_sudo_pass.text() if hasattr(self, 'server_sudo_pass') else None)
         custom_port = self._get_target_port()
+        ports_to_kill = f"80 443 21 53 8080 {custom_port} 9231"
 
         if show_progress:
             self.statusBar().showMessage("FORCE SHUTDOWN IN PROGRESS — DO NOT CLOSE...")
@@ -1423,31 +1498,36 @@ class PretendoManager(QMainWindow):
         env = os.environ.copy()
         env.pop("LD_PRELOAD", None)
 
-        # Step 2: Run docker compose down SYNCHRONOUSLY (blocking, up to 20s)
+        # Step 2: Run docker compose down SYNCHRONOUSLY
         if os.path.isdir(s_dir):
             try:
                 subprocess.run(
                     "docker compose down --remove-orphans",
                     shell=True, cwd=s_dir, env=env,
-                    timeout=20
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=30
                 )
             except Exception:
-                pass  # If it fails or times out, continue anyway
+                pass
 
         # Step 3: Kill any lingering port processes + stop Docker service (Linux)
         if OS_INFO["os"] == "linux":
-            self._kill_port_processes(ports_to_kill, pw)
-            if pw:
-                try:
-                    subprocess.run(
-                        f"sudo -S bash -c 'systemctl stop docker.socket docker.service'",
-                        shell=True, input=pw + "\n", env=env,
-                        capture_output=True, text=True, timeout=10
-                    )
-                except Exception:
-                    pass
+            kill_cmd = self._get_kill_ports_cmd(ports_to_kill, pw)
+            try:
+                # Use subprocess to run the kill command directly
+                if pw:
+                    subprocess.run(kill_cmd, shell=True, input=pw + "\n\n", env=env, timeout=10)
+                    subprocess.run(f"sudo -S systemctl stop docker.socket docker.service", shell=True, input=pw + "\n\n", env=env, timeout=10)
+                else:
+                    subprocess.run(kill_cmd, shell=True, env=env, timeout=10)
+            except Exception:
+                pass
         elif OS_INFO["os"] == "windows":
-            self._kill_port_processes(ports_to_kill)
+            kill_cmd = self._get_kill_ports_cmd(ports_to_kill)
+            try:
+                subprocess.run(kill_cmd, shell=True, env=env, timeout=15)
+            except Exception:
+                pass
 
     def emergency_exit(self):
         """ATOMIC SHUTDOWN: force stops everything and kills the process unconditionally."""
@@ -1512,32 +1592,44 @@ class PretendoManager(QMainWindow):
                 setup_cmds = []
                 # Quietly initiate MongoDB RS if not already done
                 # Note: No 'sudo -S' here, the wrapper will handle elevation
-                setup_cmds.append("for i in {1..15}; do docker compose exec -T mongodb mongo --eval 'rs.status()' >/dev/null 2>&1 && break; docker compose exec -T mongodb mongo --eval 'rs.initiate()' >/dev/null 2>&1 && break; sleep 2; done")
+                self.server_log.append("[System] Running post-boot database initialization...")
                 
-                # Check for postgres init script on host and execute it if found
+                # 1. MongoDB Guard
+                setup_cmds.append("echo '[Post-Boot] Initializing MongoDB Replica Set...'")
+                setup_cmds.append("for i in {1..15}; do if docker compose exec -T mongodb mongo --eval 'rs.status()' >/dev/null 2>&1; then echo '  [OK] Mongo RS Active'; break; fi; if docker compose exec -T mongodb mongo --eval 'rs.initiate()' >/dev/null 2>&1; then echo '  [INIT] Mongo RS Initiated'; break; fi; echo '  [WAIT] Mongo booting...'; sleep 2; done")
+                
+                # 2. Postgres Guard
                 pg_host_script = os.path.join(s_dir, "scripts/run-in-container/postgres-init.sh")
                 if os.path.exists(pg_host_script):
                     try:
+                        import shlex
                         with open(pg_host_script, 'r') as f:
-                            pg_content = f.read().replace("'", "'\"'\"'")
-                        setup_cmds.append(f"for i in {{1..15}}; do docker compose exec -T postgres sh -c '{pg_content}' >/dev/null 2>&1 && break; sleep 2; done")
+                            pg_content = f.read()
+                        setup_cmds.append("echo '[Post-Boot] Initializing Postgres Databases...'")
+                        setup_cmds.append(f"for i in {{1..15}}; do docker compose exec -T postgres sh -c {shlex.quote(pg_content)} >/dev/null 2>&1 && echo '  [OK] Postgres Initialized' && break; sleep 2; done")
                     except: pass
+
+                # 3. Stabilization Delay
+                setup_cmds.append("echo '[Post-Boot] Cooling down for service stability (8s)...'")
+                setup_cmds.append("sleep 8")
                 
-                setup_cmds.append("sleep 8; docker compose restart friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website >/dev/null 2>&1 || true")
+                # 4. State Sync
+                setup_cmds.append("echo '[Post-Boot] Synchronizing application state...'")
+                setup_cmds.append("docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website")
                 
-                full_setup_cmd = " ; ".join(setup_cmds)
-                
-                # IMPORTANT: Use CommandWorker or a piped Popen to pass the password to the sudo calls inside
-                if pw and OS_INFO["os"] == "linux": # Only Linux needs sudo for these commands if they are wrapped
-                    self.server_log.append("[System] Running post-boot database initialization...")
-                    # Wrap everything in a single sudo bash -c to avoid multi-elevations consuming same stdin password
-                    inner_cmds = " ; ".join(setup_cmds).replace("'", "'\"'\"'")
-                    full_cmd = f"sudo -S bash -c '{inner_cmds}'"
-                    self._run_command(full_cmd, self.server_log, s_dir, stdin_data=pw, display_cmd="[Elevated] Post-Boot Initialization")
+                # 5. Account Health Guard (Prevents 502 errors in Cemu)
+                setup_cmds.append("echo '[Post-Boot] Verifying Account Server health...'")
+                setup_cmds.append("for i in {1..15}; do if docker compose exec -T account node -e \"require('http').get('http://localhost:8080', (res) => process.exit(0)).on('error', (e) => process.exit(1))\" >/dev/null 2>&1; then echo '  [SUCCESS] Account Server Online'; break; fi; echo '  [WAIT] Account Server booting...'; sleep 3; done")
+
+                # Handle execution
+                import shlex
+                inner_cmds = " ; ".join(setup_cmds)
+                if pw and OS_INFO["os"] == "linux":
+                    full_cmd = f"sudo -S bash -c {shlex.quote(inner_cmds)}"
+                    self._run_command(full_cmd, self.server_log, s_dir, stdin_data=pw, display_cmd="[Elevated] Post-Boot Initialization", on_done=lambda c: self.stream_docker_logs())
                 else:
-                    self.server_log.append("[System] Running post-boot database initialization (Best-Effort)...")
-                    full_cmd = " ; ".join(setup_cmds)
-                    self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Standard] Post-Boot Initialization")
+                    full_cmd = inner_cmds
+                    self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Standard] Post-Boot Initialization", on_done=lambda c: self.stream_docker_logs())
 
             self._check_docker_status()
 
@@ -1545,7 +1637,7 @@ class PretendoManager(QMainWindow):
             if pw:
                 self.server_log.append("[System] Starting background services and clearing ports...")
                 # Wrap everything in sudo to ensure permissions for systemctl, fuser, AND docker
-                inner = f"systemctl start docker.socket docker.service ; {fuser_cmd} ; docker compose up -d"
+                inner = f"echo '[System] Activating Docker...'; systemctl start docker.socket docker.service ; echo '[System] Cleaning Ports...'; {fuser_cmd} ; echo '[System] Starting Framework...'; docker compose up -d"
                 # Safe shell quoting for the inner command string
                 import shlex
                 quoted_inner = shlex.quote(inner)
@@ -1575,7 +1667,9 @@ class PretendoManager(QMainWindow):
 
             if pw:
                 self.server_log.append("[System] Stopping server and force-releasing ports (Secure-Fast-Track)...")
-                cmd = f"docker compose down; sudo -S bash -c 'systemctl stop docker.socket docker.service; {fuser_cmd} || true'"
+                import shlex
+                inner = f"echo '[System] Stopping Containers...'; docker compose down; echo '[System] Disabling Docker...'; systemctl stop docker.socket docker.service; echo '[System] Releasing Ports...'; {fuser_cmd} || true"
+                cmd = f"sudo -S bash -c {shlex.quote(inner)}"
                 self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=lambda c: self._check_docker_status(), display_cmd="[Elevated] Stop Framework & Clean Ports")
             else:
                 self.server_log.append("[System] Stopping server containers and clearing ports (Best-Effort)...")
@@ -1932,6 +2026,12 @@ class PretendoManager(QMainWindow):
         env_files["postgres.local.env"] = [
             f"POSTGRES_PASSWORD={postgres_password}",
         ]
+
+        # mongo-express.local.env (compatibility for pinned version)
+        env_files["mongo-express.local.env"] = [
+            "ME_CONFIG_MONGODB_SERVER=mongodb",
+            "ME_CONFIG_MONGODB_PORT=27017",
+        ]
         
         # Write all env files
         for filename, lines in env_files.items():
@@ -2026,6 +2126,17 @@ Server IP address: {server_ip}
         if cnt > 0:
             self.setup_log.append(f"[OK] Pinned Delve to v1.22.0 in {cnt} Dockerfiles.")
 
+        # Fix gRPC resolver syntax for Splatoon
+        splat_init = os.path.join(s_dir, "repos/splatoon/init.go")
+        if os.path.isfile(splat_init):
+            try:
+                with open(splat_init, "r") as f: content = f.read()
+                if 'grpc.NewClient(fmt.Sprintf("dns:%s:%s"' in content:
+                    content = content.replace('dns:%s:%s"', 'dns:///%s:%s"')
+                    with open(splat_init, "w") as f: f.write(content)
+                    self.setup_log.append("[OK] Patched Splatoon gRPC resolver syntax.")
+            except: pass
+
     def _fix_juxtaposition_ui_aliases(self, s_dir):
         """Fix Juxtaposition UI crash caused by incorrect module aliases in package.json."""
         self.setup_log.append("[System] Patching Juxtaposition UI module aliases...")
@@ -2066,10 +2177,12 @@ Server IP address: {server_ip}
         
         # Build commands for port killing and container downing
         kill_cmd = self._get_kill_ports_cmd(ports_to_kill, pw)
-        down_cmd = "docker compose down --remove-orphans 2>/dev/null || docker-compose down --remove-orphans 2>/dev/null || true"
+        d_cmd = "docker compose down --remove-orphans 2>/dev/null || docker-compose down --remove-orphans 2>/dev/null || true"
+        if pw and OS_INFO["os"] == "linux":
+            d_cmd = f"sudo -S {d_cmd}"
         
         # Chain them together and run in background worker
-        full_cmd = f"{kill_cmd} ; {down_cmd}"
+        full_cmd = f"{kill_cmd} ; {d_cmd}"
         
         self._run_command(full_cmd, self.setup_log, cwd=s_dir, stdin_data=pw,
                           on_done=lambda c: self._deploy_step3_pull(s_dir, pw),
@@ -2087,9 +2200,13 @@ Server IP address: {server_ip}
         
         # Ensure Docker is active before pulling
         def _do_pull():
+            cmd = "docker compose pull --ignore-buildable 2>/dev/null || docker compose pull 2>/dev/null || true"
+            if pw and OS_INFO["os"] == "linux":
+                cmd = f"sudo -S {cmd}"
             QTimer.singleShot(500, lambda: self._run_command(
-                "docker compose pull --ignore-buildable 2>/dev/null || docker compose pull 2>/dev/null || true",
+                cmd,
                 self.setup_log, cwd=s_dir,
+                stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
                 on_done=_on_pull_done,
                 display_cmd="docker compose pull"
             ))
@@ -2117,9 +2234,14 @@ Server IP address: {server_ip}
             self._check_docker_status()
         
         def _do_build():
+            cmd = "docker compose build"
+            if pw and OS_INFO["os"] == "linux":
+                cmd = f"sudo -S {cmd}"
             QTimer.singleShot(500, lambda: self._run_command(
-                "docker compose build", self.setup_log, cwd=s_dir,
-                on_done=_on_build_done
+                cmd, self.setup_log, cwd=s_dir,
+                stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
+                on_done=_on_build_done,
+                display_cmd="docker compose build"
             ))
         
         if OS_INFO["os"] == "linux":
@@ -2199,7 +2321,12 @@ Server IP address: {server_ip}
                 self.setup_log.append(f"[ERROR] Failed to generate environment: {e}")
                 return
             
-            cmd = f"docker compose down --remove-orphans; sudo -S bash -c '{fuser_cmd} || true' && docker compose pull --ignore-buildable 2>/dev/null; docker compose pull 2>/dev/null; docker compose build"
+            inner = f"docker compose down --remove-orphans; {kill_cmd} ; docker compose pull --ignore-buildable 2>/dev/null; docker compose pull 2>/dev/null; docker compose build"
+            if pw and OS_INFO["os"] == "linux":
+                import shlex
+                cmd = f"sudo -S bash -c {shlex.quote(inner)}"
+            else:
+                cmd = inner
         
         self.setup_log.append(f"[System] Starting comprehensive setup with IP: {local_ip}...")
         self._run_command(cmd, self.setup_log, cwd=s_dir, stdin_data=pw, 
@@ -2211,7 +2338,15 @@ Server IP address: {server_ip}
         self.setup_log.append("\n[System] Deep Config Complete. Orchestrating container build process...")
         t = self.server_dir_field.text().strip()
         def _do_build():
-            QTimer.singleShot(500, lambda: self._run_command("docker compose build", self.setup_log, cwd=t, on_done=lambda c: QMessageBox.information(self, "Success", "Full Stack Deployment Finished! Ready to boot.") if c == 0 else self.setup_log.append(f"[ERROR] Build failed with exit code {c}")))
+            pw = self._get_effective_sudo_password()
+            b_cmd = "docker compose build"
+            if pw and OS_INFO["os"] == "linux":
+                b_cmd = f"sudo -S {b_cmd}"
+            QTimer.singleShot(500, lambda: self._run_command(
+                b_cmd, self.setup_log, cwd=t,
+                stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
+                on_done=lambda c: QMessageBox.information(self, "Success", "Full Stack Deployment Finished! Ready to boot.") if c == 0 else self.setup_log.append(f"[ERROR] Build failed with exit code {c}")
+            ))
         if OS_INFO["os"] == "linux":
             self._ensure_docker_active(_do_build)
         else:
@@ -2279,9 +2414,15 @@ Server IP address: {server_ip}
             self.cemu_username.clear()
             self.cemu_password.clear()
             self.cemu_miiname.clear()
-            self.server_sudo_pass.clear()
-            self.settings.clear()
+            if hasattr(self, "server_sudo_pass"):
+                self.server_sudo_pass.clear()
+            
+            # Wipe QSettings completely
+            for key in self.settings.allKeys():
+                self.settings.remove(key)
             self.settings.sync()
+            
+            self.statusBar().showMessage("SENSITIVE DATA PURGED", 5000)
             QMessageBox.information(self, "Data Wiped", "All sensitive data and administrator credentials have been permanently cleared.")
 
     def create_local_account(self):
@@ -2321,7 +2462,7 @@ const crypto = require("crypto");
 try {{
     await connect();
     const username = "{username}";
-    const pass = "{password}";
+    const pass = {json.dumps(password)};
     const miiName = "{miiname}";
     const email = username + "@pretendo.local";
     const pid = {pid};
@@ -2341,7 +2482,7 @@ try {{
         const nameBuf = Buffer.from(miiName.padEnd(10, '\\0').slice(0, 10), "utf16le");
         nameBuf.swap16(); 
         const nameHex = nameBuf.toString("hex");
-        const miiDataHex = ("03000100" + "00".repeat(22) + nameHex).padEnd(192, "0");
+        const miiDataHex = ("03000000" + "00".repeat(22) + nameHex).padEnd(192, "0");
 
         user = new PNID({{
             pid: pid,
@@ -2411,8 +2552,9 @@ try {{
                     port: port || 80,
                     maintenance_mode: false,
                     device: 1,
-                    aes_key: aes || "0".repeat(64),
-                    client_id: cid
+                    aes_key: (aes && aes.length === 64) ? aes : "0".repeat(64),
+                    client_id: cid,
+                    access_mode: mode
                 }},
                 {{ upsert: true }}
             );
@@ -2446,6 +2588,30 @@ try {{
         console.log("[Notice] Miiverse sync error: " + mErr.message);
     }}
 
+    // --- AUTO-FIX: Create account for 'BanndPenta' typo if current is 'BannedPenta' ---
+    if (username.toLowerCase() === "bannedpenta") {{
+        console.log("[Notice] Creating alias for 'BanndPenta' typo...");
+        const altUsername = "BanndPenta";
+        const altPid = 1617601004; 
+        let altUser = await PNID.findOne({{ usernameLower: altUsername.toLowerCase() }});
+        if (!altUser) {{
+            altUser = new PNID(user.toObject());
+            altUser._id = new mongoose.Types.ObjectId();
+            altUser.username = altUsername;
+            altUser.usernameLower = altUsername.toLowerCase();
+            altUser.pid = altPid;
+            await altUser.save();
+            
+            let altNex = new NEXAccount(nex.toObject());
+            altNex._id = new mongoose.Types.ObjectId();
+            altNex.pid = altPid;
+            altNex.owning_pid = altPid;
+            await altNex.save();
+            console.log("[Success] Alias 'BanndPenta' created with PID " + altPid);
+        }}
+    }}
+
+
     process.exit(0);
 }} catch(e) {{
     console.error(e);
@@ -2457,7 +2623,7 @@ try {{
         # Use docker compose exec -T for robust service targeting and project name handling
         cmd = f"docker compose exec -T account node -e {shlex.quote(js_script)}"
         
-        pw = self.cached_password or (self.server_sudo_pass.text().strip() if hasattr(self, 'server_sudo_pass') else None)
+        pw = self.cached_password or (self.server_sudo_pass.text() if hasattr(self, 'server_sudo_pass') else None)
         if pw and OS_INFO["os"] == "linux":
             # Direct sudo execution for reliable docker access
             cmd = f"sudo -S {cmd}"
@@ -2511,6 +2677,52 @@ try {{
             self.cemu_log.append(f"[ERROR] Failed to deploy console certs: {e}")
 
 
+    def _force_write_file(self, path, content):
+        """Robustly overwrite a file, attempting to fix permissions or replace the file if access is denied.
+        Falls back to sudo if standard Python file operations fail.
+        """
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+            # Try to fix permissions first if file exists
+            if os.path.exists(path):
+                try: os.chmod(path, 0o666)
+                except: pass
+            
+            # Standard write attempt
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                try: os.chmod(path, 0o777)
+                except: pass
+                return True
+            except (PermissionError, OSError):
+                # Fallback to sudo for permission issues
+                pw = self.cached_password or self._ask_sudo_password()
+                if not pw:
+                    raise PermissionError(f"Sudo password required to write to {path}")
+                
+                # Use shlex to safely handle content with quotes
+                # We use 'tee' to write content to the protected path
+                cmd = f"sudo -S tee {shlex.quote(path)} > /dev/null"
+                # Blocking execution via subprocess for synchronous logic
+                proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                # CRITICAL: Send password FIRST, followed by a newline, then the file content.
+                stdout, stderr = proc.communicate(input=f"{pw}\n{content}")
+                
+                if proc.returncode == 0:
+                    # Fix permissions after sudo write
+                    subprocess.run(["sudo", "-S", "chmod", "777", path], input=pw + "\n", text=True, capture_output=True)
+                    return True
+                else:
+                    raise OSError(f"Sudo write failed: {stderr}")
+            
+            return True
+        except Exception as e:
+            self.cemu_log.append(f"[ERROR] Force-write failed for {path}: {e}")
+            return False
+
     def patch_cemu_settings(self, url):
         # Dynamically resolve localhost if needed
         if "localhost" in url or "127.0.0.1" in url:
@@ -2548,37 +2760,70 @@ try {{
                 # Kill Legacy Cert Pointers
                 c = re.sub(r"<account_cert_path>.*?</account_cert_path>", "<account_cert_path></account_cert_path>", c)
 
+                # FORCE Account Selection to 80000001 (Decimal: 2147483649)
+                if "<PersistentId>" in c:
+                    c = re.sub(r"<PersistentId>\d+</PersistentId>", "<PersistentId>2147483649</PersistentId>", c)
+                elif "<Account>" in c:
+                    c = c.replace("<Account>", "<Account>\n        <PersistentId>2147483649</PersistentId>")
+                
+                # INJECT AccountId (Username) into settings.xml to force Network Link status
+                username = self.cemu_username.text().strip()
+                if username:
+                    if "<AccountId>" in c:
+                        c = re.sub(r"<AccountId>.*?</AccountId>", f"<AccountId>{username}</AccountId>", c)
+                    elif "<Account>" in c:
+                        c = c.replace("<Account>", f"<Account>\n        <AccountId>{username}</AccountId>")
+
+                # Force ActiveService to 2 (Pretendo) to natively use Pretendo account types
+                if "<ActiveService>" in c:
+                    c = re.sub(r"<ActiveService>\d+</ActiveService>", "<ActiveService>2</ActiveService>", c)
+                elif "<Account>" in c:
+                    c = c.replace("<Account>", "<Account>\n        <ActiveService>2</ActiveService>")
+
+                # Update AccountService selection — single regex to avoid duplicate Service= attributes
+                if "<AccountService>" in c:
+                    c = re.sub(r'<SelectedService\s+PersistentId="\d+"(?:\s+Service="[^"]*")?(?:\s+/>|>)', '<SelectedService PersistentId="2147483649" Service="2"/>', c)
+                elif "</content>" in c:
+                    as_block = '    <AccountService>\n        <SelectedService PersistentId="2147483649" Service="2"/>\n    </AccountService>\n'
+                    c = c.replace("</content>", f"{as_block}</content>")
+                
                 # Patch Proxy URL
                 if "<proxy_server>" in c:
                     c = re.sub(r"<proxy_server>.*?</proxy_server>", f"<proxy_server>{url}</proxy_server>", c)
                 elif "</content>" in c:
                     c = c.replace("</content>", f"    <proxy_server>{url}</proxy_server>\n</content>")
                 
-                with open(p, "w") as f: f.write(c)
+                self._force_write_file(p, c)
             else:
                 self.statusBar().showMessage("settings.xml not found; pursuing network_services.xml bypass only.", 3000)
             
             # 4. Multi-Path network_services.xml injection (Full Service Redirect)
-            data_dir = cemu_dir or OS_INFO.get("cemu_data", OS_INFO.get("cemu_dir"))
+            # Cemu 2.0+ Linux has split dirs: config (~/.config/Cemu) vs data (~/.local/share/Cemu).
+            # We MUST write network_services.xml to ALL possible paths to prevent stale files
+            # with explicit proxy URLs from causing mitmproxy redirect loops (Splatoon softlock).
             services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas"]
             
-            is_proxy = url.count(":") == 2 and "http" in url
-            if is_proxy:
-                # If using mitmproxy, do NOT override Cemu's internal URLs with the proxy IP.
-                # Let Cemu send requests for account.nintendo.net to the proxy, so the proxy
-                # can rewrite them to pretendo.cc and route them internally without looping.
-                urls_block = "    <urls>\n    </urls>"
-            else:
-                url_nodes = "\n".join([f"        <{s}>{url}</{s}>" for s in services])
-                urls_block = f"    <urls>\n{url_nodes}\n    </urls>"
+            url_nodes = "\n".join([f"        <{s}>{url}</{s}>" for s in services])
+            urls_block = f"    <urls>\n{url_nodes}\n    </urls>"
 
             ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n{urls_block}\n</content>'
             
-            for target_dir in set([str(data_dir), str(os.path.dirname(p))]):
-                if target_dir and target_dir != ".":
+            # Collect ALL directories that Cemu might read network_services.xml from
+            ns_targets = set()
+            if cemu_dir:
+                ns_targets.add(str(cemu_dir))
+            if p and os.path.dirname(p) != ".":
+                ns_targets.add(str(os.path.dirname(p)))
+            # Always include the OS-detected dirs (config + data split)
+            for key in ["cemu_dir", "cemu_data"]:
+                val = OS_INFO.get(key, "")
+                if val:
+                    ns_targets.add(str(val))
+            
+            for target_dir in ns_targets:
+                if target_dir and os.path.isdir(target_dir):
                     ns_xml = os.path.join(target_dir, "network_services.xml")
-                    with open(ns_xml, "w") as f:
-                        f.write(ns_content)
+                    self._force_write_file(ns_xml, ns_content)
 
             self.statusBar().showMessage("Cemu Patch & Connect Complete!", 5000)
             QMessageBox.information(self, "Success", f"Wii U Patched & Connected!\n\nAll services (act, con, etc.) redirected to {url}\nSSL Verification Disabled.\nDocker services synced.")
@@ -2645,7 +2890,7 @@ try {{
 
     def generate_cemu_manual(self):
         username = self.cemu_username.text().strip()
-        password = self.cemu_password.text().strip()
+        password = self.cemu_password.text()
         miiname = self.cemu_miiname.text().strip() or "Player"
         data_path = self.cemu_dir_field.text().strip() or OS_INFO.get("cemu_data", "")
 
@@ -2696,22 +2941,25 @@ try {{
             # Persistent Mii Hex (MiiName & Data sync)
             stored_mii = getattr(self, '_mii_data_hex', None)
             
-            # MiiName for root account (22 bytes = 44 hex characters)
-            acct_name_bytes = miiname[:10].encode('utf-16be').ljust(22, b'\x00')
+            # Force 10-char limit for Mii (Wii U Standard)
+            mii_name_limited = miiname[:10]
+            # MiiName field: UTF-16BE hex (STRICT Wii U BIG ENDIAN REQUIREMENT)
+            acct_name_bytes = mii_name_limited.encode('utf-16be').ljust(22, b'\x00')
             account_name_hex = binascii.hexlify(acct_name_bytes).decode('ascii')
             
             if not stored_mii:
-                # Build default MiiData with name at offset 0x1A (char 52)
-                name_bytes = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
-                name_hex = binascii.hexlify(name_bytes).decode('ascii')
-                # 0x1A = 26 bytes = 52 hex chars
-                stored_mii = ("01000110" + ("00" * 22) + name_hex).ljust(192, "0")
+                # Build default MiiData (Cemu/Wii U internal binary format MUST BE BIG ENDIAN)
+                # Offset 0x1A (char 52) is the name start. 
+                name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
+                name_hex_be = binascii.hexlify(name_bytes_be).decode('ascii')
+                # 0x1A = 26 bytes = 52 hex chars. Version 3
+                stored_mii = ("03000000" + ("00" * 22) + name_hex_be).ljust(192, "0")
             elif len(str(stored_mii)) >= 92: # Patch name into existing if possible
                 s_mii = str(stored_mii)
-                name_bytes = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
-                name_hex = binascii.hexlify(name_bytes).decode('ascii')
-                # Replace chars 52 to 92
-                stored_mii = s_mii[0:52] + name_hex + s_mii[92:]
+                name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
+                name_hex_be = binascii.hexlify(name_bytes_be).decode('ascii')
+                # Replace chars 52 to 92 (offset 26 to 46)
+                stored_mii = s_mii[0:52] + name_hex_be + s_mii[92:]
 
             lines = [
                 "AccountInstance_20120705",
@@ -2729,30 +2977,56 @@ try {{
                 "Country=49", "SimpleAddressId=49010000",
                 "TimeZoneId=America/New_York",
                 "UtcOffset=ffffffff9ac22000",
-                f"PrincipalId={pid:08x}",
+                f"PrincipalId={pid}",
+                "IsNnidLinked=1",
                 "IsPasswordCacheEnabled=1",
                 f"AccountPasswordCache={pwd_hash}",
-                "NnasType=0", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
+                "NnasType=1", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
                 "IsPersistentIdUploaded=1",
                 "IsConsoleAccountInfoUploaded=1",
                 "LastAuthenticationResult=0",
                 f"StickyAccountId={username}",
-                f"StickyPrincipalId={pid:08x}",
+                f"StickyPrincipalId={pid}",
                 "IsServerAccountDeleted=0",
                 "IsCommitted=1"
             ]
             
             # Destinations: BOTH usr/act (1.x) and accounts/ folder (2.x)
-            acct_dir_1x = os.path.join(data_path, "mlc01", "usr", "save", "system", "act", "80000001")
-            acct_dir_2x = os.path.join(data_path, "accounts", "80000001")
+            # We explicitly check and overwrite files in all standard Cemu locations to avoid "stale" files.
+            p_targets = []
+            cemu_candidates = [data_path]
+            if OS_INFO["os"] == "linux":
+                home = os.path.expanduser("~")
+                cemu_candidates.extend([os.path.join(home, ".local/share/Cemu"), os.path.join(home, ".config/Cemu")])
             
-            for d in [acct_dir_1x, acct_dir_2x]:
-                try:
-                    os.makedirs(d, exist_ok=True)
-                    # Write both account.dat and account.ini for hybrid compatibility
-                    with open(os.path.join(d, "account.dat"), "w", encoding="utf-8") as f: f.write("\n".join(lines))
-                    with open(os.path.join(d, "account.ini"), "w", encoding="utf-8") as f: f.write("\n".join(lines))
-                except: pass
+            for base in set(cemu_candidates):
+                if not base or not os.path.isdir(base): continue
+                p_targets.append(os.path.join(base, "mlc01/usr/save/system/act/80000001"))
+                p_targets.append(os.path.join(base, "accounts/80000001"))
+
+            for d in set(p_targets):
+                for fname in ["account.dat", "account.ini"]:
+                    fpath = os.path.join(d, fname)
+                    
+                    # Cemu is format-sensitive: .dat usually expects HEX PrincipalId, .ini expects DECIMAL.
+                    # CRITICAL: Both files MUST have the AccountInstance header to be recognized as emulated profiles.
+                    file_lines = ["AccountInstance_20120705"]
+                    
+                    for line in lines:
+                        if line == "AccountInstance_20120705": continue # Avoid duplication
+                        
+                        if line.startswith("PrincipalId=") or line.startswith("StickyPrincipalId="):
+                            key = line.split("=")[0]
+                            if fname.endswith(".ini"):
+                                file_lines.append(f"{key}={pid}")
+                            else:
+                                # Real Wii U .dat files use LOWERCASE hex for PIDs
+                                file_lines.append(f"{key}={pid:08x}")
+                        else:
+                            file_lines.append(line)
+                    
+                    if self._force_write_file(fpath, "\n".join(file_lines)):
+                        self.cemu_log.append(f"[System] Identity Updated: {fpath}")
 
             self.statusBar().showMessage(f"Deep Identity Fix Applied for {username}", 5000)
             QMessageBox.information(self, "Success", f"Wii U Identity Files Realigned!\n\nAuthentication Hash: OK\nPrincipalId: {pid:08x}")
@@ -2851,20 +3125,20 @@ try {{
                 uuid_hex = "e7e455936d2acbae339c189fb2c42990"
                 trans_id_hex = "2000004b2c42990"
                 
-                # MiiName for root account (22 bytes = 44 hex chars)
+                # MiiName for zip bundle (UTF-16BE hex for Wii U compatibility)
                 acct_name_bytes = miiname[:10].encode('utf-16be').ljust(22, b'\x00')
                 account_name_hex = binascii.hexlify(acct_name_bytes).decode('ascii')
                 
                 # Build default MiiData with name at offset 0x1A (char 52)
                 cur_mii = getattr(self, '_mii_data_hex', None)
                 if not cur_mii:
-                    m_name_bytes = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
-                    m_name_hex = binascii.hexlify(m_name_bytes).decode('ascii')
-                    cur_mii = ("01000110" + ("00" * 22) + m_name_hex).ljust(192, "0")
+                    m_name_bytes_be = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
+                    m_name_hex_be = binascii.hexlify(m_name_bytes_be).decode('ascii')
+                    cur_mii = ("03000000" + ("00" * 22) + m_name_hex_be).ljust(192, "0")
                 elif len(str(cur_mii)) >= 92:
-                    m_name_bytes = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
-                    m_name_hex = binascii.hexlify(m_name_bytes).decode('ascii')
-                    cur_mii = str(cur_mii)[0:52] + m_name_hex + str(cur_mii)[92:]
+                    m_name_bytes_be = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
+                    m_name_hex_be = binascii.hexlify(m_name_bytes_be).decode('ascii')
+                    cur_mii = str(cur_mii)[0:52] + m_name_hex_be + str(cur_mii)[92:]
 
                 acct_lines = [
                     "AccountInstance_20120705",
@@ -2883,9 +3157,10 @@ try {{
                     "TimeZoneId=America/New_York",
                     "UtcOffset=ffffffff9ac22000",
                     f"PrincipalId={pid:08x}",
+                    "IsNnidLinked=1",
                     "IsPasswordCacheEnabled=1",
                     f"AccountPasswordCache={pwd_hash}",
-                    "NnasType=0", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
+                    "NnasType=1", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
                     "IsPersistentIdUploaded=1",
                     "IsConsoleAccountInfoUploaded=1",
                     "LastAuthenticationResult=0",
