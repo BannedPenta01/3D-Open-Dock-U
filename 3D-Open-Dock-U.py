@@ -3330,11 +3330,11 @@ try {{
                 base_mii_hex = "03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2"
                 mii_buf = bytearray(binascii.unhexlify(base_mii_hex.ljust(192, '0')))
                 
-                # Write name at offset 0x1A (26), 10 chars UTF-16BE = 20 bytes  
-                name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
-                mii_buf[0x1A:0x1A+20] = name_bytes_be
+                # Write name at offset 0x1A (26), 10 chars UTF-16LE = 20 bytes  
+                name_bytes_le = mii_name_limited.encode('utf-16le').ljust(20, b'\x00')
+                mii_buf[0x1A:0x1A+20] = name_bytes_le
                 # Write Author Name at offset 0x48 (72) - Crucial for Splatoon!
-                mii_buf[0x48:0x48+20] = name_bytes_be
+                mii_buf[0x48:0x48+20] = name_bytes_le
                 
                 # CRC16-CCITT over first 0x5E (94) bytes, written at 0x5E (big endian)
                 crc = 0
@@ -3351,11 +3351,11 @@ try {{
                 stored_mii = binascii.hexlify(mii_buf).decode('ascii')
             elif len(str(stored_mii)) >= 92: # Patch name into existing if possible
                 s_mii = str(stored_mii)
-                name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
-                name_hex_be = binascii.hexlify(name_bytes_be).decode('ascii')
+                name_bytes_le = mii_name_limited.encode('utf-16le').ljust(20, b'\x00')
+                name_hex_le = binascii.hexlify(name_bytes_le).decode('ascii')
                 # Replace name (offset 26 -> 46) and author (offset 72 -> 92)
                 # s_mii indices: 26*2=52, 46*2=92 | 72*2=144, 92*2=184
-                new_s_mii = s_mii[0:52] + name_hex_be + s_mii[92:144] + name_hex_be + s_mii[184:]
+                new_s_mii = s_mii[0:52] + name_hex_le + s_mii[92:144] + name_hex_le + s_mii[184:]
                 mii_buf = bytearray(binascii.unhexlify(new_s_mii))
                 # Ensure buffer is 96 bytes
                 if len(mii_buf) < 96:
