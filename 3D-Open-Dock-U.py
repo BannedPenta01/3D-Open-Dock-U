@@ -1124,61 +1124,38 @@ class PretendoManager(QMainWindow):
         guide = QTextEdit()
         guide.setReadOnly(True)
         guide.setHtml(f"""
-            <h1 style='color:{RED_PRIMARY};'>3D Open Dock U: Complete User Guide</h1>
-            <p>The <b>3D Open Dock U</b> is your all-in-one command center for deploying, managing, and connecting to a private <b>Pretendo Network</b> server stack. 
-            Follow this guide to transition from a clean slate to a fully functional private online environment.</p>
-            
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 1: Environment Readiness</h2>
-            <p>Before installing the server stack, ensure your system is compatible:</p>
-            <ul>
-                <li><b>Linux:</b> Ensure Docker and Docker Compose are installed. Use the <b>Setup</b> tab's <i>'Fix Docker Permissions'</i> if the app can't talk to the Docker socket.</li>
-                <li><b>Windows:</b> You <b>MUST</b> install <b>Docker Desktop</b> and enable <b>WSL2</b>. Click <i>'Audit System'</i> in the Setup tab to check your status. 
-                If Docker isn't running, use the <i>'Start Docker Desktop'</i> button on the dashboard.</li>
-                <li><b>Submodules:</b> If you are a developer, ensure you have <b>Git</b> installed to clone the repository with all its dependencies.</li>
-            </ul>
+            <h1 style='color:{RED_PRIMARY};'>Quick Start Guide</h1>
+            <p>Welcome to <b>3D Open Dock U</b>. Follow these simple steps to get your private server running and connected.</p>
 
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 2: Server Installation (Step-by-Step)</h2>
+            <h2 style='color:{CYAN_PRIMARY};'>Step 1: Power On</h2>
             <ol>
-                <li>Navigate to the <b>Setup & Maintenance</b> tab.</li>
-                <li><b>Select Root Folder:</b> Choose an empty directory where the server will live (e.g., <code>C:\\Games\\Pretendo</code> or <code>~/pretendo-docker</code>).</li>
-                <li><b>Download Stack:</b> Click 'Download Stack'. This pulls the official Pretendo architecture.</li>
-                <li><b>Run Automated Setup:</b> Click <i>'Run Full Setup Script'</i>. This is the "Magic Button" that generates secret keys, configures local IP addresses, and sets up your <code>.env</code> files.</li>
-                <li><b>Apply Submodule Patches:</b> Click <i>'Run Submodule Patches'</i>. This fixes common bugs in the original code, like Super Mario Maker 404 errors.</li>
-                <li><b>Build Containers:</b> Click <i>'Build Server Containers'</i>. This will download and compile the server images. This takes ~5-15 minutes depending on your internet and CPU.</li>
+                <li>In <b>Setup & Maintenance</b>, click <b>Download Stack</b>.</li>
+                <li>Click <b>Run Full Setup Script</b> (sets up keys, IPs, and <b>Smash Bros</b> database).</li>
+                <li>Click <b>Build Server Containers</b> (wait ~10 mins).</li>
+                <li>On the main dashboard, click <b>START SERVER</b>.</li>
             </ol>
 
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 3: The "Magic" Patching System</h2>
-            <p>Configuring Cemu or Citra manually is difficult. We've automated it entirely:</p>
+            <h2 style='color:{CYAN_PRIMARY};'>Step 2: Connect Emulators</h2>
+            <ul>
+                <li>In <b>Identities & Emulators</b>, enter your username/password.</li>
+                <li>Click <b>Sync & Patch Cemu</b> (or Citra). This automates everything: fonts, accounts, and server links.</li>
+                <li><b>Game Support:</b> Splatoon, Mario Maker, and <b>Super Smash Bros. Wii U</b> are fully supported.</li>
+            </ul>
+
+            <h2 style='color:{CYAN_PRIMARY};'>Step 3: Easy Troubleshooting</h2>
+            <ul>
+                <li><b>Docker Errors (Windows):</b> If Docker stops responding or shows "WSL stopped", click <b>Fix Docker Permissions</b> in Setup. It will offer to automatically repair the bridge.</li>
+                <li><b>Port Conflicts:</b> Close Steam or click Stop then Start to force-clear ports.</li>
+                <li><b>Real Hardware:</b> Use <b>Generate Console Bundle</b> to play on real Wii U/3DS hardware.</li>
+            </ul>
+
+            <h2 style='color:#85bb65;'>How to Connect to Other Pretendo Servers</h2>
+            <p>You can use this program to connect your emulators to external Pretendo servers (hosted by friends or others) without running your own stack:</p>
             <ul>
                 <li>Go to the <b>Identities & Emulators</b> tab.</li>
-                <li><b>Detection:</b> Ensure the paths to your <b>Cemu</b> or <b>Citra</b> folders are correct (they are usually auto-detected).</li>
-                <li><b>Identity:</b> Enter your desired username, password, and Mii Name.</li>
-                <li><b>Target Node:</b> Set this to your server's IP (usually detected automatically) and port (default 8070).</li>
-                <li><b>The 'Patch All' Button:</b> Click <i>'Sync & Patch Cemu'</i>. This will:
-                    <ul>
-                        <li>Auto-sync Docker's internal settings to match your custom port.</li>
-                        <li>Download and install required <b>Mii shared fonts</b> (fix question marks).</li>
-                        <li>Inject <code>otp.bin</code>, <code>seeprom.bin</code>, and account data.</li>
-                        <li>Register your account on the server database automatically.</li>
-                    </ul>
-                </li>
-            </ul>
-
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 4: Playing on Real Hardware</h2>
-            <p>If you want to use your private server on a real <b>Wii U</b> or <b>3DS</b>:</p>
-            <ul>
-                <li>Install <b>Nimbus</b> on your console.</li>
-                <li>On the manager, click <b>'Generate Console Bundle'</b> in the Identites tab.</li>
-                <li>Save the ZIP file and extract it to your console's SD card.</li>
-                <li>Use the <code>3DS/local_server_url.txt</code> with Nimbus to point your hardware to your PC's IP.</li>
-            </ul>
-
-            <h2 style='color:{RED_LIGHT};'>Common Issues & Troubleshooting</h2>
-            <ul>
-                <li><b>502 Bad Gateway / Connection Refused:</b> This usually means the server is still booting. Check the <b>Logs</b> tab. If it persists, click <i>'Refresh WSL Status'</i> (Windows) or <i>'Stop Server'</i> then <i>'Start Server'</i> to clear port conflicts.</li>
-                <li><b>Repetitive Maps (Splatoon):</b> Click <i>'Apply Live Rotations'</i> in the Setup tab. This pulls live schedules from the public Pretendo CDN to fix the 'same stage' bug.</li>
-                <li><b>Softlocks on Connect:</b> Ensure your Firewall is not blocking ports <b>80, 443, 8080, and 8070</b>.</li>
-                <li><b>Mii Names are ????:</b> Click <i>'Apply Mii Font Fix'</i> on the Identities/Setup tab to redeploy <code>CafeStd.ttf</code>.</li>
+                <li>In the <b>Target Node</b> section, enter the <b>Public IP</b> or <b>Domain Name</b> of the server you wish to join.</li>
+                <li>Make sure the <b>Target Port</b> matches the server's public port (usually 80 or 8070).</li>
+                <li>Click <b>Sync & Patch Cemu</b> (or Citra). The manager will automatically configure your emulator to point to that external node instead of your localhost.</li>
             </ul>
         """)
         layout.addWidget(guide)
@@ -1438,20 +1415,26 @@ class PretendoManager(QMainWindow):
             self.refresh_vault_list()
 
     def _apply_compose_patches(self, port, s_dir):
-        """Robust YAML patching for mitmproxy port and MongoDB version/stability."""
+        """Robust YAML patching for mitmproxy port, Postgres health, and service injections."""
         applied_any = False
-        for fname in ["compose.yml", "docker-compose.yml"]:
+        # Check files in order of Docker preference
+        for fname in ["compose.yaml", "compose.yml", "docker-compose.yml"]:
             path = os.path.join(s_dir, fname)
             if not os.path.exists(path): continue
+            
             try:
-                with open(path, "r") as f: lines = f.readlines()
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                
+                if not lines: continue
+
                 new_lines = []
                 current_service = None
                 changed = False
                 
                 for i, line in enumerate(lines):
                     stripped = line.strip()
-                    # Identify current service block (lines starting with exactly 2 spaces)
+                    # Service detection (indented exactly 2 spaces)
                     if line.startswith("  ") and not line.startswith("   ") and stripped.endswith(":") and not stripped.startswith("-"):
                         current_service = stripped[:-1].lower()
 
@@ -1462,9 +1445,6 @@ class PretendoManager(QMainWindow):
                             if new_line != line:
                                 line = new_line
                                 changed = True
-                        if "command: mitmweb" in line and "pretendo_addon.py" not in line:
-                            line = line.replace("mitmweb --web-host 0.0.0.0", "mitmweb --web-host 0.0.0.0 --set confdir=./.mitmproxy -s ./pretendo_addon.py --set pretendo_redirect=true --set pretendo_host=nginx --set pretendo_host_port=80 --set pretendo_http=true --set client_certs=./client-certificates/WiiU-common.pem --set ssl_insecure=true --set tls_version_client_min=UNBOUNDED --set tls_version_server_min=UNBOUNDED")
-                            changed = True
 
                     # 2. adminer: update port
                     if current_service == "adminer":
@@ -1477,42 +1457,35 @@ class PretendoManager(QMainWindow):
                         if "image: mongo:latest" in line:
                             line = line.replace("mongo:latest", "mongo:4.4")
                             changed = True
-                        if "internal:" in line:
-                            # Verify if aliases: mongo already exists
-                            already_has = False
-                            for j in range(i + 1, min(i + 5, len(lines))):
-                                if "aliases:" in lines[j] or "- mongo" in lines[j]:
-                                    already_has = True
-                                    break
-                            if not already_has:
+                        if stripped == "internal:":
+                            if "aliases:" not in "".join(lines[i:i+5]):
                                 new_lines.append(line)
                                 new_lines.append("        aliases:\n")
                                 new_lines.append("          - mongo\n")
                                 changed = True
                                 continue
 
-                    # 4. mongo-express: pin version and add local env
+                    # 4. mongo-express: pin version
                     if current_service == "mongo-express":
                         if "image: mongo-express:latest" in line:
                             line = line.replace("mongo-express:latest", "mongo-express:0.54.0")
                             changed = True
-                        if "env_file:" in line:
-                            # Look ahead to see if local.env is already there
-                            has_local = False
-                            for j in range(i + 1, min(i + 5, len(lines))):
-                                if "mongo-express.local.env" in lines[j]:
-                                    has_local = True
-                                    break
-                            if not has_local:
-                                new_lines.append(line)
-                                indent = line[:line.find("-")] if "-" in line else "      "
-                                new_lines.append(f"{indent}- ./environment/mongo-express.local.env\n")
-                                changed = True
-                                continue
-                    
+
+                    # 5. postgres: Add Healthcheck (Fixes Smash connection refused)
+                    if current_service == "postgres" and stripped == "postgres:":
+                        if "healthcheck:" not in "".join(lines[i:i+20]):
+                            new_lines.append(line)
+                            new_lines.append("    healthcheck:\n")
+                            new_lines.append("      test: [\"CMD-SHELL\", \"pg_isready -U postgres_pretendo -d postgres\"]\n")
+                            new_lines.append("      interval: 5s\n")
+                            new_lines.append("      timeout: 5s\n")
+                            new_lines.append("      retries: 5\n")
+                            changed = True
+                            continue
+
                     new_lines.append(line)
-                
-                # 5. Injection Gate: Ensure Super Smash Bros. Wii U is present
+
+                # 6. Injection: Super Smash Bros. Wii U with Health Dependency
                 if "super-smash-bros-wiiu:" not in "".join(new_lines).lower():
                     self.setup_log.append("[System] Injecting Super Smash Bros. Wii U service definition...")
                     smash_service = [
@@ -1520,9 +1493,12 @@ class PretendoManager(QMainWindow):
                         "  super-smash-bros-wiiu:\n",
                         "    build: ./repos/super-smash-bros-wiiu\n",
                         "    depends_on:\n",
-                        "      - account\n",
-                        "      - postgres\n",
-                        "      - mongodb\n",
+                        "      postgres:\n",
+                        "        condition: service_healthy\n",
+                        "      account:\n",
+                        "        condition: service_started\n",
+                        "      mongodb:\n",
+                        "        condition: service_started\n",
                         "    restart: unless-stopped\n",
                         "    ports:\n",
                         "      - 127.0.0.1:2352:2345\n",
@@ -1530,21 +1506,35 @@ class PretendoManager(QMainWindow):
                         "      - 6013:6013/udp\n",
                         "    networks:\n",
                         "      internal:\n",
+                        "        aliases:\n",
+                        "          - super-smash-bros-wiiu\n",
                         "    dns: 172.20.0.200\n",
                         "    env_file:\n",
                         "      - ./environment/super-smash-bros-wiiu.local.env\n"
                     ]
-                    # Insert before the volumes block
+                    
+                    # Find 'services:' line to inject under
+                    injected = False
                     for idx, l in enumerate(new_lines):
-                        if l.startswith("volumes:"):
+                        if l.strip().startswith("services:"):
                             for sl in reversed(smash_service):
-                                new_lines.insert(idx, sl)
+                                new_lines.insert(idx + 1, sl)
+                            injected = True
                             changed = True
                             break
-                
-                if changed:
+                    
+                    if not injected:
+                        # Fallback: find the first service and insert before it
+                        for idx, l in enumerate(new_lines):
+                            if l.startswith("  ") and l.strip().endswith(":"):
+                                for sl in reversed(smash_service):
+                                    new_lines.insert(idx, sl)
+                                changed = True
+                                break
+
+                if changed and new_lines:
                     self._patch_mitmproxy_addon(s_dir)
-                    # Also patch postgres-init.sh to include the smash database
+                    # Patch postgres-init.sh
                     pg_init = os.path.join(s_dir, "scripts", "run-in-container", "postgres-init.sh")
                     if os.path.exists(pg_init):
                         try:
@@ -1552,15 +1542,25 @@ class PretendoManager(QMainWindow):
                             new_pg = []
                             for pl in pg_lines:
                                 if "databases=" in pl and "super_smash_bros_wiiu" not in pl:
-                                    pl = pl.replace('"', 'super_smash_bros_wiiu "')
+                                    if '"' in pl:
+                                        # Safely insert before the closing quote
+                                        last_quote_idx = pl.rfind('"')
+                                        pl = pl[:last_quote_idx] + " super_smash_bros_wiiu" + pl[last_quote_idx:]
                                 new_pg.append(pl)
-                            with open(pg_init, "w") as f: f.writelines(new_pg)
+                            if new_pg:
+                                with open(pg_init, "w") as f: f.writelines(new_pg)
                         except: pass
                     
-                    with open(path, "w") as f: f.writelines(new_lines)
+                    # Write the patched compose file
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.writelines(new_lines)
                     applied_any = True
+                    # Stop after first successful patch to avoid conflicting compose files
+                    break
+                    
             except Exception as e:
                 self.setup_log.append(f"[ERROR] Failed to patch {fname}: {e}")
+                
         return applied_any
 
     def _patch_mitmproxy_addon(self, s_dir):
@@ -2046,55 +2046,35 @@ class PretendoManager(QMainWindow):
                 self.server_log.append("<b>[System] Skipping initialization tasks due to start failure.</b>")
                 return
             if s_dir:
-                # Initialize the replica set using service names, with retries since Mongo takes time
                 setup_cmds = []
-                # Quietly initiate MongoDB RS if not already done
-                # Note: No 'sudo -S' here, the wrapper will handle elevation
                 self.server_log.append("[System] Running post-boot database initialization...")
                 
-                # 1. MongoDB Guard
-                setup_cmds.append("echo '[Post-Boot] Initializing MongoDB Replica Set...'")
-                setup_cmds.append("for i in {1..15}; do if docker compose exec -T mongodb mongo --eval 'rs.status()' >/dev/null 2>&1; then echo '  [OK] Mongo RS Active'; break; fi; if docker compose exec -T mongodb mongo --eval 'rs.initiate()' >/dev/null 2>&1; then echo '  [INIT] Mongo RS Initiated'; break; fi; echo '  [WAIT] Mongo booting...'; sleep 2; done")
+                # 1. MongoDB RS
+                setup_cmds.append("for i in {1..15}; do if docker compose exec -T mongodb mongo --eval 'rs.initiate()' >/dev/null 2>&1; then break; fi; sleep 2; done")
                 
-                # 2. Postgres Guard
+                # 2. Postgres Init (Force creation of Smash DB)
                 pg_host_script = os.path.join(s_dir, "scripts/run-in-container/postgres-init.sh")
                 if os.path.exists(pg_host_script):
-                    try:
-                        import shlex
-                        with open(pg_host_script, 'r') as f:
-                            pg_content = f.read()
-                        setup_cmds.append("echo '[Post-Boot] Initializing Postgres Databases...'")
-                        setup_cmds.append(f"for i in {{1..15}}; do docker compose exec -T postgres sh -c {shlex.quote(pg_content)} >/dev/null 2>&1 && echo '  [OK] Postgres Initialized' && break; sleep 2; done")
-                    except: pass
-
-                # 3. Stabilization Delay
-                setup_cmds.append("echo '[Post-Boot] Cooling down for service stability (8s)...'")
-                setup_cmds.append("sleep 8")
+                    with open(pg_host_script, 'r') as f: pg_content = f.read()
+                    setup_cmds.append(f"docker compose exec -T postgres sh -c {shlex.quote(pg_content)}")
                 
-                # 4. State Sync
-                setup_cmds.append("echo '[Post-Boot] Synchronizing application state...'")
-                setup_cmds.append("docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website super-smash-bros-wiiu")
+                # 3. Wait specifically for Smash DB to be ready before restarting app
+                setup_cmds.append("for i in {1..10}; do if docker compose exec -T postgres psql -U postgres_pretendo -d super_smash_bros_wiiu -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 2; done")
                 
-                # 5. Account Health Guard (Prevents 502 errors in Cemu)
-                setup_cmds.append("echo '[Post-Boot] Verifying Account Server health...'")
-                setup_cmds.append("for i in {1..15}; do if docker compose exec -T account node -e \"require('http').get('http://localhost:8080', (res) => process.exit(0)).on('error', (e) => process.exit(1))\" >/dev/null 2>&1; then echo '  [SUCCESS] Account Server Online'; break; fi; echo '  [WAIT] Account Server booting...'; sleep 3; done")
-
-                # Handle execution
-                import shlex
+                setup_cmds.append("docker compose restart account friends splatoon super-mario-maker super-smash-bros-wiiu")
+                
                 inner_cmds = " ; ".join(setup_cmds)
                 if pw and OS_INFO["os"] == "linux":
                     full_cmd = f"sudo -S bash -c {shlex.quote(inner_cmds)}"
                     self._run_command(full_cmd, self.server_log, s_dir, stdin_data=pw, display_cmd="[Elevated] Post-Boot Initialization", on_done=self._on_server_boot_finished)
                 elif OS_INFO["os"] == "windows":
-                    # Windows: Route bash loops through WSL if available
                     if OS_INFO.get("has_wsl") and OS_INFO.get("has_wsl_distro"):
                         wsl_cwd = _win_to_wsl_path(s_dir)
                         escaped = inner_cmds.replace('"', '\\"')
                         full_cmd = f'wsl bash -lc "cd {shlex.quote(wsl_cwd)} && {escaped}"'
                     else:
-                        # Simplified fallback: just docker compose restart (no bash loops)
                         self.server_log.append("[System] WSL2 not available — using simplified post-boot init...")
-                        full_cmd = "docker compose exec -T mongodb mongo --eval \"rs.initiate()\" & timeout /t 8 & docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website"
+                        full_cmd = "docker compose exec -T mongodb mongo --eval \"rs.initiate()\" & timeout /t 8 & docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website super-smash-bros-wiiu"
                     self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Windows] Post-Boot Initialization", on_done=self._on_server_boot_finished)
                 else:
                     full_cmd = inner_cmds
@@ -2506,8 +2486,10 @@ class PretendoManager(QMainWindow):
         splat_kerberos_pw = get_existing("splatoon.local.env", "PN_SPLATOON_KERBEROS_PASSWORD", gen_password(32))
         splat_aes_key = get_existing("splatoon.local.env", "PN_SPLATOON_CONFIG_AES_KEY", gen_hex(64))
         
-        smash_kerberos_pw = get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_KERBEROS_PASSWORD", gen_password(32))
-        smash_aes_key = get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_CONFIG_AES_KEY", gen_hex(64))
+        smash_kerberos_pw = get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_KERBEROS_PASSWORD", 
+                                         get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_KERBEROS_PASSWORD", gen_password(32)))
+        smash_aes_key = get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_AES_KEY", 
+                                     get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_CONFIG_AES_KEY", gen_hex(64)))
         
         minecraft_kerberos_pw = get_existing("minecraft-wiiu.local.env", "PN_MINECRAFT_KERBEROS_PASSWORD", gen_password(32))
         pikmin3_kerberos_pw = get_existing("pikmin-3.local.env", "PN_PIKMIN3_KERBEROS_PASSWORD", gen_password(32))
@@ -2637,14 +2619,23 @@ class PretendoManager(QMainWindow):
         
         # super-smash-bros-wiiu.local.env
         env_files["super-smash-bros-wiiu.local.env"] = [
-            f"PN_SMASH_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
-            f"PN_SMASH_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
-            f"PN_SMASH_KERBEROS_PASSWORD={smash_kerberos_pw}",
-            f"PN_SMASH_CONFIG_KERBEROS_PASSWORD={smash_kerberos_pw}",
-            f"PN_SMASH_CONFIG_AES_KEY={smash_aes_key}",
-            f"PN_SMASH_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_password}@postgres/super_smash_bros_wiiu?sslmode=disable",
-            f"PN_SMASH_SECURE_SERVER_HOST={server_ip}",
-            f"PN_SMASH_CONFIG_SECURE_SERVER_HOST={server_ip}",
+            f"PN_SSBWIIU_KERBEROS_PASSWORD={smash_kerberos_pw}",
+            f"PN_SSBWIIU_AUTHENTICATION_SERVER_PORT=6012",
+            f"PN_SSBWIIU_SECURE_SERVER_PORT=6013",
+            f"PN_SSBWIIU_SECURE_SERVER_HOST={server_ip}",
+            f"PN_SSBWIIU_ACCOUNT_GRPC_HOST=account",
+            f"PN_SSBWIIU_ACCOUNT_GRPC_PORT=5000",
+            f"PN_SSBWIIU_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
+            f"PN_SSBWIIU_FRIENDS_GRPC_HOST=friends",
+            f"PN_SSBWIIU_FRIENDS_GRPC_PORT=5001",
+            f"PN_SSBWIIU_FRIENDS_GRPC_API_KEY={friends_api_key}",
+            f"PN_SSBWIIU_DATASTORE_S3BUCKET=super-smash-bros-wiiu",
+            f"PN_SSBWIIU_DATASTORE_S3KEY=minio_pretendo",
+            f"PN_SSBWIIU_DATASTORE_S3SECRET={minio_secret_key}",
+            f"PN_SSBWIIU_DATASTORE_S3URL=minio:9000",
+            f"PN_SSBWIIU_AES_KEY={smash_aes_key}",
+            f"PN_SSBWIIU_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/super_smash_bros_wiiu?sslmode=disable",
+            "PN_SSBWIIU_LOCAL_AUTH=0",
         ]
 
         # minio.local.env
@@ -3092,10 +3083,11 @@ Server IP address: {server_ip}
         """Generate a shell command string to kill processes on specified ports."""
         ports = ports_str.split()
         if OS_INFO["os"] == "windows":
-            # PowerShell one-liner
+            # PowerShell one-liner with silent error handling for protected/system processes
             ps_parts = []
             for p in ports:
-                ps_parts.append(f'try {{ Get-NetTCPConnection -LocalPort {p} -ErrorAction Stop | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force }} }} catch {{}}')
+                # We filter for OwningProcess > 0 and use SilentlyContinue for Access Denied fix
+                ps_parts.append(f"Get-NetTCPConnection -LocalPort {p} -ErrorAction SilentlyContinue | Where-Object {{ $_.OwningProcess -gt 0 }} | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}")
             return 'powershell -Command "' + "; ".join(ps_parts) + '"'
         else:
             # Linux: build fuser sequence
@@ -3129,9 +3121,32 @@ Server IP address: {server_ip}
                     _start_docker_desktop()
             else:
                 if not _docker_available():
-                    QMessageBox.warning(self, "Docker Issue", "Docker Desktop is running, but the 'docker' command is not responding.\n\nEnsure 'WSL Integration' is enabled in Docker settings for your default distribution.")
+                    reply = QMessageBox.question(self, "Docker Issue", 
+                        "Docker Desktop is running, but the 'docker' command is unresponsive.\n\n"
+                        "This often means the WSL integration has crashed (distro stopped).\n\n"
+                        "Attempt an automated 'WSL Repair' (Shutdown + Restart Docker)?",
+                        QMessageBox.Yes | QMessageBox.No)
+                    if reply == QMessageBox.Yes:
+                        self._repair_wsl_integration()
                 else:
                     QMessageBox.information(self, "Docker OK", "Docker is running and accessible. If you have deployment issues, try 'Refresh WSL Status' on the dashboard.")
+
+    def _repair_wsl_integration(self):
+        """Force-restart WSL and Docker Desktop to fix stuck integration bridges."""
+        self.setup_log.append("[System] Starting WSL integration repair sequence...")
+        # 1. Kill Docker Desktop processes
+        self.setup_log.append("  [1/3] Terminating Docker Desktop...")
+        subprocess.run(["taskkill", "/IM", "Docker Desktop.exe", "/F"], capture_output=True, creationflags=0x08000000 if _is_windows() else 0)
+        # 2. Force WSL shutdown
+        self.setup_log.append("  [2/3] Executing WSL global shutdown...")
+        subprocess.run(["wsl", "--shutdown"], capture_output=True, creationflags=0x08000000 if _is_windows() else 0)
+        # 3. Re-start Docker Desktop
+        self.setup_log.append("  [3/3] Re-initiating Docker Desktop startup...")
+        if _start_docker_desktop():
+            self.setup_log.append("[OK] Repair sequence complete. Wait ~20s for Docker to stabilize.")
+            QMessageBox.information(self, "Repair", "Repair commands sent. Docker Desktop is restarting.\n\nPlease wait a few moments for the dashboard to show 'ONLINE'.")
+        else:
+            self.setup_log.append("[ERROR] Could not find Docker Desktop executable.")
 
 
     # ─── Windows-Specific Actions ─────────────────────────────────────────────
