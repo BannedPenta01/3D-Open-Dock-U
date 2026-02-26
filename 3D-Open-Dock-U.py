@@ -45,14 +45,164 @@ except ImportError:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 APP_NAME = "3D Open Dock U"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 PRETENDO_REPO = "https://github.com/MatthewL246/pretendo-docker.git"
+
+# ─── Windows / WSL2 Support Helpers ───────────────────────────────────────────
+def _is_windows():
+    return platform.system().lower() == "windows"
+
+def _wsl_installed():
+    """Check if WSL2 is available on this Windows machine."""
+    if not _is_windows():
+        return False
+    try:
+        res = subprocess.run(["wsl", "--status"], capture_output=True, text=True, timeout=10, creationflags=0x08000000 if _is_windows() else 0)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def _wsl_distro_installed():
+    """Check if at least one WSL distro is installed."""
+    if not _is_windows():
+        return False
+    try:
+        res = subprocess.run(["wsl", "-l", "-q"], capture_output=True, text=True, timeout=10, creationflags=0x08000000 if _is_windows() else 0)
+        distros = [d.strip().replace('\x00', '') for d in res.stdout.strip().splitlines() if d.strip().replace('\x00', '')]
+        return len(distros) > 0
+    except Exception:
+        return False
+
+def _get_default_wsl_distro():
+    """Return the name of the default WSL distro, or None."""
+    if not _is_windows():
+        return None
+    try:
+        res = subprocess.run(["wsl", "-l", "-v"], capture_output=True, text=True, timeout=10, creationflags=0x08000000 if _is_windows() else 0)
+        for line in res.stdout.replace('\x00', '').splitlines():
+            line = line.strip()
+            if line.startswith("*"):
+                parts = line[1:].split()
+                if parts:
+                    return parts[0]
+    except Exception:
+        pass
+    return None
+
+def _win_to_wsl_path(win_path):
+    """Convert a Windows path (C:\\Users\\foo) to a WSL path (/mnt/c/Users/foo)."""
+    if not win_path:
+        return win_path
+    p = win_path.replace("\\", "/")
+    # Handle drive letter: C:/... -> /mnt/c/...
+    if len(p) >= 2 and p[1] == ':':
+        drive = p[0].lower()
+        p = f"/mnt/{drive}{p[2:]}"
+    return p
+
+def _wsl_to_win_path(wsl_path):
+    """Convert a WSL path (/mnt/c/Users/foo) to a Windows path (C:\\Users\\foo)."""
+    if not wsl_path:
+        return wsl_path
+    if wsl_path.startswith("/mnt/") and len(wsl_path) > 5:
+        drive = wsl_path[5].upper()
+        rest = wsl_path[6:].replace("/", "\\")
+        return f"{drive}:{rest}"
+    return wsl_path
+
+def _wsl_run(cmd_str, cwd=None, timeout=60):
+    """Run a bash command inside WSL and return the CompletedProcess."""
+    wsl_cmd = ["wsl", "bash", "-lc", cmd_str]
+    wsl_cwd = None
+    if cwd:
+        wsl_cwd = _win_to_wsl_path(cwd) if _is_windows() else cwd
+        wsl_cmd = ["wsl", "bash", "-lc", f"cd {shlex.quote(wsl_cwd)} && {cmd_str}"]
+    return subprocess.run(wsl_cmd, capture_output=True, text=True, timeout=timeout, creationflags=0x08000000 if _is_windows() else 0)
+
+def _docker_desktop_running():
+    """Check if Docker Desktop is running on Windows."""
+    if not _is_windows():
+        return False
+    try:
+        res = subprocess.run(
+            ["powershell", "-Command", "Get-Process 'Docker Desktop' -ErrorAction SilentlyContinue"],
+            capture_output=True, text=True, timeout=10, creationflags=0x08000000
+        )
+        return bool(res.stdout.strip())
+    except Exception:
+        return False
+
+def _docker_available():
+    """Check if the docker CLI is available and responsive."""
+    try:
+        res = subprocess.run(["docker", "info"], capture_output=True, text=True, timeout=10, creationflags=0x08000000 if _is_windows() else 0)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+def _start_docker_desktop():
+    """Attempt to start Docker Desktop on Windows."""
+    if not _is_windows():
+        return False
+    try:
+        # Try common install paths
+        dd_paths = [
+            os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Docker", "Docker", "Docker Desktop.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Docker", "Docker Desktop.exe"),
+        ]
+        for dd in dd_paths:
+            if os.path.isfile(dd):
+                subprocess.Popen([dd], creationflags=0x00000008)  # DETACHED_PROCESS
+                return True
+        # Fallback: try via start command
+        subprocess.Popen(["cmd", "/c", "start", "", "Docker Desktop"], creationflags=0x00000008)
+        return True
+    except Exception:
+        return False
+
+def _install_wsl2():
+    """Install WSL2 on Windows using PowerShell (requires admin). Returns (success, message)."""
+    if not _is_windows():
+        return False, "Not Windows"
+    try:
+        # Use 'wsl --install' which handles both the WSL2 feature and Ubuntu distro
+        res = subprocess.run(
+            ["powershell", "-Command",
+             "Start-Process 'wsl' -ArgumentList '--install' -Verb RunAs -Wait"],
+            capture_output=True, text=True, timeout=600
+        )
+        if res.returncode == 0:
+            return True, "WSL2 installation initiated. A restart may be required."
+        else:
+            return False, f"WSL2 install failed: {res.stderr.strip()}"
+    except subprocess.TimeoutExpired:
+        return False, "WSL2 installation timed out (10 minutes)."
+    except Exception as e:
+        return False, f"WSL2 install error: {e}"
+
+def _win_shell_cmd(cmd_str, use_wsl=False, cwd=None):
+    """Build the appropriate shell command for Windows.
+    If use_wsl=True, wraps the command in 'wsl bash -lc ...'.
+    Otherwise returns the command as-is (for cmd.exe / PowerShell execution).
+    """
+    if use_wsl:
+        wsl_cwd = ""
+        if cwd:
+            wsl_path = _win_to_wsl_path(cwd)
+            wsl_cwd = f"cd {shlex.quote(wsl_path)} && "
+        # Use double-quoting to pass through shell=True on Windows
+        escaped = cmd_str.replace('"', '\\"')
+        return f'wsl bash -lc "{wsl_cwd}{escaped}"'
+    return cmd_str
+
 
 def detect_os_info():
     """Detect OS, package manager, and default emulator paths."""
     system = platform.system().lower()
     info = {"os": system, "pkg_mgr": None, "pkg_install": "",
-            "cemu_dir": "", "cemu_settings": "", "citra_config": "", "server_dir": "", "distro": ""}
+            "cemu_dir": "", "cemu_settings": "", "citra_config": "", "server_dir": "", "distro": "",
+            "has_wsl": False, "has_wsl_distro": False, "wsl_distro": None,
+            "has_docker_desktop": False, "docker_available": False}
 
     username = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
     home = os.path.expanduser("~")
@@ -99,17 +249,59 @@ def detect_os_info():
         info["cemu_dir"] = os.path.join(home, "Library/Application Support/Cemu")
         info["cemu_settings"] = os.path.join(info["cemu_dir"], "settings.xml")
     elif system == "windows":
-        info["server_dir"] = os.path.join(os.environ.get("USERPROFILE", "C:"), "pretendo-docker")
+        userprofile = os.environ.get("USERPROFILE", "C:\\Users\\User")
+        info["server_dir"] = os.path.join(userprofile, "pretendo-docker")
         info["distro"] = "Windows"
+        
+        # Detect WSL2
+        info["has_wsl"] = _wsl_installed()
+        info["has_wsl_distro"] = _wsl_distro_installed()
+        info["wsl_distro"] = _get_default_wsl_distro()
+        
+        # Detect Docker Desktop
+        info["has_docker_desktop"] = _docker_desktop_running()
+        info["docker_available"] = _docker_available()
+        
+        # Cemu paths on Windows
         appdata = os.environ.get("APPDATA", "")
-        info["cemu_dir"] = os.path.join(appdata, "Cemu") if appdata else "C:/Cemu"
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        
+        # Check multiple Cemu locations on Windows
+        cemu_candidates = []
+        if appdata:
+            cemu_candidates.append(os.path.join(appdata, "Cemu"))
+        if localappdata:
+            cemu_candidates.append(os.path.join(localappdata, "Cemu"))
+        # Common standalone install locations
+        for drive in ["C:", "D:", "E:"]:
+            cemu_candidates.append(os.path.join(drive, os.sep, "Cemu"))
+            cemu_candidates.append(os.path.join(drive, os.sep, "Games", "Cemu"))
+        
+        found_cemu = ""
+        for cand in cemu_candidates:
+            if os.path.isdir(cand):
+                found_cemu = cand
+                break
+        if not found_cemu and appdata:
+            found_cemu = os.path.join(appdata, "Cemu")
+        
+        info["cemu_dir"] = found_cemu
+        info["cemu_data"] = found_cemu  # Windows Cemu uses single directory
         c_dir = info["cemu_dir"] or ""
         info["cemu_settings"] = os.path.join(c_dir, "settings.xml") if c_dir else ""
         
-        citra_paths = [
-            os.path.join(appdata, "Citra/config/qt-config.ini"),
-            os.path.join(appdata, "Lime3DS/config/qt-config.ini")
-        ] if appdata else []
+        citra_paths = []
+        if appdata:
+            citra_paths.extend([
+                os.path.join(appdata, "Citra", "config", "qt-config.ini"),
+                os.path.join(appdata, "Lime3DS", "config", "qt-config.ini"),
+                os.path.join(appdata, "Azahar", "qt-config.ini"),
+            ])
+        if localappdata:
+            citra_paths.extend([
+                os.path.join(localappdata, "Citra", "config", "qt-config.ini"),
+                os.path.join(localappdata, "Lime3DS", "config", "qt-config.ini"),
+            ])
         for p in citra_paths:
             if os.path.exists(p):
                 info["citra_config"] = p
@@ -268,12 +460,19 @@ class CommandWorker(QThread):
                 env["TERM"] = "xterm-256color"
 
             # Use binary mode to handle \r and mixed encodings safely
-            proc = subprocess.Popen(
-                self.cmd, shell=True, cwd=self.cwd, env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE if self.stdin_data is not None else None,
-                bufsize=0 
-            )
+            popen_kwargs = {
+                "shell": True,
+                "cwd": self.cwd,
+                "env": env,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "stdin": subprocess.PIPE if self.stdin_data is not None else None,
+                "bufsize": 0
+            }
+            if OS_INFO["os"] == "windows":
+                popen_kwargs["creationflags"] = 0x08000000 # CREATE_NO_WINDOW
+                
+            proc = subprocess.Popen(self.cmd, **popen_kwargs)
             
             if self.stdin_data is not None and proc.stdin:
                 try:
@@ -711,6 +910,29 @@ class PretendoManager(QMainWindow):
             self.dash_sudo_eye.clicked.connect(lambda: self.server_sudo_pass.setEchoMode(QLineEdit.Normal if self.dash_sudo_eye.isChecked() else QLineEdit.Password))
             sudo_row.addWidget(self.dash_sudo_eye)
             dlay.addLayout(sudo_row)
+        elif OS_INFO["os"] == "windows":
+            self.server_sudo_pass = None  # Windows uses UAC elevation, no inline password
+            
+            # ─── WSL2 Status & Controls ───
+            wsl_group = QGroupBox("Windows Subsystem for Linux (WSL2)")
+            wsl_lay = QVBoxLayout(wsl_group)
+            
+            self.wsl_status_label = QLabel("WSL2: Detecting...")
+            self.wsl_status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+            wsl_lay.addWidget(self.wsl_status_label)
+            
+            wsl_btn_row = QHBoxLayout()
+            self.install_wsl_btn = QPushButton("Install WSL2 + Ubuntu", clicked=self._install_wsl2_action)
+            self.install_wsl_btn.setToolTip("Automatically installs WSL2 and Ubuntu distro (requires admin privileges and a restart).")
+            self.install_wsl_btn.setStyleSheet(f"background: #0366d6; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
+            wsl_btn_row.addWidget(self.install_wsl_btn)
+            
+            self.refresh_wsl_btn = QPushButton("Refresh WSL Status", clicked=self._refresh_wsl_status)
+            self.refresh_wsl_btn.setStyleSheet(f"border-color: {CYAN_PRIMARY}; padding: 8px;")
+            wsl_btn_row.addWidget(self.refresh_wsl_btn)
+            wsl_lay.addLayout(wsl_btn_row)
+            
+            dlay.addWidget(wsl_group)
         else:
             self.server_sudo_pass = None
 
@@ -718,6 +940,9 @@ class PretendoManager(QMainWindow):
         if OS_INFO["os"] == "linux":
             row_sys.addWidget(QPushButton("Fix Perms", clicked=self.fix_docker_permissions))
             row_sys.addWidget(QPushButton("Reset Per-Session Sudo", clicked=lambda: setattr(self, 'cached_password', None) or (self.server_sudo_pass.clear() if self.server_sudo_pass else None)))
+        elif OS_INFO["os"] == "windows":
+            row_sys.addWidget(QPushButton("Open PowerShell", clicked=lambda: subprocess.Popen(["powershell", "-NoExit", "-Command", "Write-Host '3D Open Dock U - PowerShell Session'"], creationflags=0x00000010 if _is_windows() else 0)))
+            row_sys.addWidget(QPushButton("Open WSL Terminal", clicked=lambda: subprocess.Popen(["wsl"], creationflags=0x00000010 if _is_windows() else 0) if OS_INFO.get("has_wsl") else QMessageBox.warning(self, "WSL2", "WSL2 is not installed. Click 'Install WSL2 + Ubuntu' first.")))
         
         dlay.addLayout(row_sys)
 
@@ -899,56 +1124,61 @@ class PretendoManager(QMainWindow):
         guide = QTextEdit()
         guide.setReadOnly(True)
         guide.setHtml(f"""
-            <h1 style='color:{RED_PRIMARY};'>Pretendo Docker Setup Guide</h1>
-            <p>Welcome to the <b>3D Open Dock U</b> server manager! This guide will walk you through setting up your own private 
-            Pretendo Network stack using Docker.</p>
+            <h1 style='color:{RED_PRIMARY};'>3D Open Dock U: Complete User Guide</h1>
+            <p>The <b>3D Open Dock U</b> is your all-in-one command center for deploying, managing, and connecting to a private <b>Pretendo Network</b> server stack. 
+            Follow this guide to transition from a clean slate to a fully functional private online environment.</p>
             
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 1: Prerequisites</h2>
+            <h2 style='color:{CYAN_PRIMARY};'>Phase 1: Environment Readiness</h2>
+            <p>Before installing the server stack, ensure your system is compatible:</p>
             <ul>
-                <li><b>Docker & Docker Compose:</b> Ensure Docker is installed. On Linux, use the <i>Setup</i> tab to fix permissions.</li>
-                <li><b>Admin Rights:</b> You need a sudo password for Linux setups (to manage system services and network ports).</li>
+                <li><b>Linux:</b> Ensure Docker and Docker Compose are installed. Use the <b>Setup</b> tab's <i>'Fix Docker Permissions'</i> if the app can't talk to the Docker socket.</li>
+                <li><b>Windows:</b> You <b>MUST</b> install <b>Docker Desktop</b> and enable <b>WSL2</b>. Click <i>'Audit System'</i> in the Setup tab to check your status. 
+                If Docker isn't running, use the <i>'Start Docker Desktop'</i> button on the dashboard.</li>
+                <li><b>Submodules:</b> If you are a developer, ensure you have <b>Git</b> installed to clone the repository with all its dependencies.</li>
             </ul>
 
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 2: Installation</h2>
+            <h2 style='color:{CYAN_PRIMARY};'>Phase 2: Server Installation (Step-by-Step)</h2>
             <ol>
-                <li>Go to the <b>Setup</b> tab.</li>
-                <li>Choose a folder (e.g., <code>~/pretendo-docker</code>).</li>
-                <li>Click <b>Download Stack</b>. This clones the official Pretendo Docker repository.</li>
-                <li>Click <b>Run Full Setup Script</b>. This generates the necessary configuration and <code>.env</code> files.</li>
-                <li>Click <b>Build Containers</b>. This fetches the server images (this can take 5-10 minutes).</li>
+                <li>Navigate to the <b>Setup & Maintenance</b> tab.</li>
+                <li><b>Select Root Folder:</b> Choose an empty directory where the server will live (e.g., <code>C:\\Games\\Pretendo</code> or <code>~/pretendo-docker</code>).</li>
+                <li><b>Download Stack:</b> Click 'Download Stack'. This pulls the official Pretendo architecture.</li>
+                <li><b>Run Automated Setup:</b> Click <i>'Run Full Setup Script'</i>. This is the "Magic Button" that generates secret keys, configures local IP addresses, and sets up your <code>.env</code> files.</li>
+                <li><b>Apply Submodule Patches:</b> Click <i>'Run Submodule Patches'</i>. This fixes common bugs in the original code, like Super Mario Maker 404 errors.</li>
+                <li><b>Build Containers:</b> Click <i>'Build Server Containers'</i>. This will download and compile the server images. This takes ~5-15 minutes depending on your internet and CPU.</li>
             </ol>
 
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 3: Network & Ports</h2>
-            <p>Steam often uses port <b>8080</b>, which clashes with Pretendo. We automatically adapt your 
-            installation to use the port specified in the <b>Target Node URL</b> (default 8070) to avoid crashes.</p>
+            <h2 style='color:{CYAN_PRIMARY};'>Phase 3: The "Magic" Patching System</h2>
+            <p>Configuring Cemu or Citra manually is difficult. We've automated it entirely:</p>
             <ul>
-                <li>When patching your emulator, ensure the URL matches your server IP and Port.</li>
-                <li>The <i>Start Server</i> button will automatically clear any port conflicts before launching.</li>
+                <li>Go to the <b>Identities & Emulators</b> tab.</li>
+                <li><b>Detection:</b> Ensure the paths to your <b>Cemu</b> or <b>Citra</b> folders are correct (they are usually auto-detected).</li>
+                <li><b>Identity:</b> Enter your desired username, password, and Mii Name.</li>
+                <li><b>Target Node:</b> Set this to your server's IP (usually detected automatically) and port (default 8070).</li>
+                <li><b>The 'Patch All' Button:</b> Click <i>'Sync & Patch Cemu'</i>. This will:
+                    <ul>
+                        <li>Auto-sync Docker's internal settings to match your custom port.</li>
+                        <li>Download and install required <b>Mii shared fonts</b> (fix question marks).</li>
+                        <li>Inject <code>otp.bin</code>, <code>seeprom.bin</code>, and account data.</li>
+                        <li>Register your account on the server database automatically.</li>
+                    </ul>
+                </li>
             </ul>
 
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 4: Patch & Connect</h2>
-            <h3>Wii U (Cemu)</h3>
+            <h2 style='color:{CYAN_PRIMARY};'>Phase 4: Playing on Real Hardware</h2>
+            <p>If you want to use your private server on a real <b>Wii U</b> or <b>3DS</b>:</p>
             <ul>
-                <li>In the <b>Identities & Emulators</b> tab, enter your PNID credentials.</li>
-                <li>Ensure your Cemu folder is correctly detected.</li>
-                <li>Set the <b>Target Node</b> URL to your server's address and port.</li>
-                <li>Click <b>Patch & Connect (Cemu)</b>. This will sync Docker services to your target port, update Cemu's <code>settings.xml</code>, generate identity files, and register your account — all in one step.</li>
-            </ul>
-            <h3>3DS (Citra/Lime3DS)</h3>
-            <ul>
-                <li>Click <b>Patch & Connect (Citra)</b> with the Target Node pointing to your local server. Docker services, Citra config, and identity files will all be synced automatically.</li>
+                <li>Install <b>Nimbus</b> on your console.</li>
+                <li>On the manager, click <b>'Generate Console Bundle'</b> in the Identites tab.</li>
+                <li>Save the ZIP file and extract it to your console's SD card.</li>
+                <li>Use the <code>3DS/local_server_url.txt</code> with Nimbus to point your hardware to your PC's IP.</li>
             </ul>
 
-            <h2 style='color:{CYAN_PRIMARY};'>Phase 5: The Vault (Profile Management)</h2>
-            <p>The <b>Vault</b> is used to manage multiple "identities". You can backup your current 3DS/Wii U online files 
-            into named profiles. This allows you to swap between your Official, Pretendo-Public, and Local-Dev 
-            accounts with a single click!</p>
-            
-            <h2 style='color:{RED_LIGHT};'>Common Issues</h2>
+            <h2 style='color:{RED_LIGHT};'>Common Issues & Troubleshooting</h2>
             <ul>
-                <li><b>"Address already in use":</b> Close Steam or click <i>Stop Server</i> and then <i>Start Server</i> again to force-clear ports.</li>
-                <li><b>"IOSU_CRYPTO / RSA Failures":</b> Use the <i>Inject System Keys</i> tool in the Setup tab to fix decryption errors.</li>
-                <li><b>"account.dat not found":</b> Make sure you have run the emulator at least once so it creates the file structure.</li>
+                <li><b>502 Bad Gateway / Connection Refused:</b> This usually means the server is still booting. Check the <b>Logs</b> tab. If it persists, click <i>'Refresh WSL Status'</i> (Windows) or <i>'Stop Server'</i> then <i>'Start Server'</i> to clear port conflicts.</li>
+                <li><b>Repetitive Maps (Splatoon):</b> Click <i>'Apply Live Rotations'</i> in the Setup tab. This pulls live schedules from the public Pretendo CDN to fix the 'same stage' bug.</li>
+                <li><b>Softlocks on Connect:</b> Ensure your Firewall is not blocking ports <b>80, 443, 8080, and 8070</b>.</li>
+                <li><b>Mii Names are ????:</b> Click <i>'Apply Mii Font Fix'</i> on the Identities/Setup tab to redeploy <code>CafeStd.ttf</code>.</li>
             </ul>
         """)
         layout.addWidget(guide)
@@ -1209,6 +1439,7 @@ class PretendoManager(QMainWindow):
 
     def _apply_compose_patches(self, port, s_dir):
         """Robust YAML patching for mitmproxy port and MongoDB version/stability."""
+        applied_any = False
         for fname in ["compose.yml", "docker-compose.yml"]:
             path = os.path.join(s_dir, fname)
             if not os.path.exists(path): continue
@@ -1217,15 +1448,16 @@ class PretendoManager(QMainWindow):
                 new_lines = []
                 current_service = None
                 changed = False
+                
                 for i, line in enumerate(lines):
                     stripped = line.strip()
-                    # Identify current service block
+                    # Identify current service block (lines starting with exactly 2 spaces)
                     if line.startswith("  ") and not line.startswith("   ") and stripped.endswith(":") and not stripped.startswith("-"):
                         current_service = stripped[:-1].lower()
 
+                    # 1. mitmproxy-pretendo: update external port
                     if current_service == "mitmproxy-pretendo":
                         if ":8080" in line and "ports:" not in line:
-                            # Robustly replace any port mapping to internal 8080
                             new_line = re.sub(r'(?:^\s*-\s*|:)(\d+):8080', lambda m: m.group(0).replace(m.group(1), str(port)), line)
                             if new_line != line:
                                 line = new_line
@@ -1234,79 +1466,102 @@ class PretendoManager(QMainWindow):
                             line = line.replace("mitmweb --web-host 0.0.0.0", "mitmweb --web-host 0.0.0.0 --set confdir=./.mitmproxy -s ./pretendo_addon.py --set pretendo_redirect=true --set pretendo_host=nginx --set pretendo_host_port=80 --set pretendo_http=true --set client_certs=./client-certificates/WiiU-common.pem --set ssl_insecure=true --set tls_version_client_min=UNBOUNDED --set tls_version_server_min=UNBOUNDED")
                             changed = True
 
+                    # 2. adminer: update port
                     if current_service == "adminer":
                         if "127.0.0.1:8070:8080" in line:
                             line = line.replace("127.0.0.1:8070:8080", "127.0.0.1:8088:8080")
                             changed = True
-                        
+                    
+                    # 3. mongodb: pin version and add alias
                     if current_service == "mongodb":
                         if "image: mongo:latest" in line:
                             line = line.replace("mongo:latest", "mongo:4.4")
                             changed = True
-                        # Add 'mongo' alias for legacy service compatibility
-                        if "networks:" in line:
-                            # Check if 'internal:' is present in the next few lines
+                        if "internal:" in line:
+                            # Verify if aliases: mongo already exists
+                            already_has = False
                             for j in range(i + 1, min(i + 5, len(lines))):
-                                if "internal:" in lines[j]:
-                                    # Check if 'aliases:' is already present under 'internal:'
-                                    aliases_found = False
-                                    for k in range(j + 1, min(j + 5, len(lines))):
-                                        if "aliases:" in lines[k]:
-                                            aliases_found = True
-                                            break
-                                        if lines[k].strip() == "" or not lines[k].startswith("      "): # Stop if indentation changes or empty line
-                                            break
-                                    if not aliases_found:
-                                        # We can't easily insert into the list we are iterating over safely without index management
-                                        # but since we append to new_lines, we can just append there.
-                                        pass
+                                if "aliases:" in lines[j] or "- mongo" in lines[j]:
+                                    already_has = True
                                     break
+                            if not already_has:
+                                new_lines.append(line)
+                                new_lines.append("        aliases:\n")
+                                new_lines.append("          - mongo\n")
+                                changed = True
+                                continue
 
+                    # 4. mongo-express: pin version and add local env
                     if current_service == "mongo-express":
                         if "image: mongo-express:latest" in line:
-                            # Fix for the broken /dev/tcp entrypoint in recent mongo-express images on Alpine
-                            # Pinning to 0.54.0 resolves the shell compatibility issue
                             line = line.replace("mongo-express:latest", "mongo-express:0.54.0")
                             changed = True
-                        
-                        # Inject connection compatibility vars if using the pinned version
-                        if "env_file:" in line and "mongo-express:0.54.0" in "".join(new_lines[-5:]):
-                             # If we see the pinned version, ensure we use the older MB_CONFIG vars
-                             # We'll handle this in _generate_env_files instead for persistence.
-                             pass
-
-                # Ensure mongo-express has its .local.env file included for the MB_CONFIG variables
-                if current_service == "mongo-express" and "mongo-express.env" in line and "mongo-express.local.env" not in "".join(lines[i:i+3]):
-                    new_lines.append(line)
-                    indent = line[:line.find("-")]
-                    new_lines.append(f"{indent}- ./environment/mongo-express.local.env\n")
-                    changed = True
-                    continue
-
-                    new_lines.append(line)
+                        if "env_file:" in line:
+                            # Look ahead to see if local.env is already there
+                            has_local = False
+                            for j in range(i + 1, min(i + 5, len(lines))):
+                                if "mongo-express.local.env" in lines[j]:
+                                    has_local = True
+                                    break
+                            if not has_local:
+                                new_lines.append(line)
+                                indent = line[:line.find("-")] if "-" in line else "      "
+                                new_lines.append(f"{indent}- ./environment/mongo-express.local.env\n")
+                                changed = True
+                                continue
                     
-                    # Special case: Insert aliases after the 'internal:' line in mongodb service
-                    if current_service == "mongodb" and "internal:" in line:
-                        # Look ahead to see if aliases already exist
-                        already_has = False
-                        for j in range(i + 1, min(i + 5, len(lines))):
-                            if "aliases:" in lines[j]:
-                                already_has = True
-                                break
-                            if lines[j].strip() == "" or (len(lines[j]) > 0 and not lines[j].startswith("      ")):
-                                break
-                        if not already_has:
-                            new_lines.append("        aliases:\n")
-                            new_lines.append("          - mongo\n")
+                    new_lines.append(line)
+                
+                # 5. Injection Gate: Ensure Super Smash Bros. Wii U is present
+                if "super-smash-bros-wiiu:" not in "".join(new_lines).lower():
+                    self.setup_log.append("[System] Injecting Super Smash Bros. Wii U service definition...")
+                    smash_service = [
+                        "\n",
+                        "  super-smash-bros-wiiu:\n",
+                        "    build: ./repos/super-smash-bros-wiiu\n",
+                        "    depends_on:\n",
+                        "      - account\n",
+                        "      - postgres\n",
+                        "      - mongodb\n",
+                        "    restart: unless-stopped\n",
+                        "    ports:\n",
+                        "      - 127.0.0.1:2352:2345\n",
+                        "      - 6012:6012/udp\n",
+                        "      - 6013:6013/udp\n",
+                        "    networks:\n",
+                        "      internal:\n",
+                        "    dns: 172.20.0.200\n",
+                        "    env_file:\n",
+                        "      - ./environment/super-smash-bros-wiiu.local.env\n"
+                    ]
+                    # Insert before the volumes block
+                    for idx, l in enumerate(new_lines):
+                        if l.startswith("volumes:"):
+                            for sl in reversed(smash_service):
+                                new_lines.insert(idx, sl)
                             changed = True
+                            break
                 
                 if changed:
                     self._patch_mitmproxy_addon(s_dir)
+                    # Also patch postgres-init.sh to include the smash database
+                    pg_init = os.path.join(s_dir, "scripts", "run-in-container", "postgres-init.sh")
+                    if os.path.exists(pg_init):
+                        try:
+                            with open(pg_init, "r") as f: pg_lines = f.readlines()
+                            new_pg = []
+                            for pl in pg_lines:
+                                if "databases=" in pl and "super_smash_bros_wiiu" not in pl:
+                                    pl = pl.replace('"', 'super_smash_bros_wiiu "')
+                                new_pg.append(pl)
+                            with open(pg_init, "w") as f: f.writelines(new_pg)
+                        except: pass
+                    
                     with open(path, "w") as f: f.writelines(new_lines)
-                    return True
+                    applied_any = True
             except Exception as e:
-                print(f"Error patching {path}: {e}")
-        return False
+                self.setup_log.append(f"[ERROR] Failed to patch {fname}: {e}")
+        return applied_any
 
     def _patch_mitmproxy_addon(self, s_dir):
         """Fix the mitmproxy addon to prevent infinite loops when patching via IP address."""
@@ -1350,7 +1605,7 @@ class PretendoManager(QMainWindow):
         if shutil.which("docker-compose"): has_compose = True
         else:
             try:
-                res = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True)
+                res = subprocess.run(["docker", "compose", "version"], capture_output=True, text=True, creationflags=0x08000000 if OS_INFO["os"] == "windows" else 0)
                 if res.returncode == 0: has_compose = True
             except: pass
         if not has_compose: missing.append("Docker Compose (Plugin or V1)")
@@ -1364,6 +1619,25 @@ class PretendoManager(QMainWindow):
                 if not os.access("/var/run/docker.sock", os.W_OK):
                     warnings.append("Docker socket not writable (Run 'Fix Permissions')")
             except: pass
+        elif OS_INFO["os"] == "windows":
+            # Windows-specific checks
+            if not OS_INFO.get("has_wsl"):
+                missing.append("WSL2 (Required for bash scripts — Click 'Install WSL2 + Ubuntu')")
+            elif not OS_INFO.get("has_wsl_distro"):
+                missing.append("WSL2 Linux Distro (WSL2 installed but no distro — run 'wsl --install -d Ubuntu')")
+            
+            if not _docker_available():
+                if not _docker_desktop_running():
+                    warnings.append("Docker Desktop is not running (Click 'Start Docker Desktop')")
+                else:
+                    warnings.append("Docker Desktop is running but not responding (it may still be starting up)")
+            
+            if not shutil.which("git"):
+                warnings.append("Git not found in PATH (Install Git for Windows from https://git-scm.com)")
+            
+            # Check if bash is available (via Git Bash or WSL)
+            if not shutil.which("bash") and not OS_INFO.get("has_wsl"):
+                warnings.append("No bash available (Install Git for Windows or WSL2)")
 
         # 3. Stack Integrity
         s_dir = self.server_dir_field.text().strip()
@@ -1388,7 +1662,11 @@ class PretendoManager(QMainWindow):
 
         # Final Report
         if not missing and not warnings:
-            self.check_result.setText("✔ Audit Passed: System is fully operational.")
+            platform_note = ""
+            if OS_INFO["os"] == "windows":
+                distro = OS_INFO.get("wsl_distro", "Unknown")
+                platform_note = f"\n🖥 Windows Mode — WSL2: {distro} | Docker Desktop"
+            self.check_result.setText(f"✔ Audit Passed: System is fully operational.{platform_note}")
             self.check_result.setStyleSheet("color: #3fb950; font-weight: bold;")
         else:
             report = ""
@@ -1497,7 +1775,7 @@ class PretendoManager(QMainWindow):
             stack_exists = os.path.isdir(s_dir) and (os.path.isfile(os.path.join(s_dir, "compose.yml")) or os.path.isfile(os.path.join(s_dir, "docker-compose.yml")))
             
             # Use a timeout to prevent GUI freezes if the docker socket is unresponsive
-            res = subprocess.run(["docker", "ps", "--filter", "name=pretendo", "--format", "{{.Names}}"], capture_output=True, text=True, timeout=3)
+            res = subprocess.run(["docker", "ps", "--filter", "name=pretendo", "--format", "{{.Names}}"], capture_output=True, text=True, timeout=3, creationflags=0x08000000 if OS_INFO["os"] == "windows" else 0)
             self.server_running = bool(res.stdout.strip())
             
             if not stack_exists:
@@ -1535,6 +1813,34 @@ class PretendoManager(QMainWindow):
                     else:
                         self.service_toggle_btn.setText("Enable Docker Service")
                         self.service_toggle_btn.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1a7f37, stop:1 #2ea043); border-color: #1a5c1a; color: white; font-weight: bold; border-radius: 8px; padding: 12px;")
+            elif OS_INFO["os"] == "windows":
+                self.docker_service_running = _docker_desktop_running() or _docker_available()
+                
+                if not stack_exists:
+                    self.service_toggle_btn.setEnabled(False)
+                    self.service_toggle_btn.setText("Error: Install Docker Services")
+                    self.service_toggle_btn.setStyleSheet("background: #555555; border-color: #444444; color: #aaaaaa; font-weight: bold; border-radius: 8px; padding: 12px;")
+                else:
+                    self.service_toggle_btn.setEnabled(True)
+                    if self.docker_service_running:
+                        self.service_toggle_btn.setText("Docker Desktop Running ✔")
+                        self.service_toggle_btn.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1a7f37, stop:1 #2ea043); border-color: #1a5c1a; color: white; font-weight: bold; border-radius: 8px; padding: 12px;")
+                    else:
+                        self.service_toggle_btn.setText("Start Docker Desktop")
+                        self.service_toggle_btn.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0366d6, stop:1 #2188ff); border-color: #0366d6; color: white; font-weight: bold; border-radius: 8px; padding: 12px;")
+                
+                # Update WSL status label if it exists
+                if hasattr(self, 'wsl_status_label'):
+                    if OS_INFO["has_wsl"] and OS_INFO["has_wsl_distro"]:
+                        distro = OS_INFO.get("wsl_distro", "Unknown")
+                        self.wsl_status_label.setText(f"WSL2: ✔ Active ({distro})")
+                        self.wsl_status_label.setStyleSheet("color: #3fb950; font-size: 12px;")
+                    elif OS_INFO["has_wsl"]:
+                        self.wsl_status_label.setText("WSL2: ⚠ No Distro Installed")
+                        self.wsl_status_label.setStyleSheet("color: #d29922; font-size: 12px;")
+                    else:
+                        self.wsl_status_label.setText("WSL2: ❌ Not Installed")
+                        self.wsl_status_label.setStyleSheet(f"color: {RED_PRIMARY}; font-size: 12px;")
         except: pass
 
     def _get_effective_sudo_password(self):
@@ -1767,7 +2073,7 @@ class PretendoManager(QMainWindow):
                 
                 # 4. State Sync
                 setup_cmds.append("echo '[Post-Boot] Synchronizing application state...'")
-                setup_cmds.append("docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website")
+                setup_cmds.append("docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website super-smash-bros-wiiu")
                 
                 # 5. Account Health Guard (Prevents 502 errors in Cemu)
                 setup_cmds.append("echo '[Post-Boot] Verifying Account Server health...'")
@@ -1779,6 +2085,17 @@ class PretendoManager(QMainWindow):
                 if pw and OS_INFO["os"] == "linux":
                     full_cmd = f"sudo -S bash -c {shlex.quote(inner_cmds)}"
                     self._run_command(full_cmd, self.server_log, s_dir, stdin_data=pw, display_cmd="[Elevated] Post-Boot Initialization", on_done=self._on_server_boot_finished)
+                elif OS_INFO["os"] == "windows":
+                    # Windows: Route bash loops through WSL if available
+                    if OS_INFO.get("has_wsl") and OS_INFO.get("has_wsl_distro"):
+                        wsl_cwd = _win_to_wsl_path(s_dir)
+                        escaped = inner_cmds.replace('"', '\\"')
+                        full_cmd = f'wsl bash -lc "cd {shlex.quote(wsl_cwd)} && {escaped}"'
+                    else:
+                        # Simplified fallback: just docker compose restart (no bash loops)
+                        self.server_log.append("[System] WSL2 not available — using simplified post-boot init...")
+                        full_cmd = "docker compose exec -T mongodb mongo --eval \"rs.initiate()\" & timeout /t 8 & docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website"
+                    self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Windows] Post-Boot Initialization", on_done=self._on_server_boot_finished)
                 else:
                     full_cmd = inner_cmds
                     self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Standard] Post-Boot Initialization", on_done=self._on_server_boot_finished)
@@ -1799,6 +2116,15 @@ class PretendoManager(QMainWindow):
                 self.server_log.append("[System] Starting server (Best-Effort Mode)...")
                 cmd = f"({fuser_cmd}) ; docker compose up -d"
                 self._run_command(cmd, self.server_log, s_dir, on_done=_on_start, display_cmd="[Standard] Clean Ports & Start Framework")
+        elif OS_INFO["os"] == "windows":
+            # Windows: Clear ports via PowerShell, then docker compose up
+            kill_cmd = self._get_kill_ports_cmd(ports)
+            def _win_start():
+                self.server_log.append("[System] Clearing ports and starting Docker containers...")
+                cmd = f"{kill_cmd} & docker compose up -d"
+                self._run_command(cmd, self.server_log, s_dir, on_done=_on_start, display_cmd="[Windows] Clean Ports & Start Framework")
+            # Ensure Docker Desktop is running first
+            self._ensure_docker_desktop(_win_start)
         else:
             self._run_command("docker compose up -d", self.server_log, s_dir, on_done=_on_start, display_cmd="docker compose up -d")
 
@@ -1828,6 +2154,12 @@ class PretendoManager(QMainWindow):
                 # Try to kill what we can as current user, then docker down
                 cmd = f"{fuser_cmd} || true; docker compose down"
                 self._run_command(cmd, self.server_log, s_dir, on_done=lambda c: self._check_docker_status(), display_cmd="[Standard] Stop Framework & Clean Ports")
+        elif OS_INFO["os"] == "windows":
+            # Windows: kill ports via PowerShell, then docker compose down
+            kill_cmd = self._get_kill_ports_cmd(ports)
+            self.server_log.append("[System] Stopping containers and releasing ports...")
+            cmd = f"docker compose down & {kill_cmd}"
+            self._run_command(cmd, self.server_log, s_dir, on_done=lambda c: self._check_docker_status(), display_cmd="[Windows] Stop Framework & Clean Ports")
         else:
             self._run_command("docker compose down", self.server_log, s_dir, on_done=lambda c: self._check_docker_status(), display_cmd="docker compose down")
 
@@ -1909,6 +2241,24 @@ class PretendoManager(QMainWindow):
         custom_port = self._get_target_port()
         if not custom_port.isdigit(): return
         ports = f"80 443 21 53 8080 {custom_port} 9231"
+
+        if OS_INFO["os"] == "windows":
+            # ─── Windows: Docker Desktop Toggle ───
+            if self.docker_service_running:
+                self.setup_log.append("[System] Stopping Docker Desktop and clearing ports...")
+                kill_cmd = self._get_kill_ports_cmd(ports)
+                # Stop Docker Desktop gracefully
+                stop_cmd = 'powershell -Command "Get-Process \"Docker Desktop\" -ErrorAction SilentlyContinue | Stop-Process -Force"'
+                self._run_command(f"{kill_cmd} & {stop_cmd}", self.setup_log, on_done=lambda c: self._check_docker_status())
+            else:
+                if self._get_local_ip() == "127.0.0.1":
+                    QMessageBox.warning(self, "No Connection", "An active internet connection is required to enable Docker services.")
+                    return
+                self.setup_log.append("[System] Starting Docker Desktop...")
+                self._ensure_docker_desktop(lambda: self._check_docker_status())
+            return
+
+        # ─── Linux: systemctl Toggle ───
         fuser_cmd = " ; ".join([f"fuser -k -n tcp {p} || true" for p in ports.split()])
 
         if self.docker_service_running:
@@ -1919,7 +2269,6 @@ class PretendoManager(QMainWindow):
                 self._run_command(cmd, self.setup_log, stdin_data=pw, on_done=lambda c: self._check_docker_status())
             else:
                 self.setup_log.append("[System] Clearing ports and attempting service stop (Silent-Best-Effort)...")
-                # Try killing ports as user, then stop service (service stop requires sudo but might work if NOPASSWD)
                 cmd = f"{fuser_cmd} || true; systemctl stop docker.socket docker.service"
                 self._run_command(cmd, self.setup_log, on_done=lambda c: self._check_docker_status())
         else:
@@ -1969,7 +2318,9 @@ class PretendoManager(QMainWindow):
                                     cmd = f"sudo -S rm -rf {shlex.quote(s_dir)}"
                                     result = subprocess.run(cmd, shell=True, input=pw + "\n", capture_output=True, text=True)
                                 else:
-                                    cmd = f"rmdir /s /q {shlex.quote(s_dir)}"
+                                    # Windows: Use PowerShell Remove-Item which handles junctions better
+                                    win_path = s_dir.replace("'", "''")
+                                    cmd = f'powershell -Command "Remove-Item -Path \'{win_path}\' -Recurse -Force -ErrorAction Stop"'
                                     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
                                 
                                 if result.returncode == 0:
@@ -2019,15 +2370,46 @@ class PretendoManager(QMainWindow):
             self.setup_log.append("[ERROR] Clone completed but compose.yml still missing. Repository may be corrupted.")
             return
         
-        self.setup_log.append("\n[System] Stack downloaded. Applying submodule patches...")
+        self.setup_log.append("\n[System] Stack downloaded. Checking for game-specific repositories...")
+        
+        # Ensure Super Smash Bros. Wii U repo is present (Custom Addition)
+        smash_dir = os.path.join(s_dir, "repos", "super-smash-bros-wiiu")
+        if not os.path.isdir(smash_dir):
+            self.setup_log.append("[System] Downloading Super Smash Bros. Wii U server...")
+            smash_repo = "https://github.com/PretendoNetwork/super-smash-bros-wiiu"
+            self._run_command(
+                f"git clone {smash_repo} {shlex.quote(smash_dir)}",
+                self.setup_log,
+                on_done=lambda c: self._on_clone_finished(0) # Re-run to continue
+            )
+            return
+
+        self.setup_log.append("[OK] All required repositories are present. Applying submodule patches...")
         
         # Run submodule patches (CRITICAL for Super Mario Maker and other fixes)
         patch_script = os.path.join(s_dir, "scripts", "setup-submodule-patches.sh")
         if os.path.isfile(patch_script):
             if OS_INFO["os"] == "linux":
                 patch_cmd = f"chmod +x {shlex.quote(patch_script)} && {shlex.quote(patch_script)}"
+            elif OS_INFO["os"] == "windows":
+                # Windows: Route through WSL if available, fallback to Git Bash
+                if OS_INFO.get("has_wsl") and OS_INFO.get("has_wsl_distro"):
+                    wsl_script = _win_to_wsl_path(patch_script)
+                    wsl_cwd = _win_to_wsl_path(s_dir)
+                    patch_cmd = f'wsl bash -lc "cd {shlex.quote(wsl_cwd)} && chmod +x {shlex.quote(wsl_script)} && {shlex.quote(wsl_script)}"'
+                    self.setup_log.append("[System] Running patches via WSL2...")
+                elif shutil.which("bash"):
+                    # Git Bash fallback: convert to Unix path for the bash shell
+                    git_bash_script = patch_script.replace("\\", "/")
+                    patch_cmd = f'bash -lc "chmod +x \'{git_bash_script}\' && \'{git_bash_script}\'"'
+                    self.setup_log.append("[System] Running patches via Git Bash...")
+                else:
+                    self.setup_log.append("[WARN] No bash environment available (WSL2 or Git Bash). Skipping patches.")
+                    self.setup_log.append("[HINT] Install WSL2 for full compatibility. Click 'Install WSL2 + Ubuntu'.")
+                    QTimer.singleShot(1000, self._run_environment_setup)
+                    return
             else:
-                # On Windows, try to run it with bash (if available via Git Bash) or just try to execute
+                # macOS / other
                 patch_cmd = f"bash {shlex.quote(patch_script)}" if shutil.which("bash") else shlex.quote(patch_script)
                 
             self._run_command(
@@ -2074,6 +2456,10 @@ class PretendoManager(QMainWindow):
             if not pw:
                 self.setup_log.append("[ERROR] Sudo password is required for setup. Aborted.")
                 return
+        elif OS_INFO["os"] == "windows":
+            # Windows: No sudo needed — Docker Desktop handles elevation via its own daemon
+            self.setup_log.append("[System] Windows mode: Docker Desktop handles elevation.")
+            pw = None
 
         # Proceed to port clearing + docker pull + build
         self._deploy_step2_clear_and_pull(s_dir, local_ip, custom_port, pw)
@@ -2119,6 +2505,9 @@ class PretendoManager(QMainWindow):
         
         splat_kerberos_pw = get_existing("splatoon.local.env", "PN_SPLATOON_KERBEROS_PASSWORD", gen_password(32))
         splat_aes_key = get_existing("splatoon.local.env", "PN_SPLATOON_CONFIG_AES_KEY", gen_hex(64))
+        
+        smash_kerberos_pw = get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_KERBEROS_PASSWORD", gen_password(32))
+        smash_aes_key = get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_CONFIG_AES_KEY", gen_hex(64))
         
         minecraft_kerberos_pw = get_existing("minecraft-wiiu.local.env", "PN_MINECRAFT_KERBEROS_PASSWORD", gen_password(32))
         pikmin3_kerberos_pw = get_existing("pikmin-3.local.env", "PN_PIKMIN3_KERBEROS_PASSWORD", gen_password(32))
@@ -2246,6 +2635,18 @@ class PretendoManager(QMainWindow):
             f"PN_WIIU_CHAT_CONFIG_SECURE_SERVER_LOCATION={server_ip}",
         ]
         
+        # super-smash-bros-wiiu.local.env
+        env_files["super-smash-bros-wiiu.local.env"] = [
+            f"PN_SMASH_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
+            f"PN_SMASH_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
+            f"PN_SMASH_KERBEROS_PASSWORD={smash_kerberos_pw}",
+            f"PN_SMASH_CONFIG_KERBEROS_PASSWORD={smash_kerberos_pw}",
+            f"PN_SMASH_CONFIG_AES_KEY={smash_aes_key}",
+            f"PN_SMASH_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_password}@postgres/super_smash_bros_wiiu?sslmode=disable",
+            f"PN_SMASH_SECURE_SERVER_HOST={server_ip}",
+            f"PN_SMASH_CONFIG_SECURE_SERVER_HOST={server_ip}",
+        ]
+
         # minio.local.env
         env_files["minio.local.env"] = [
             f"MINIO_ROOT_PASSWORD={minio_secret_key}",
@@ -2462,12 +2863,15 @@ Server IP address: {server_ip}
         
         # Build commands for port killing and container downing
         kill_cmd = self._get_kill_ports_cmd(ports_to_kill, pw)
-        d_cmd = "docker compose down --remove-orphans 2>/dev/null || docker-compose down --remove-orphans 2>/dev/null || true"
-        if pw and OS_INFO["os"] == "linux":
-            d_cmd = f"sudo -S {d_cmd}"
         
-        # Chain them together and run in background worker
-        full_cmd = f"{kill_cmd} ; {d_cmd}"
+        if OS_INFO["os"] == "windows":
+            d_cmd = "docker compose down --remove-orphans 2>NUL || docker-compose down --remove-orphans 2>NUL || echo done"
+            full_cmd = f"{kill_cmd} & {d_cmd}"
+        else:
+            d_cmd = "docker compose down --remove-orphans 2>/dev/null || docker-compose down --remove-orphans 2>/dev/null || true"
+            if pw and OS_INFO["os"] == "linux":
+                d_cmd = f"sudo -S {d_cmd}"
+            full_cmd = f"{kill_cmd} ; {d_cmd}"
         
         self._run_command(full_cmd, self.setup_log, cwd=s_dir, stdin_data=pw,
                           on_done=lambda c: self._deploy_step3_pull(s_dir, pw),
@@ -2485,9 +2889,12 @@ Server IP address: {server_ip}
         
         # Ensure Docker is active before pulling
         def _do_pull():
-            cmd = "docker compose pull --ignore-buildable 2>/dev/null || docker compose pull 2>/dev/null || true"
-            if pw and OS_INFO["os"] == "linux":
-                cmd = f"sudo -S {cmd}"
+            if OS_INFO["os"] == "windows":
+                cmd = "docker compose pull --ignore-buildable 2>NUL || docker compose pull 2>NUL || echo done"
+            else:
+                cmd = "docker compose pull --ignore-buildable 2>/dev/null || docker compose pull 2>/dev/null || true"
+                if pw and OS_INFO["os"] == "linux":
+                    cmd = f"sudo -S {cmd}"
             QTimer.singleShot(500, lambda: self._run_command(
                 cmd,
                 self.setup_log, cwd=s_dir,
@@ -2496,10 +2903,8 @@ Server IP address: {server_ip}
                 display_cmd="docker compose pull"
             ))
         
-        if OS_INFO["os"] == "linux":
-            self._ensure_docker_active(_do_pull)
-        else:
-            _do_pull()
+        # Ensure Docker is active on all platforms
+        self._ensure_docker_active(_do_pull)
 
     def _deploy_step4_build(self, s_dir, pw):
         """Step 4: Build docker images."""
@@ -2529,10 +2934,8 @@ Server IP address: {server_ip}
                 display_cmd="docker compose build"
             ))
         
-        if OS_INFO["os"] == "linux":
-            self._ensure_docker_active(_do_build)
-        else:
-            _do_build()
+        # Ensure Docker is active on all platforms
+        self._ensure_docker_active(_do_build)
 
     def _check_port_conflicts(self):
         """Check for processes occupying critical Pretendo ports."""
@@ -2591,6 +2994,25 @@ Server IP address: {server_ip}
         
         if os.path.isfile(setup_script) and os.path.isfile(framework_script) and OS_INFO["os"] == "linux":
             cmd = f"docker compose down --remove-orphans ; {kill_cmd} ; chmod +x ./setup.sh && ./setup.sh --force --server-ip {local_ip}"
+        elif os.path.isfile(setup_script) and os.path.isfile(framework_script) and OS_INFO["os"] == "windows":
+            if OS_INFO.get("has_wsl") and OS_INFO.get("has_wsl_distro"):
+                # Windows + WSL: Run bash setup.sh through WSL
+                wsl_dir = _win_to_wsl_path(s_dir)
+                self.setup_log.append("[System] Running setup.sh via WSL2...")
+                cmd = f'docker compose down --remove-orphans & {kill_cmd} & wsl bash -lc "cd {shlex.quote(wsl_dir)} && chmod +x ./setup.sh && ./setup.sh --force --server-ip {local_ip}"'
+            elif shutil.which("bash"):
+                # Windows + Git Bash: Run bash setup.sh via Git Bash fallback
+                git_bash_setup = setup_script.replace("\\", "/")
+                self.setup_log.append("[System] Running setup.sh via Git Bash...")
+                cmd = f'docker compose down --remove-orphans & {kill_cmd} & bash -lc "\'{git_bash_setup}\' --force --server-ip {local_ip}"'
+            else:
+                # No bash found on Windows - will fall through to Python fallback
+                cmd = None
+        else:
+            cmd = None
+
+        if cmd:
+            pass # cmd is set
         else:
             # Fallback: generate env files in Python, then pull + build
             if not os.path.isfile(setup_script):
@@ -2606,12 +3028,17 @@ Server IP address: {server_ip}
                 self.setup_log.append(f"[ERROR] Failed to generate environment: {e}")
                 return
             
-            inner = f"docker compose down --remove-orphans; {kill_cmd} ; docker compose pull --ignore-buildable 2>/dev/null; docker compose pull 2>/dev/null; docker compose build"
-            if pw and OS_INFO["os"] == "linux":
-                import shlex
-                cmd = f"sudo -S bash -c {shlex.quote(inner)}"
-            else:
+            if OS_INFO["os"] == "windows":
+                # Windows: no sudo needed, use & instead of ; for cmd.exe chaining
+                inner = f"docker compose down --remove-orphans & {kill_cmd} & docker compose pull --ignore-buildable 2>NUL & docker compose pull 2>NUL & docker compose build"
                 cmd = inner
+            else:
+                inner = f"docker compose down --remove-orphans; {kill_cmd} ; docker compose pull --ignore-buildable 2>/dev/null; docker compose pull 2>/dev/null; docker compose build"
+                if pw and OS_INFO["os"] == "linux":
+                    import shlex
+                    cmd = f"sudo -S bash -c {shlex.quote(inner)}"
+                else:
+                    cmd = inner
         
         self.setup_log.append(f"[System] Starting comprehensive setup with IP: {local_ip}...")
         self._run_command(cmd, self.setup_log, cwd=s_dir, stdin_data=pw, 
@@ -2639,6 +3066,11 @@ Server IP address: {server_ip}
 
     def _ensure_docker_active(self, on_ready):
         """Ensure Docker service is running appropriately for the platform."""
+        if OS_INFO["os"] == "windows":
+            # On Windows, ensure Docker Desktop is running
+            self._ensure_docker_desktop(on_ready)
+            return
+        
         if OS_INFO["os"] != "linux":
             on_ready()
             return
@@ -2674,19 +3106,144 @@ Server IP address: {server_ip}
             return inner
 
     def fix_docker_permissions(self):
-        """Fix Docker socket permissions on Linux."""
-        def _do_fix():
-            pw = self._ask_sudo_password()
-            if not pw: return
-            self.setup_log.append("[System] Attempting to apply Docker permissions...")
-            try:
-                actual_user = os.getlogin()
-            except OSError:
-                actual_user = os.environ.get("USER", os.environ.get("LOGNAME", "user"))
-            cmd = f"sudo -S bash -c 'groupadd -f docker && usermod -aG docker {actual_user} && chmod 666 /var/run/docker.sock'"
-            self._run_command(cmd, self.setup_log, stdin_data=pw, on_done=lambda c: QMessageBox.information(self, "Permissions", "Docker permissions applied! Restart the app to finish.") if c == 0 else None)
+        """Fix Docker socket permissions on Linux or diagnostic check on Windows."""
+        if OS_INFO["os"] == "linux":
+            def _do_fix():
+                pw = self._ask_sudo_password()
+                if not pw: return
+                self.setup_log.append("[System] Attempting to apply Docker permissions...")
+                try:
+                    actual_user = os.getlogin()
+                except OSError:
+                    actual_user = os.environ.get("USER", os.environ.get("LOGNAME", "user"))
+                cmd = f"sudo -S bash -c 'groupadd -f docker && usermod -aG docker {actual_user} && chmod 666 /var/run/docker.sock'"
+                self._run_command(cmd, self.setup_log, stdin_data=pw, on_done=lambda c: QMessageBox.information(self, "Permissions", "Docker permissions applied! Restart the app to finish.") if c == 0 else None)
+            
+            self._ensure_docker_active(_do_fix)
+        elif OS_INFO["os"] == "windows":
+            # Windows: Diagnostic check for Docker Desktop
+            self.setup_log.append("[System] Performing Windows Docker Health Check...")
+            if not _docker_desktop_running():
+                reply = QMessageBox.question(self, "Docker Offline", "Docker Desktop is not running. Start it now?", QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.Yes:
+                    _start_docker_desktop()
+            else:
+                if not _docker_available():
+                    QMessageBox.warning(self, "Docker Issue", "Docker Desktop is running, but the 'docker' command is not responding.\n\nEnsure 'WSL Integration' is enabled in Docker settings for your default distribution.")
+                else:
+                    QMessageBox.information(self, "Docker OK", "Docker is running and accessible. If you have deployment issues, try 'Refresh WSL Status' on the dashboard.")
+
+
+    # ─── Windows-Specific Actions ─────────────────────────────────────────────
+
+    def _install_wsl2_action(self):
+        """Install WSL2 + Ubuntu on Windows with user confirmation."""
+        if OS_INFO["os"] != "windows":
+            QMessageBox.information(self, "WSL2", "WSL2 is only applicable on Windows.")
+            return
         
-        self._ensure_docker_active(_do_fix)
+        if OS_INFO.get("has_wsl") and OS_INFO.get("has_wsl_distro"):
+            QMessageBox.information(self, "WSL2", f"WSL2 is already installed with distro: {OS_INFO.get('wsl_distro', 'Unknown')}.")
+            return
+        
+        reply = QMessageBox.question(
+            self, "Install WSL2",
+            "This will install WSL2 and Ubuntu on your system.\n\n"
+            "• Requires Administrator privileges (UAC prompt)\n"
+            "• A system restart may be required after installation\n"
+            "• Approximately 1-2 GB of disk space needed\n\n"
+            "Proceed with installation?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        
+        self.setup_log.append("[System] Installing WSL2 + Ubuntu (this requires admin and may take several minutes)...")
+        self.setup_log.append("[System] A UAC elevation prompt will appear — please approve it.")
+        QApplication.processEvents()
+        
+        # Run the install in the background worker
+        self._run_command(
+            'powershell -Command "Start-Process wsl -ArgumentList \'--install\' -Verb RunAs -Wait"',
+            self.setup_log,
+            on_done=self._on_wsl_install_done
+        )
+
+    def _on_wsl_install_done(self, code):
+        """Handle WSL2 installation completion."""
+        if code == 0:
+            self.setup_log.append("[SUCCESS] WSL2 installation command completed!")
+            self.setup_log.append("[INFO] You may need to restart your computer to finish WSL2 setup.")
+            self._refresh_wsl_status()
+            QMessageBox.information(
+                self, "WSL2 Installed",
+                "WSL2 installation initiated successfully!\n\n"
+                "Please restart your computer to complete the setup.\n"
+                "After restarting, launch this application again and WSL2 will be ready."
+            )
+        else:
+            self.setup_log.append(f"[ERROR] WSL2 installation failed with code {code}.")
+            self.setup_log.append("[HINT] Try running 'wsl --install' manually in an Administrator PowerShell.")
+
+    def _refresh_wsl_status(self):
+        """Re-probe WSL2 status on Windows and update the UI."""
+        if OS_INFO["os"] != "windows":
+            return
+        
+        self.setup_log.append("[System] Refreshing WSL2 status...")
+        OS_INFO["has_wsl"] = _wsl_installed()
+        OS_INFO["has_wsl_distro"] = _wsl_distro_installed()
+        OS_INFO["wsl_distro"] = _get_default_wsl_distro()
+        OS_INFO["has_docker_desktop"] = _docker_desktop_running()
+        OS_INFO["docker_available"] = _docker_available()
+        
+        if OS_INFO["has_wsl"] and OS_INFO["has_wsl_distro"]:
+            distro = OS_INFO.get("wsl_distro", "Unknown")
+            self.setup_log.append(f"[OK] WSL2 Active — Default Distro: {distro}")
+        elif OS_INFO["has_wsl"]:
+            self.setup_log.append("[WARN] WSL2 is installed but no Linux distro found. Click 'Install WSL2 + Ubuntu'.")
+        else:
+            self.setup_log.append("[WARN] WSL2 is not installed.")
+        
+        self._check_docker_status()
+
+    def _ensure_docker_desktop(self, on_ready):
+        """Ensure Docker Desktop is running on Windows, auto-starting if needed."""
+        if OS_INFO["os"] != "windows":
+            on_ready()
+            return
+        
+        if _docker_available():
+            on_ready()
+            return
+        
+        self.setup_log.append("[System] Docker is not responding. Attempting to start Docker Desktop...")
+        if _start_docker_desktop():
+            self.setup_log.append("[System] Docker Desktop launch initiated. Waiting for it to become ready (up to 60s)...")
+            # Poll for docker availability
+            self._wait_for_docker_desktop(on_ready, attempts=0)
+        else:
+            self.setup_log.append("[ERROR] Could not find Docker Desktop. Please install it from https://www.docker.com/products/docker-desktop/")
+            QMessageBox.warning(
+                self, "Docker Desktop Required",
+                "Docker Desktop is required on Windows.\n\n"
+                "Please install it from:\nhttps://www.docker.com/products/docker-desktop/\n\n"
+                "After installing, restart this application."
+            )
+
+    def _wait_for_docker_desktop(self, on_ready, attempts=0):
+        """Poll for Docker Desktop readiness with timeout."""
+        if _docker_available():
+            self.setup_log.append("[OK] Docker Desktop is now ready!")
+            self._check_docker_status()
+            on_ready()
+            return
+        if attempts >= 30:  # 30 * 2s = 60s timeout
+            self.setup_log.append("[ERROR] Docker Desktop did not become ready within 60 seconds.")
+            self.setup_log.append("[HINT] Please wait for Docker Desktop to fully start, then try again.")
+            return
+        QTimer.singleShot(2000, lambda: self._wait_for_docker_desktop(on_ready, attempts + 1))
+
 
     def clear_sensitive_data(self):
         """Wipe passwords (including sudo), usernames, and miinames from the UI, cache, and disk."""
@@ -3034,7 +3591,7 @@ try {{
 
     def _force_write_file(self, path, content):
         """Robustly overwrite a file, attempting to fix permissions or replace the file if access is denied.
-        Falls back to sudo if standard Python file operations fail.
+        Falls back to sudo (Linux) or PowerShell (Windows) if standard Python file operations fail.
         """
         try:
             # Ensure directory exists
@@ -3053,30 +3610,69 @@ try {{
                 except: pass
                 return True
             except (PermissionError, OSError):
-                # Fallback to sudo for permission issues
-                pw = self.cached_password or self._ask_sudo_password()
-                if not pw:
-                    raise PermissionError(f"Sudo password required to write to {path}")
-                
-                # Use shlex to safely handle content with quotes
-                # We use 'tee' to write content to the protected path
-                cmd = f"sudo -S tee {shlex.quote(path)} > /dev/null"
-                # Blocking execution via subprocess for synchronous logic
-                proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                # CRITICAL: Send password FIRST, followed by a newline, then the file content.
-                stdout, stderr = proc.communicate(input=f"{pw}\n{content}")
-                
-                if proc.returncode == 0:
-                    # Fix permissions after sudo write
-                    subprocess.run(["sudo", "-S", "chmod", "777", path], input=pw + "\n", text=True, capture_output=True)
-                    return True
+                if OS_INFO["os"] == "windows":
+                    # Windows: Try PowerShell with Force flag
+                    import tempfile
+                    try:
+                        # Write content to temp file, then copy with PowerShell
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.tmp', delete=False, encoding='utf-8') as tf:
+                            tf.write(content)
+                            tf_path = tf.name
+                        win_path = path.replace("'", "''")
+                        win_tmp = tf_path.replace("'", "''")
+                        cmd = f"powershell -Command \"Copy-Item -Path '{win_tmp}' -Destination '{win_path}' -Force\""
+                        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                        os.unlink(tf_path)
+                        if result.returncode == 0:
+                            return True
+                        raise OSError(f"PowerShell write failed: {result.stderr}")
+                    except Exception as we:
+                        raise OSError(f"Windows write failed: {we}")
                 else:
-                    raise OSError(f"Sudo write failed: {stderr}")
+                    # Linux: Fallback to sudo
+                    pw = self.cached_password or self._ask_sudo_password()
+                    if not pw:
+                        raise PermissionError(f"Sudo password required to write to {path}")
+                    
+                    cmd = f"sudo -S tee {shlex.quote(path)} > /dev/null"
+                    proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    stdout, stderr = proc.communicate(input=f"{pw}\n{content}")
+                    
+                    if proc.returncode == 0:
+                        subprocess.run(["sudo", "-S", "chmod", "777", path], input=pw + "\n", text=True, capture_output=True)
+                        return True
+                    else:
+                        raise OSError(f"Sudo write failed: {stderr}")
             
             return True
         except Exception as e:
             self.cemu_log.append(f"[ERROR] Force-write failed for {path}: {e}")
             return False
+
+    def _force_delete_file(self, path):
+        """Robustly delete a file, attempting to fix permissions or elevate if access is denied."""
+        try:
+            if not os.path.exists(path): return True
+            try:
+                os.remove(path)
+                return True
+            except (PermissionError, OSError):
+                if OS_INFO["os"] == "windows":
+                    # Windows: Use PowerShell to force delete
+                    win_path = path.replace("'", "''")
+                    cmd = f'powershell -Command "Remove-Item -Path \'{win_path}\' -Force -ErrorAction SilentlyContinue"'
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    return result.returncode == 0
+                else:
+                    # Linux: Use sudo rm
+                    pw = self.cached_password or self._get_effective_sudo_password()
+                    if pw:
+                        import shlex
+                        cmd = f"sudo -S rm -f {shlex.quote(path)}"
+                        result = subprocess.run(cmd, shell=True, input=pw + "\n", capture_output=True, text=True)
+                        return result.returncode == 0
+                    return False
+        except: return False
 
     def patch_cemu_settings(self, url, is_official=False):
         # Dynamically resolve localhost if needed
@@ -3189,9 +3785,7 @@ try {{
                 for target_dir in ns_targets:
                     if target_dir and os.path.isdir(target_dir):
                         ns_xml = os.path.join(target_dir, "network_services.xml")
-                        if os.path.exists(ns_xml):
-                            try: os.remove(ns_xml)
-                            except: pass
+                        self._force_delete_file(ns_xml)
                 self.statusBar().showMessage("Cemu restored to Official Pretendo.", 5000)
                 return
 
