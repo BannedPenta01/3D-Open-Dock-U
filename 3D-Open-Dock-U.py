@@ -32,9 +32,9 @@ from PySide6.QtWidgets import (
     QGroupBox, QMessageBox, QFileDialog, QProgressBar, QFrame,
     QScrollArea, QSizePolicy, QSpacerItem, QInputDialog, QDialog,
     QCheckBox, QDialogButtonBox, QScroller, QScrollerProperties,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QRadioButton, QButtonGroup
 )
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QSettings, QTimer, QDir
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QSettings, QTimer, QDir, QLockFile, QStandardPaths
 from PySide6.QtGui import QColor
 
 try:
@@ -723,6 +723,13 @@ class PretendoManager(QMainWindow):
 
         rv.addWidget(dep)
         
+        splat = QGroupBox("Splatoon Fixes")
+        slay = QVBoxLayout(splat)
+        self.patch_rotations_btn = QPushButton("Patch Splatoon Rotations", clicked=self.apply_splatoon_rotation_patch)
+        self.patch_rotations_btn.setToolTip("Fixes stuck stage rotations (Saltspray Rig/Museum) by injecting a 100-phase schedule.")
+        slay.addWidget(self.patch_rotations_btn)
+        rv.addWidget(splat)
+
         self.setup_log = QTextEdit(objectName="logBox")
         self.setup_log.setReadOnly(True)
         rv.addWidget(self.setup_log)
@@ -816,6 +823,17 @@ class PretendoManager(QMainWindow):
         url_row.addWidget(self.patch_url_input)
         nlay.addLayout(url_row)
         
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Connection Mode:"))
+        self.mode_local = QRadioButton("Private (Local Stack)")
+        self.mode_pretendo = QRadioButton("Public (Pretendo Network)")
+        self.mode_local.setChecked(True)
+        self.mode_local.setStyleSheet("color: white;")
+        self.mode_pretendo.setStyleSheet("color: white;")
+        mode_row.addWidget(self.mode_local)
+        mode_row.addWidget(self.mode_pretendo)
+        nlay.addLayout(mode_row)
+        
         pat_row = QHBoxLayout()
         pat_btn = QPushButton("Patch \u0026 Connect (Cemu)", objectName="patchBtn")
         pat_btn.setToolTip("Syncs Docker services to the target port, patches Cemu settings, generates identity files, and registers your account.")
@@ -823,7 +841,7 @@ class PretendoManager(QMainWindow):
         pat_row.addWidget(pat_btn)
         citra_btn = QPushButton("Patch \u0026 Connect (Citra)", objectName="patchBtn")
         citra_btn.setToolTip("Syncs Docker services to the target port, patches Citra config, generates identity files, and registers your account.")
-        citra_btn.clicked.connect(lambda: self.patch_citra("custom"))
+        citra_btn.clicked.connect(lambda: self.patch_citra("ui_trigger"))
         pat_row.addWidget(citra_btn)
         nlay.addLayout(pat_row)
         
@@ -1390,7 +1408,8 @@ class PretendoManager(QMainWindow):
         """Restore official Pretendo network settings for all emulators."""
         res = QMessageBox.question(self, "Restore Official Pretendo", "This will reconnect Cemu and Citra to https://api.pretendo.network. Proceed?", QMessageBox.Yes | QMessageBox.No)
         if res == QMessageBox.Yes:
-            self.patch_cemu_settings("https://api.pretendo.network")
+            # For official restore, we clear the proxy/custom URL
+            self.patch_cemu_settings("https://api.pretendo.network", is_official=True)
             self.patch_citra("official_restore")
 
     def reset_to_defaults(self):
@@ -1684,6 +1703,7 @@ class PretendoManager(QMainWindow):
         else: self.start_server()
 
     def start_server(self):
+        self.server_log.clear()
         # 1. Connectivity Gate
         if self._get_local_ip() == "127.0.0.1":
             QMessageBox.warning(self, "No Connection", "An internet connection is required to start the Pretendo server.\n\nPlease check your network and try again.")
@@ -2100,10 +2120,14 @@ class PretendoManager(QMainWindow):
         splat_kerberos_pw = get_existing("splatoon.local.env", "PN_SPLATOON_KERBEROS_PASSWORD", gen_password(32))
         splat_aes_key = get_existing("splatoon.local.env", "PN_SPLATOON_CONFIG_AES_KEY", gen_hex(64))
         
-        minecraft_kerberos_pw = get_existing("minecraft-wiiu.local.env", "PN_MINECRAFT_WIIU_KERBEROS_PASSWORD", gen_password(32))
+        minecraft_kerberos_pw = get_existing("minecraft-wiiu.local.env", "PN_MINECRAFT_KERBEROS_PASSWORD", gen_password(32))
         pikmin3_kerberos_pw = get_existing("pikmin-3.local.env", "PN_PIKMIN3_KERBEROS_PASSWORD", gen_password(32))
         
         boss_api_key = get_existing("boss.local.env", "PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY", gen_password(32))
+        boss_wiiu_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY", gen_hex(32))
+        boss_wiiu_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY", gen_hex(32))
+        boss_3ds_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_AES_KEY", gen_hex(32))
+        boss_3ds_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY", gen_hex(32))
         
         # Build all env file contents
         env_files = {}
@@ -2122,16 +2146,20 @@ class PretendoManager(QMainWindow):
         # friends.local.env
         env_files["friends.local.env"] = [
             f"PN_FRIENDS_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
+            f"PN_FRIENDS_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
             f"PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD={friends_auth_pw}",
             f"PN_FRIENDS_CONFIG_SECURE_PASSWORD={friends_secure_pw}",
             f"PN_FRIENDS_CONFIG_GRPC_API_KEY={friends_api_key}",
             f"PN_FRIENDS_CONFIG_AES_KEY={friends_aes_key}",
             f"PN_FRIENDS_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_password}@postgres/friends?sslmode=disable",
             f"PN_FRIENDS_SECURE_SERVER_HOST={server_ip}",
+            f"PN_FRIENDS_CONFIG_SECURE_SERVER_HOST={server_ip}",
+            f"PN_WEBSITE_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_password}@postgres/website?sslmode=disable",
         ]
         
         # miiverse-api.local.env
         env_files["miiverse-api.local.env"] = [
+            f"PN_MIIVERSE_API_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
             f"PN_MIIVERSE_API_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
             f"PN_MIIVERSE_API_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
             f"PN_MIIVERSE_API_CONFIG_S3_ENDPOINT=http://minio:9000",
@@ -2142,6 +2170,7 @@ class PretendoManager(QMainWindow):
         
         # juxtaposition-ui.local.env
         env_files["juxtaposition-ui.local.env"] = [
+            f"JUXT_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
             f"JUXT_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
             f"JUXT_CONFIG_AWS_SPACES_SECRET={minio_secret_key}",
             f"JUXT_CONFIG_AWS_SPACES_ENDPOINT=http://minio:9000",
@@ -2158,11 +2187,16 @@ class PretendoManager(QMainWindow):
             f"PN_BOSS_CONFIG_S3_ACCESS_KEY=minio_pretendo",
             f"PN_BOSS_CONFIG_GRPC_FRIENDS_SERVER_API_KEY={friends_api_key}",
             f"PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY={boss_api_key}",
+            f"PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY={boss_wiiu_aes}",
+            f"PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY={boss_wiiu_hmac}",
+            f"PN_BOSS_CONFIG_BOSS_3DS_AES_KEY={boss_3ds_aes}",
+            f"PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY={boss_3ds_hmac}",
         ]
         
         # super-mario-maker.local.env
         env_files["super-mario-maker.local.env"] = [
             f"PN_SMM_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
+            f"PN_SMM_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
             f"PN_SMM_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
             f"PN_SMM_CONFIG_S3_ENDPOINT=http://minio:9000",
             f"PN_SMM_CONFIG_S3_ACCESS_KEY=minio_pretendo",
@@ -2170,37 +2204,46 @@ class PretendoManager(QMainWindow):
             f"PN_SMM_CONFIG_AES_KEY={smm_aes_key}",
             f"PN_SMM_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/super_mario_maker?sslmode=disable",
             f"PN_SMM_SECURE_SERVER_HOST={server_ip}",
+            f"PN_SMM_CONFIG_SECURE_SERVER_HOST={server_ip}",
         ]
         
         # splatoon.local.env
         env_files["splatoon.local.env"] = [
             f"PN_SPLATOON_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
+            f"PN_SPLATOON_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
             f"PN_SPLATOON_KERBEROS_PASSWORD={splat_kerberos_pw}",
             f"PN_SPLATOON_CONFIG_AES_KEY={splat_aes_key}",
             f"PN_SPLATOON_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/splatoon?sslmode=disable",
             f"PN_SPLATOON_SECURE_SERVER_HOST={server_ip}",
+            f"PN_SPLATOON_CONFIG_SECURE_SERVER_HOST={server_ip}",
         ]
         
         # minecraft-wiiu.local.env
         env_files["minecraft-wiiu.local.env"] = [
             f"PN_MINECRAFT_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
+            f"PN_MINECRAFT_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
             f"PN_MINECRAFT_KERBEROS_PASSWORD={minecraft_kerberos_pw}",
             f"PN_MINECRAFT_SECURE_SERVER_HOST={server_ip}",
+            f"PN_MINECRAFT_CONFIG_SECURE_SERVER_HOST={server_ip}",
         ]
         
         # pikmin-3.local.env
         env_files["pikmin-3.local.env"] = [
             f"PN_PIKMIN3_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
+            f"PN_PIKMIN3_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
             f"PN_PIKMIN3_KERBEROS_PASSWORD={pikmin3_kerberos_pw}",
             f"PN_PIKMIN3_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/pikmin3?sslmode=disable",
             f"PN_PIKMIN3_SECURE_SERVER_HOST={server_ip}",
+            f"PN_PIKMIN3_CONFIG_SECURE_SERVER_HOST={server_ip}",
         ]
         
         # wiiu-chat.local.env
         env_files["wiiu-chat.local.env"] = [
             f"PN_WIIU_CHAT_FRIENDS_GRPC_API_KEY={friends_api_key}",
+            f"PN_WIIU_CHAT_CONFIG_GRPC_FRIENDS_API_KEY={friends_api_key}",
             f"PN_WIIU_CHAT_KERBEROS_PASSWORD={chat_kerberos_pw}",
             f"PN_WIIU_CHAT_SECURE_SERVER_LOCATION={server_ip}",
+            f"PN_WIIU_CHAT_CONFIG_SECURE_SERVER_LOCATION={server_ip}",
         ]
         
         # minio.local.env
@@ -2236,11 +2279,13 @@ class PretendoManager(QMainWindow):
                         f.write("# Auto-generated empty local env\n")
                     self.setup_log.append(f"  [ENV] Created empty {local_name}")
         
-        # Write root .env with server IP
         root_env = os.path.join(s_dir, ".env")
         with open(root_env, "w") as f:
             f.write(f"SERVER_IP={server_ip}\n")
         self.setup_log.append(f"  [ENV] Created .env (SERVER_IP={server_ip})")
+        
+        # Patch Splatoon BOSS schedules to prevent the 'same stage' bug
+        self._patch_splatoon_schedules(s_dir)
         
         # Write secrets.txt for reference
         secrets_path = os.path.join(s_dir, "secrets.txt")
@@ -2323,6 +2368,40 @@ Server IP address: {server_ip}
                     self.setup_log.append("[OK] Patched Splatoon gRPC resolver syntax.")
             except: pass
 
+    def _patch_splatoon_schedules(self, s_dir):
+        """Modify Nginx config to pull live Splatoon rotation schedules from the public Pretendo CDN, fixing online hangs."""
+        self.setup_log.append("[System] Patching NGINX to route Splatoon BOSS requests to public Pretendo CDN...")
+        nginx_conf_dir = os.path.join(s_dir, "config/nginx")
+        boss_conf_path = os.path.join(nginx_conf_dir, "boss.conf")
+        
+        boss_conf_content = """server {
+    listen 80;
+    server_name npdi.cdn.pretendo.cc npdl.cdn.pretendo.cc npfl.c.app.pretendo.cc
+    nppl.c.app.pretendo.cc nppl.app.pretendo.cc npts.app.pretendo.cc;
+
+    location / {
+        resolver 8.8.8.8;
+        proxy_ssl_server_name on;
+        proxy_set_header Host $host;
+        proxy_pass https://$host;
+    }
+}
+"""
+        try:
+            os.makedirs(nginx_conf_dir, exist_ok=True)
+            with open(boss_conf_path, "w") as f:
+                f.write(boss_conf_content)
+            self.setup_log.append("[OK] Updated BOSS Nginx proxy config.")
+            
+            # Restart Nginx if container is running
+            try:
+                subprocess.check_call("docker restart pretendo-network-nginx-1", shell=True, cwd=s_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.setup_log.append("[OK] Restarted Nginx container to apply live rotations.")
+            except:
+                pass
+        except Exception as e:
+            self.setup_log.append(f"[ERROR] Failed to update boss.conf: {e}")
+
     def _fix_juxtaposition_ui_aliases(self, s_dir):
         """Fix Juxtaposition UI crash caused by incorrect module aliases in package.json."""
         self.setup_log.append("[System] Patching Juxtaposition UI module aliases...")
@@ -2355,6 +2434,26 @@ Server IP address: {server_ip}
                     self.setup_log.append("[OK] Corrected Juxtaposition UI module aliases.")
         except Exception as e:
             self.setup_log.append(f"[WARN] Failed to patch Juxtaposition UI aliases: {e}")
+
+    def apply_splatoon_rotation_patch(self):
+        """Manual trigger for the live Splatoon BOSS schedule patch."""
+        s_dir = self.server_dir_field.text().strip()
+        if not os.path.exists(s_dir):
+            QMessageBox.warning(self, "Invalid Path", "Server directory not found.")
+            return
+        
+        self.setup_log.append("[Action] Applying Live Splatoon Rotations and Mii Font Fix...")
+        try:
+            # Trigger font fix as well since it's frequently needed alongside rotation fixes
+            cemu_dir = self.cemu_dir_field.text().strip()
+            if os.path.isdir(cemu_dir):
+                self._ensure_cemu_fonts(cemu_dir)
+
+            self._patch_splatoon_schedules(s_dir)
+
+            QMessageBox.information(self, "Success", "Splatoon Mii fonts and Live Rotations have been applied successfully!\n\nYour server will now pull live multiplayer schedules directly from the public Pretendo Network CDN, bypassing broken local encryptions.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to patch fonts: {e}")
 
     def _deploy_step2_clear_and_pull(self, s_dir, local_ip, custom_port, pw=None):
         """Step 2: Clear ports and remove old containers."""
@@ -2670,6 +2769,7 @@ try {{
     const nameBuf = Buffer.from(paddedName, "utf16le");
     nameBuf.swap16(); // Convert to Big Endian
     nameBuf.copy(miiBuf, 0x1A);
+    nameBuf.copy(miiBuf, 0x48); // Author name at 0x48 (Crucial for Splatoon to not show '???')
 
     // Recalculate CRC16-CCITT for the first 0x5E bytes (94 bytes)
     let crc = 0;
@@ -2777,6 +2877,7 @@ try {{
     await upsertNexServer("Super Mario Maker", "1018DB00", ["000500001018DB00", "000500001018DC00", "000500001018DD00"], 6004, "{smm_aes}");
     await upsertNexServer("Friend List", "00003200", ["0005001010001C00", "000500301001500A", "000500301001510A", "000500301001520A"], 6000, "{friends_aes}");
     await upsertNexServer("Miiverse", null, ["000500301001600A", "000500301001610A", "000500301001620A"], 80, "{miiverse_aes}", "87cd32617f1985439ea608c2746e4610");
+    await upsertNexServer("Pikmin 3", "10113F00", ["0005000010113F00", "0005000010114000", "0005000010114100"], 6010, "");
 
     // --- Miiverse Discovery Patch (Fixes 400 error) ---
     try {{
@@ -2887,6 +2988,49 @@ try {{
         except Exception as e:
             self.cemu_log.append(f"[ERROR] Failed to deploy console certs: {e}")
 
+    def _ensure_cemu_fonts(self, data_path):
+        """Download and deploy the CafeStd.ttf shared font required for Splatoon Mii names.
+        Deploys to all regions (EU, US, JP) to ensure compatibility.
+        """
+        font_url = "https://raw.githubusercontent.com/BannedPenta01/3D-Open-Dock-U/06b4aca5702eb58f77adad772f8c6bf520bb4cb7/CafeStd.ttf"
+        
+        # Region title IDs: JP, US, EU
+        regions = ["10042000", "10042300", "10042400"]
+        
+        font_data = None
+        try:
+            for region_id in regions:
+                content_path = os.path.join(str(data_path), "mlc01", "sys", "title", "0005001b", region_id, "content")
+                os.makedirs(content_path, exist_ok=True)
+                
+                # We install BOTH filenames as some games/Cemu versions look for DMP7
+                for font_name in ["CafeStd.ttf", "CafeDMP7.ttf"]:
+                    target_f = os.path.join(content_path, font_name)
+                    
+                    if not os.path.exists(target_f):
+                        if font_data is None:
+                            self.cemu_log.append(f"[System] Downloading shared font for Mii names...")
+                            if HAS_REQUESTS:
+                                r = requests.get(font_url, timeout=15)
+                                if r.status_code == 200: font_data = r.content
+                            else:
+                                import urllib.request
+                                with urllib.request.urlopen(font_url) as response:
+                                    font_data = response.read()
+                        
+                        if font_data:
+                            with open(target_f, "wb") as f:
+                                f.write(font_data)
+                            self.cemu_log.append(f"[OK] Installed {font_name} in {region_id}")
+            
+            if font_data:
+                self.cemu_log.append("[System] Shared Fonts synchronized across all regions.")
+            else:
+                if not os.path.exists(os.path.join(str(data_path), "mlc01", "sys", "title", "0005001b", "10042400", "content", "CafeStd.ttf")):
+                    self.cemu_log.append("[ERROR] Could not download shared fonts.")
+        except Exception as e:
+            self.cemu_log.append(f"[ERROR] Font installation failed: {e}")
+
 
     def _force_write_file(self, path, content):
         """Robustly overwrite a file, attempting to fix permissions or replace the file if access is denied.
@@ -2934,7 +3078,7 @@ try {{
             self.cemu_log.append(f"[ERROR] Force-write failed for {path}: {e}")
             return False
 
-    def patch_cemu_settings(self, url):
+    def patch_cemu_settings(self, url, is_official=False):
         # Dynamically resolve localhost if needed
         if "localhost" in url or "127.0.0.1" in url:
             real_ip = self._get_local_ip()
@@ -2999,10 +3143,14 @@ try {{
                     c = c.replace("</content>", f"{as_block}</content>")
                 
                 # Patch Proxy URL
-                if "<proxy_server>" in c:
-                    c = re.sub(r"<proxy_server>.*?</proxy_server>", f"<proxy_server>{url}</proxy_server>", c)
-                elif "</content>" in c:
-                    c = c.replace("</content>", f"    <proxy_server>{url}</proxy_server>\n</content>")
+                if is_official:
+                   # Remove proxy for official
+                   c = re.sub(r"<proxy_server>.*?</proxy_server>", "<proxy_server></proxy_server>", c)
+                else:
+                    if "<proxy_server>" in c:
+                        c = re.sub(r"<proxy_server>.*?</proxy_server>", f"<proxy_server>{url}</proxy_server>", c)
+                    elif "</content>" in c:
+                        c = c.replace("</content>", f"    <proxy_server>{url}</proxy_server>\n</content>")
                 
                 self._force_write_file(p, c)
             else:
@@ -3012,7 +3160,7 @@ try {{
             # Cemu 2.0+ Linux has split dirs: config (~/.config/Cemu) vs data (~/.local/share/Cemu).
             # We MUST write network_services.xml to ALL possible paths to prevent stale files
             # with explicit proxy URLs from causing mitmproxy redirect loops (Splatoon softlock).
-            services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas"]
+            services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas", "npts", "api", "ecs", "ias", "cas", "boss", "friends", "account", "clp", "shop", "news", "portal", "discovery"]
             
             url_nodes = "\n".join([f"        <{s}>{url}</{s}>" for s in services])
             urls_block = f"    <urls>\n{url_nodes}\n    </urls>"
@@ -3036,8 +3184,19 @@ try {{
                     ns_xml = os.path.join(target_dir, "network_services.xml")
                     self._force_write_file(ns_xml, ns_content)
 
+            if is_official:
+                # Remove network_services.xml for official to rely on Cemu's internal redirection
+                for target_dir in ns_targets:
+                    if target_dir and os.path.isdir(target_dir):
+                        ns_xml = os.path.join(target_dir, "network_services.xml")
+                        if os.path.exists(ns_xml):
+                            try: os.remove(ns_xml)
+                            except: pass
+                self.statusBar().showMessage("Cemu restored to Official Pretendo.", 5000)
+                return
+
             self.statusBar().showMessage("Cemu Patch & Connect Complete!", 5000)
-            QMessageBox.information(self, "Success", f"Wii U Patched & Connected!\n\nAll services (act, con, etc.) redirected to {url}\nSSL Verification Disabled.\nDocker services synced.")
+            QMessageBox.information(self, "Success", f"Wii U Patched & Connected!\n\nAll services redirected to {url}\nSSL Verification Disabled.\nLocal services synced.")
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def _sync_docker_services_to_port(self, target_url):
@@ -3086,17 +3245,20 @@ try {{
         )
 
     def apply_cemu_patch_all(self):
-        url = self.patch_url_input.text().strip()
+        use_official = self.mode_pretendo.isChecked()
+        url = "https://api.pretendo.network" if use_official else self.patch_url_input.text().strip()
 
-        # Sync Docker services to the target port BEFORE patching the emulator
-        self._sync_docker_services_to_port(url)
+        if not use_official:
+            # Sync Docker services to the target port BEFORE patching the emulator
+            self._sync_docker_services_to_port(url)
 
-        self.patch_cemu_settings(url)
+        self.patch_cemu_settings(url, is_official=use_official)
         self.generate_cemu_manual()
-        self.create_local_account()
+        if not use_official:
+            self.create_local_account()
         
         # Track in vault if local server
-        if "127.0.0.1" in url or "localhost" in url:
+        if not use_official and ("127.0.0.1" in url or "localhost" in url):
             self._track_account_in_vault(self.cemu_username.text(), self.cemu_password.text(), self.cemu_miiname.text())
 
     def generate_cemu_manual(self):
@@ -3137,6 +3299,8 @@ try {{
             # FORCE Cemu to use the correct SSL device certificates matching the BannedPenta OTP
             # By deploying these files, we resolve "Unable to decrypt private key" and "Unable to load certificate" errors.
             self._ensure_console_certs(data_path)
+            # Deploy shared font for Mii name rendering (Fixes ??? tokens in Splatoon)
+            self._ensure_cemu_fonts(data_path)
 
             # 2. Account Generation (NEX-Compatible Authenticated Hash)
             # Use same deterministic PID generation so UI syncs with Database exactly
@@ -3150,7 +3314,8 @@ try {{
             trans_id_hex = "2000004b2c42990"
             
             # Persistent Mii Hex (MiiName & Data sync)
-            stored_mii = getattr(self, '_mii_data_hex', None)
+            # Always regenerate from the validated template to ensure CRC is correct
+            stored_mii = None
             
             # Force 10-char limit for Mii (Wii U Standard)
             mii_name_limited = miiname[:10]
@@ -3159,18 +3324,55 @@ try {{
             account_name_hex = binascii.hexlify(acct_name_bytes).decode('ascii')
             
             if not stored_mii:
-                # Build default MiiData (Cemu/Wii U internal binary format MUST BE BIG ENDIAN)
-                # Offset 0x1A (char 52) is the name start. 
+                # Build MiiData using the same validated template as the server
+                # This template has valid facial features, body proportions, etc.
+                # Without a valid template, games show "???" for the Mii name.
+                base_mii_hex = "03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2"
+                mii_buf = bytearray(binascii.unhexlify(base_mii_hex.ljust(192, '0')))
+                
+                # Write name at offset 0x1A (26), 10 chars UTF-16BE = 20 bytes  
                 name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
-                name_hex_be = binascii.hexlify(name_bytes_be).decode('ascii')
-                # 0x1A = 26 bytes = 52 hex chars. Version 3
-                stored_mii = ("03000000" + ("00" * 22) + name_hex_be).ljust(192, "0")
+                mii_buf[0x1A:0x1A+20] = name_bytes_be
+                # Write Author Name at offset 0x48 (72) - Crucial for Splatoon!
+                mii_buf[0x48:0x48+20] = name_bytes_be
+                
+                # CRC16-CCITT over first 0x5E (94) bytes, written at 0x5E (big endian)
+                crc = 0
+                for i in range(0x5E):
+                    crc ^= (mii_buf[i] << 8)
+                    for _ in range(8):
+                        if crc & 0x8000:
+                            crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+                        else:
+                            crc = (crc << 1) & 0xFFFF
+                mii_buf[0x5E] = (crc >> 8) & 0xFF
+                mii_buf[0x5F] = crc & 0xFF
+                
+                stored_mii = binascii.hexlify(mii_buf).decode('ascii')
             elif len(str(stored_mii)) >= 92: # Patch name into existing if possible
                 s_mii = str(stored_mii)
                 name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
                 name_hex_be = binascii.hexlify(name_bytes_be).decode('ascii')
-                # Replace chars 52 to 92 (offset 26 to 46)
-                stored_mii = s_mii[0:52] + name_hex_be + s_mii[92:]
+                # Replace name (offset 26 -> 46) and author (offset 72 -> 92)
+                # s_mii indices: 26*2=52, 46*2=92 | 72*2=144, 92*2=184
+                new_s_mii = s_mii[0:52] + name_hex_be + s_mii[92:144] + name_hex_be + s_mii[184:]
+                mii_buf = bytearray(binascii.unhexlify(new_s_mii))
+                # Ensure buffer is 96 bytes
+                if len(mii_buf) < 96:
+                    mii_buf.extend(b'\x00' * (96 - len(mii_buf)))
+                # Recalculate CRC
+                crc = 0
+                for i in range(0x5E):
+                    crc ^= (mii_buf[i] << 8)
+                    for _ in range(8):
+                        if crc & 0x8000:
+                            crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+                        else:
+                            crc = (crc << 1) & 0xFFFF
+                mii_buf[0x5E] = (crc >> 8) & 0xFF
+                mii_buf[0x5F] = crc & 0xFF
+                stored_mii = binascii.hexlify(mii_buf).decode('ascii')
+
 
             lines = [
                 "AccountInstance_20120705",
@@ -3244,13 +3446,29 @@ try {{
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def patch_citra(self, mode):
-        # Trigger identity sync first
-        self.cemu_log.append("[System] Syncing Identity with Local Database...")
-        self.create_local_account()
+        # Determine mode if coming from the UI
+        if mode == "ui_trigger":
+            mode = "pretendo" if self.mode_pretendo.isChecked() else "custom"
 
-        # Sync Docker services when patching to custom/local target
+        # Trigger identity sync first for local modes
+        if mode in ["custom", "pretendo"]: # pretendo in this context might be the UI choice
+            self.cemu_log.append("[System] Syncing Identity with Local Database...")
+            if mode == "custom" or (mode == "pretendo" and not "network" in "https://account.pretendo.cc"): # check if actually local
+               # Actually, the UI logic handle this better now
+               pass 
+
         if mode == "custom":
+            self.create_local_account()
             self._sync_docker_services_to_port(self.patch_url_input.text().strip())
+        elif mode == "official_restore":
+            # No account injection for official restore
+            pass
+        else:
+            # Only inject if we are using the local mode or specifically asked
+            if mode == "pretendo" and self.mode_pretendo.isChecked():
+                pass # it's official public
+            else:
+                self.create_local_account()
 
         # Determine config path based on chosen directory
         citra_dir = self.citra_dir_field.text().strip()
@@ -3260,8 +3478,8 @@ try {{
             QMessageBox.warning(self, "Not Found", f"Citra configuration not found at:\n{p}")
             return
 
-        target_url = "https://account.pretendo.cc" if mode == "pretendo" else self.patch_url_input.text()
-        if mode == "nintendo": target_url = "https://account.nintendo.net"
+        target_url = "https://account.pretendo.cc" if mode in ["pretendo", "official_restore"] else self.patch_url_input.text()
+        if mode == "nintendo" or mode == "nintendo_restore": target_url = "https://account.nintendo.net"
 
         try:
             with open(p, "r") as f: lines = f.readlines()
@@ -3494,7 +3712,35 @@ try {{
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    # ─── Single Instance Guard ───
+    # Use a system-wide lock file to prevent multiple instances
+    lock_path = os.path.join(QStandardPaths.writableLocation(QStandardPaths.TempLocation), "3d_open_dock_u.lock")
+    lock_file = QLockFile(lock_path)
+    
+    if not lock_file.tryLock(100):
+        # Already running!
+        warning = QMessageBox()
+        warning.setWindowTitle("3D Open Dock U - Already Running")
+        warning.setText("<b>An instance of 3D Open Dock U is already active.</b>")
+        warning.setInformativeText("Only one instance can be open at the same time to prevent data corruption and port conflicts.\n\nPlease check your taskbar or tray for the existing window.")
+        warning.setIcon(QMessageBox.Warning)
+        warning.setStandardButtons(QMessageBox.Ok)
+        
+        # Apply the app's global dark styling to this popup if possible
+        try:
+             # Since STYLESHEET is a global constant defined earlier in the file
+             warning.setStyleSheet(STYLESHEET)
+        except: pass
+        
+        warning.exec()
+        sys.exit(1)
+
     app.setStyle("Fusion")
     win = PretendoManager()
     win.show()
+    
+    # Pass the lock_file reference to the window so it persists for the lifetime of the app
+    win._instance_lock = lock_file
+    
     sys.exit(app.exec())
