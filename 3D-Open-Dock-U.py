@@ -452,14 +452,11 @@ class CommandWorker(QThread):
         self.stdin_data = stdin_data
     def run(self):
         try:
-            # Sanitize environment: Remove LD_PRELOAD to avoid leakage from AppImages/etc.
-            # Add TERM variable to satisfy scripts using tput/ncurses
             env = os.environ.copy()
             env.pop("LD_PRELOAD", None)
-            if "TERM" not in env or not env["TERM"]:
+            if "TERM" not in env:
                 env["TERM"] = "xterm-256color"
 
-            # Use binary mode to handle \r and mixed encodings safely
             popen_kwargs = {
                 "shell": True,
                 "cwd": self.cwd,
@@ -467,57 +464,33 @@ class CommandWorker(QThread):
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.STDOUT,
                 "stdin": subprocess.PIPE if self.stdin_data is not None else None,
-                "bufsize": 0
+                "bufsize": 1,
+                "universal_newlines": True
             }
             if OS_INFO["os"] == "windows":
-                popen_kwargs["creationflags"] = 0x08000000 # CREATE_NO_WINDOW
+                popen_kwargs["creationflags"] = 0x08000000 
                 
             proc = subprocess.Popen(self.cmd, **popen_kwargs)
             
             if self.stdin_data is not None and proc.stdin:
-                try:
-                    # Write password directly
-                    # Added multiple newlines to ensure it flushes
-                    proc.stdin.write((self.stdin_data + "\n\n").encode('utf-8'))
-                    proc.stdin.flush()
-                    # A tiny delay ensures the OS pipe has processed the data 
-                    import time
-                    time.sleep(0.1) 
-                    proc.stdin.close()
-                except Exception as e:
-                    self.output.emit(f"[DEBUG] Stdin write error: {e}")
-            
-            buffer = []
+                # Send password with multiple newlines to handle sudo's prompt correctly
+                # We send it twice to handle cases where sudo might re-prompt
+                proc.stdin.write(f"{self.stdin_data}\n{self.stdin_data}\n")
+                proc.stdin.flush()
+                # Crucial: tiny sleep to ensure sudo reads the buffer before we continue
+                import time
+                time.sleep(0.2)
+
             while True:
-                char = proc.stdout.read(1)
-                if not char:
+                line = proc.stdout.readline()
+                if not line:
                     break
-                
-                c = char.decode(errors='ignore')
-                if c == '\n' or c == '\r':
-                    line = "".join(buffer).strip()
-                    if line:
-                        # Improved prompt filtering: ignore lines that are JUST the password prompt or variants
-                        low = line.lower()
-                        is_p = ('password for' in low or '[sudo] password' in low or '___sudo___' in low)
-                        # Only skip if it's a short line (likely just the prompt)
-                        if not is_p or len(line) > 50:
-                            self.output.emit(self._colorize_log(line))
-                    buffer = []
-                else:
-                    buffer.append(c)
-                    if len(buffer) > 250:
-                        self.output.emit("".join(buffer))
-                        buffer = []
+                self.output.emit(self._colorize_log(line.strip()))
             
-            # Clean up
-            try:
-                if proc.stdin: proc.stdin.close()
-            except: pass
             proc.wait()
             self.finished.emit(proc.returncode)
         except Exception as e:
-            self.output.emit(self._colorize_log(f"ERROR inside Worker: {e}"))
+            self.output.emit(self._colorize_log(f"ERROR: {e}"))
             self.finished.emit(1)
 
     @staticmethod
@@ -1534,21 +1507,23 @@ class PretendoManager(QMainWindow):
 
                 if changed and new_lines:
                     self._patch_mitmproxy_addon(s_dir)
-                    # Patch postgres-init.sh
+                    # Force DB addition to init script
                     pg_init = os.path.join(s_dir, "scripts", "run-in-container", "postgres-init.sh")
                     if os.path.exists(pg_init):
                         try:
                             with open(pg_init, "r") as f: pg_lines = f.readlines()
                             new_pg = []
                             for pl in pg_lines:
-                                if "databases=" in pl and "super_smash_bros_wiiu" not in pl:
-                                    if '"' in pl:
-                                        # Safely insert before the closing quote
-                                        last_quote_idx = pl.rfind('"')
-                                        pl = pl[:last_quote_idx] + " super_smash_bros_wiiu" + pl[last_quote_idx:]
+                                if "databases=" in pl:
+                                    # Properly append without duplicating and handling quotes
+                                    current_dbs = re.search(r'databases="([^"]*)"', pl)
+                                    if current_dbs:
+                                        db_list = current_dbs.group(1).split()
+                                        if "super_smash_bros_wiiu" not in db_list:
+                                            db_list.append("super_smash_bros_wiiu")
+                                            pl = f'databases="{" ".join(db_list)}"\n'
                                 new_pg.append(pl)
-                            if new_pg:
-                                with open(pg_init, "w") as f: f.writelines(new_pg)
+                            with open(pg_init, "w") as f: f.writelines(new_pg)
                         except: pass
                     
                     # Write the patched compose file
@@ -1625,12 +1600,6 @@ class PretendoManager(QMainWindow):
                 missing.append("WSL2 (Required for bash scripts — Click 'Install WSL2 + Ubuntu')")
             elif not OS_INFO.get("has_wsl_distro"):
                 missing.append("WSL2 Linux Distro (WSL2 installed but no distro — run 'wsl --install -d Ubuntu')")
-            
-            if not _docker_available():
-                if not _docker_desktop_running():
-                    warnings.append("Docker Desktop is not running (Click 'Start Docker Desktop')")
-                else:
-                    warnings.append("Docker Desktop is running but not responding (it may still be starting up)")
             
             if not shutil.which("git"):
                 warnings.append("Git not found in PATH (Install Git for Windows from https://git-scm.com)")
@@ -1853,18 +1822,15 @@ class PretendoManager(QMainWindow):
 
     def _ask_sudo_password(self):
         if OS_INFO["os"] != "linux":
-            return "" # Windows/Docker Desktop handles its own elevation usually
-        # 1. Check existing sources
+            return ""
         pw = self._get_effective_sudo_password()
-        if pw: return pw
+        if pw: return pw.strip() # Added strip()
         
-        # 2. Fallback to dialog — pass current text just in case
-        current_in_field = self.server_sudo_pass.text() if hasattr(self, 'server_sudo_pass') else ""
-        dlg = SudoPasswordDialog(self, current_pw=current_in_field)
+        dlg = SudoPasswordDialog(self)
         if dlg.exec():
             pw, _ = dlg.get_data()
             if not pw: return None
-            # Always persist: save to UI field, cache, and settings
+            pw = pw.strip() # Clean input
             self.cached_password = pw
             if hasattr(self, 'server_sudo_pass'):
                 self.server_sudo_pass.blockSignals(True)
@@ -2084,14 +2050,16 @@ class PretendoManager(QMainWindow):
 
         if OS_INFO["os"] == "linux":
             if pw:
-                self.server_log.append("[System] Starting background services and clearing ports...")
-                # Wrap everything in sudo to ensure permissions for systemctl, fuser, AND docker
-                inner = f"echo '[System] Activating Docker...'; systemctl start docker.socket docker.service ; echo '[System] Cleaning Ports...'; {fuser_cmd} ; echo '[System] Starting Framework...'; docker compose up -d"
-                # Safe shell quoting for the inner command string
-                import shlex
-                quoted_inner = shlex.quote(inner)
-                cmd = f"sudo -S bash -c {quoted_inner}"
-                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=_on_start, display_cmd="[Elevated] Clean Ports & Start Framework")
+                self.server_log.append("[System] Starting services with elevated privileges...")
+                # Wrap EVERYTHING into one bash call so sudo only asks ONCE
+                inner_logic = (
+                    "systemctl start docker.socket docker.service; "
+                    f"{fuser_cmd}; "
+                    "docker compose up -d"
+                )
+                # Use -S for stdin and -E to preserve environment variables (like SERVER_IP)
+                cmd = f"sudo -S -E bash -c {shlex.quote(inner_logic)}"
+                self._run_command(cmd, self.server_log, s_dir, stdin_data=pw, on_done=_on_start)
             else:
                 self.server_log.append("[System] Starting server (Best-Effort Mode)...")
                 cmd = f"({fuser_cmd}) ; docker compose up -d"
@@ -2175,9 +2143,7 @@ class PretendoManager(QMainWindow):
         # Strip simple HTML spans to get the raw text back for checking
         raw_text = re.sub(r'<[^>]+>', '', html_text)
         
-        # Critical patterns that definitely mean the game disconnected or failed
         critical_patterns = [
-            "connection refused",
             "failed request /oauth20/access_token/generate",
             "failed to retrieve oauth token",
             "mongooseserverselectionerror",
@@ -2187,13 +2153,17 @@ class PretendoManager(QMainWindow):
             "panic:",
             "segmentation fault",
             "502 bad gateway",
-            "econnrefused",
             "request failed with status code",
             "database is locked"
         ]
         
         low = raw_text.lower()
         if any(p in low for p in critical_patterns):
+            # Ignore panic loops caused by Docker containers starting before the database is ready.
+            # Docker natively self-heals these crashes via 'restart: unless-stopped'.
+            if any(ignore in low for ignore in ["connection refused", "dial tcp", "database system is starting up", "econnrefused"]):
+                return
+                
             self._show_critical_error_popup(raw_text)
 
     def _show_critical_error_popup(self, error_line):
@@ -2423,7 +2393,7 @@ class PretendoManager(QMainWindow):
             self._generate_env_files(s_dir, local_ip)
             self._ensure_smm_metadata(s_dir)
             self._fix_go_build_compatibility(s_dir)
-            self._fix_juxtaposition_ui_aliases(s_dir)
+            self._generate_juxtaposition_boot_config(s_dir) # Renamed from _fix_juxtaposition_ui_aliases
             self.setup_log.append("[OK] Environment files generated successfully.")
         except Exception as e:
             self.setup_log.append(f"[ERROR] Failed to generate environment: {e}")
@@ -2445,7 +2415,7 @@ class PretendoManager(QMainWindow):
         self._deploy_step2_clear_and_pull(s_dir, local_ip, custom_port, pw)
 
     def _generate_env_files(self, s_dir, server_ip):
-        """Generate all required .env and *.local.env files for the Pretendo stack."""
+        """Corrected Env Generator: Fixed S3 protocols and missing MongoDB URIs."""
         import secrets as sec_module
         import string
         
@@ -2458,21 +2428,18 @@ class PretendoManager(QMainWindow):
             return ''.join(sec_module.choice(chars) for _ in range(length))
         
         env_dir = os.path.join(s_dir, "environment")
-        if not os.path.isdir(env_dir):
-            self.setup_log.append(f"[WARN] Environment directory not found at {env_dir}, creating it...")
-            os.makedirs(env_dir, exist_ok=True)
+        os.makedirs(env_dir, exist_ok=True)
         
-        # Helper to load existing secrets to prevent rotating them unnecessarily on every deploy
         def get_existing(fname, key, fallback):
             val = self._grep_env_file(os.path.join(env_dir, fname), key)
             return val if val else fallback
 
-        # Load or generate all secrets
+        # Secrets aggregation
         account_aes_key = get_existing("account.local.env", "PN_ACT_CONFIG_AES_KEY", gen_hex(64))
         account_datastore_secret = get_existing("account.local.env", "PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET", gen_hex(32))
-        account_grpc_api_key = get_existing("account.local.env", "PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT", gen_password(32))
-        minio_secret_key = get_existing("account.local.env", "PN_ACT_CONFIG_S3_ACCESS_SECRET", gen_password(32))
-        postgres_password = get_existing("postgres.local.env", "POSTGRES_PASSWORD", gen_password(32))
+        account_grpc_key = get_existing("account.local.env", "PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT", gen_password(32))
+        minio_secret = get_existing("account.local.env", "PN_ACT_CONFIG_S3_ACCESS_SECRET", gen_password(32))
+        postgres_pass = get_existing("postgres.local.env", "POSTGRES_PASSWORD", gen_password(32))
         
         friends_auth_pw = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD", gen_password(32))
         friends_secure_pw = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_SECURE_PASSWORD", gen_password(32))
@@ -2500,158 +2467,174 @@ class PretendoManager(QMainWindow):
         boss_3ds_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_AES_KEY", gen_hex(32))
         boss_3ds_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY", gen_hex(32))
         
-        # Build all env file contents
         env_files = {}
-        
-        # account.local.env
+
+        # 1. Account Server
         env_files["account.local.env"] = [
             f"PN_ACT_CONFIG_AES_KEY={account_aes_key}",
             f"PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET={account_datastore_secret}",
-            f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT={account_grpc_api_key}",
-            f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_API={account_grpc_api_key}",
-            f"PN_ACT_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
-            f"PN_ACT_CONFIG_S3_ENDPOINT=http://minio:9000",
-            f"PN_ACT_CONFIG_S3_ACCESS_KEY=minio_pretendo",
+            f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT={account_grpc_key}",
+            f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_API={account_grpc_key}",
+            f"PN_ACT_CONFIG_S3_ACCESS_SECRET={minio_secret}",
+            "PN_ACT_CONFIG_S3_ENDPOINT=minio:9000",
+            "PN_ACT_CONFIG_S3_ACCESS_KEY=minio_pretendo",
+            "PN_ACT_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_account?replicaSet=rs",
         ]
-        
-        # friends.local.env
+
+        # 2. Friends Server
         env_files["friends.local.env"] = [
-            f"PN_FRIENDS_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
-            f"PN_FRIENDS_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
+            f"PN_FRIENDS_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            f"PN_FRIENDS_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
             f"PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD={friends_auth_pw}",
             f"PN_FRIENDS_CONFIG_SECURE_PASSWORD={friends_secure_pw}",
             f"PN_FRIENDS_CONFIG_GRPC_API_KEY={friends_api_key}",
             f"PN_FRIENDS_CONFIG_AES_KEY={friends_aes_key}",
-            f"PN_FRIENDS_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_password}@postgres/friends?sslmode=disable",
+            f"PN_FRIENDS_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/friends?sslmode=disable",
             f"PN_FRIENDS_SECURE_SERVER_HOST={server_ip}",
             f"PN_FRIENDS_CONFIG_SECURE_SERVER_HOST={server_ip}",
-            f"PN_WEBSITE_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_password}@postgres/website?sslmode=disable",
+            f"PN_WEBSITE_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/website?sslmode=disable",
         ]
-        
-        # miiverse-api.local.env
+
+        # 3. Miiverse API
         env_files["miiverse-api.local.env"] = [
-            f"PN_MIIVERSE_API_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
-            f"PN_MIIVERSE_API_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
-            f"PN_MIIVERSE_API_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
-            f"PN_MIIVERSE_API_CONFIG_S3_ENDPOINT=http://minio:9000",
-            f"PN_MIIVERSE_API_CONFIG_S3_ACCESS_KEY=minio_pretendo",
+            f"PN_MIIVERSE_API_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            f"PN_MIIVERSE_API_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
+            f"PN_MIIVERSE_API_CONFIG_S3_ACCESS_SECRET={minio_secret}",
+            "PN_MIIVERSE_API_CONFIG_S3_ENDPOINT=minio:9000",
+            "PN_MIIVERSE_API_CONFIG_S3_ACCESS_KEY=minio_pretendo",
             f"PN_MIIVERSE_API_CONFIG_GRPC_FRIENDS_API_KEY={friends_api_key}",
-            f"PN_MIIVERSE_API_CONFIG_AES_KEY={account_aes_key}", # Sync with account server
+            f"PN_MIIVERSE_API_CONFIG_AES_KEY={account_aes_key}",
+            "PN_MIIVERSE_API_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_miiverse?replicaSet=rs",
         ]
         
-        # juxtaposition-ui.local.env
+        # 4. Juxtaposition UI
         env_files["juxtaposition-ui.local.env"] = [
-            f"JUXT_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
-            f"JUXT_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
-            f"JUXT_CONFIG_AWS_SPACES_SECRET={minio_secret_key}",
-            f"JUXT_CONFIG_AWS_SPACES_ENDPOINT=http://minio:9000",
-            f"JUXT_CONFIG_AWS_SPACES_ACCESS_KEY=minio_pretendo",
+            f"JUXT_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            f"JUXT_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
+            f"JUXT_CONFIG_AWS_SPACES_SECRET={minio_secret}",
+            "JUXT_CONFIG_AWS_SPACES_ENDPOINT=minio:9000",
+            "JUXT_CONFIG_AWS_SPACES_ACCESS_KEY=minio_pretendo",
             f"JUXT_CONFIG_GRPC_FRIENDS_API_KEY={friends_api_key}",
-            f"JUXT_CONFIG_AES_KEY={account_aes_key}", # Sync with account server
+            f"JUXT_CONFIG_AES_KEY={account_aes_key}",
+            "JUXT_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_juxt?replicaSet=rs",
         ]
-        
-        # boss.local.env
+
+        # 5. BOSS
         env_files["boss.local.env"] = [
-            f"PN_BOSS_CONFIG_GRPC_ACCOUNT_SERVER_API_KEY={account_grpc_api_key}",
-            f"PN_BOSS_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
-            f"PN_BOSS_CONFIG_S3_ENDPOINT=http://minio:9000",
-            f"PN_BOSS_CONFIG_S3_ACCESS_KEY=minio_pretendo",
+            f"PN_BOSS_CONFIG_GRPC_ACCOUNT_SERVER_API_KEY={account_grpc_key}",
+            f"PN_BOSS_CONFIG_S3_ACCESS_SECRET={minio_secret}",
+            "PN_BOSS_CONFIG_S3_ENDPOINT=minio:9000",
+            "PN_BOSS_CONFIG_S3_ACCESS_KEY=minio_pretendo",
             f"PN_BOSS_CONFIG_GRPC_FRIENDS_SERVER_API_KEY={friends_api_key}",
             f"PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY={boss_api_key}",
             f"PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY={boss_wiiu_aes}",
             f"PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY={boss_wiiu_hmac}",
             f"PN_BOSS_CONFIG_BOSS_3DS_AES_KEY={boss_3ds_aes}",
             f"PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY={boss_3ds_hmac}",
+            "PN_BOSS_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_boss?replicaSet=rs",
         ]
-        
-        # super-mario-maker.local.env
+
+        # 6. Super Mario Maker
         env_files["super-mario-maker.local.env"] = [
-            f"PN_SMM_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
-            f"PN_SMM_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
-            f"PN_SMM_CONFIG_S3_ACCESS_SECRET={minio_secret_key}",
-            f"PN_SMM_CONFIG_S3_ENDPOINT=http://minio:9000",
-            f"PN_SMM_CONFIG_S3_ACCESS_KEY=minio_pretendo",
+            f"PN_SMM_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            f"PN_SMM_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
+            f"PN_SMM_CONFIG_S3_ACCESS_SECRET={minio_secret}",
+            "PN_SMM_CONFIG_S3_ENDPOINT=minio:9000",
+            "PN_SMM_CONFIG_S3_ACCESS_KEY=minio_pretendo",
             f"PN_SMM_KERBEROS_PASSWORD={smm_kerberos_pw}",
             f"PN_SMM_CONFIG_AES_KEY={smm_aes_key}",
-            f"PN_SMM_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/super_mario_maker?sslmode=disable",
+            f"PN_SMM_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/super_mario_maker?sslmode=disable",
             f"PN_SMM_SECURE_SERVER_HOST={server_ip}",
             f"PN_SMM_CONFIG_SECURE_SERVER_HOST={server_ip}",
+            "PN_SMM_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_smm?replicaSet=rs",
         ]
-        
-        # splatoon.local.env
-        env_files["splatoon.local.env"] = [
-            f"PN_SPLATOON_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
-            f"PN_SPLATOON_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
-            f"PN_SPLATOON_KERBEROS_PASSWORD={splat_kerberos_pw}",
-            f"PN_SPLATOON_CONFIG_AES_KEY={splat_aes_key}",
-            f"PN_SPLATOON_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/splatoon?sslmode=disable",
-            f"PN_SPLATOON_SECURE_SERVER_HOST={server_ip}",
-            f"PN_SPLATOON_CONFIG_SECURE_SERVER_HOST={server_ip}",
-        ]
-        
-        # minecraft-wiiu.local.env
-        env_files["minecraft-wiiu.local.env"] = [
-            f"PN_MINECRAFT_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
-            f"PN_MINECRAFT_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
-            f"PN_MINECRAFT_KERBEROS_PASSWORD={minecraft_kerberos_pw}",
-            f"PN_MINECRAFT_SECURE_SERVER_HOST={server_ip}",
-            f"PN_MINECRAFT_CONFIG_SECURE_SERVER_HOST={server_ip}",
-        ]
-        
-        # pikmin-3.local.env
-        env_files["pikmin-3.local.env"] = [
-            f"PN_PIKMIN3_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
-            f"PN_PIKMIN3_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_api_key}",
-            f"PN_PIKMIN3_KERBEROS_PASSWORD={pikmin3_kerberos_pw}",
-            f"PN_PIKMIN3_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/pikmin3?sslmode=disable",
-            f"PN_PIKMIN3_SECURE_SERVER_HOST={server_ip}",
-            f"PN_PIKMIN3_CONFIG_SECURE_SERVER_HOST={server_ip}",
-        ]
-        
-        # wiiu-chat.local.env
+
+        # 7. WiiU Chat
         env_files["wiiu-chat.local.env"] = [
             f"PN_WIIU_CHAT_FRIENDS_GRPC_API_KEY={friends_api_key}",
             f"PN_WIIU_CHAT_CONFIG_GRPC_FRIENDS_API_KEY={friends_api_key}",
             f"PN_WIIU_CHAT_KERBEROS_PASSWORD={chat_kerberos_pw}",
+            "PN_WIIU_CHAT_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_chat?replicaSet=rs",
+            "MONGO_URI=mongodb://mongodb:27017/pretendo_chat?replicaSet=rs",
             f"PN_WIIU_CHAT_SECURE_SERVER_LOCATION={server_ip}",
             f"PN_WIIU_CHAT_CONFIG_SECURE_SERVER_LOCATION={server_ip}",
         ]
         
-        # super-smash-bros-wiiu.local.env
-        env_files["super-smash-bros-wiiu.local.env"] = [
-            f"PN_SSBWIIU_KERBEROS_PASSWORD={smash_kerberos_pw}",
-            f"PN_SSBWIIU_AUTHENTICATION_SERVER_PORT=6012",
-            f"PN_SSBWIIU_SECURE_SERVER_PORT=6013",
-            f"PN_SSBWIIU_SECURE_SERVER_HOST={server_ip}",
-            f"PN_SSBWIIU_ACCOUNT_GRPC_HOST=account",
-            f"PN_SSBWIIU_ACCOUNT_GRPC_PORT=5000",
-            f"PN_SSBWIIU_ACCOUNT_GRPC_API_KEY={account_grpc_api_key}",
-            f"PN_SSBWIIU_FRIENDS_GRPC_HOST=friends",
-            f"PN_SSBWIIU_FRIENDS_GRPC_PORT=5001",
-            f"PN_SSBWIIU_FRIENDS_GRPC_API_KEY={friends_api_key}",
-            f"PN_SSBWIIU_DATASTORE_S3BUCKET=super-smash-bros-wiiu",
-            f"PN_SSBWIIU_DATASTORE_S3KEY=minio_pretendo",
-            f"PN_SSBWIIU_DATASTORE_S3SECRET={minio_secret_key}",
-            f"PN_SSBWIIU_DATASTORE_S3URL=minio:9000",
-            f"PN_SSBWIIU_AES_KEY={smash_aes_key}",
-            f"PN_SSBWIIU_POSTGRES_URI=postgres://postgres_pretendo:{postgres_password}@postgres/super_smash_bros_wiiu?sslmode=disable",
-            "PN_SSBWIIU_LOCAL_AUTH=0",
-        ]
-
-        # minio.local.env
-        env_files["minio.local.env"] = [
-            f"MINIO_ROOT_PASSWORD={minio_secret_key}",
+        # 8. Splatoon
+        env_files["splatoon.local.env"] = [
+            f"PN_SPLATOON_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            f"PN_SPLATOON_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
+            f"PN_SPLATOON_KERBEROS_PASSWORD={splat_kerberos_pw}",
+            f"PN_SPLATOON_CONFIG_AES_KEY={splat_aes_key}",
+            "PN_SPLATOON_CONFIG_S3_ENDPOINT=minio:9000",
+            f"PN_SPLATOON_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/splatoon?sslmode=disable",
+            f"PN_SPLATOON_SECURE_SERVER_HOST={server_ip}",
+            f"PN_SPLATOON_CONFIG_SECURE_SERVER_HOST={server_ip}",
+            "PN_SPLATOON_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_splatoon?replicaSet=rs",
         ]
         
-        # postgres.local.env
-        env_files["postgres.local.env"] = [
-            f"POSTGRES_PASSWORD={postgres_password}",
+        # 9. Minecraft
+        env_files["minecraft-wiiu.local.env"] = [
+            f"PN_MINECRAFT_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            f"PN_MINECRAFT_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
+            f"PN_MINECRAFT_KERBEROS_PASSWORD={minecraft_kerberos_pw}",
+            f"PN_MINECRAFT_SECURE_SERVER_HOST={server_ip}",
+            f"PN_MINECRAFT_CONFIG_SECURE_SERVER_HOST={server_ip}",
+            "PN_MINECRAFT_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_minecraft?replicaSet=rs",
+        ]
+        
+        # 10. Pikmin 3
+        env_files["pikmin-3.local.env"] = [
+            f"PN_PIKMIN3_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            f"PN_PIKMIN3_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
+            f"PN_PIKMIN3_KERBEROS_PASSWORD={pikmin3_kerberos_pw}",
+            "PN_PIKMIN3_CONFIG_S3_ENDPOINT=minio:9000",
+            f"PN_PIKMIN3_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/pikmin3?sslmode=disable",
+            f"PN_PIKMIN3_SECURE_SERVER_HOST={server_ip}",
+            f"PN_PIKMIN3_CONFIG_SECURE_SERVER_HOST={server_ip}",
+            "PN_PIKMIN3_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_pikmin3?replicaSet=rs",
         ]
 
-        # mongo-express.local.env (compatibility for pinned version)
+        # 11. Super Smash Bros. Wii U
+        env_files["super-smash-bros-wiiu.local.env"] = [
+            f"PN_SSBWIIU_KERBEROS_PASSWORD={smash_kerberos_pw}",
+            "PN_SSBWIIU_AUTHENTICATION_SERVER_PORT=6012",
+            "PN_SSBWIIU_SECURE_SERVER_PORT=6013",
+            f"PN_SSBWIIU_SECURE_SERVER_HOST={server_ip}",
+            "PN_SSBWIIU_ACCOUNT_GRPC_HOST=account",
+            "PN_SSBWIIU_ACCOUNT_GRPC_PORT=5000",
+            f"PN_SSBWIIU_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            "PN_SSBWIIU_FRIENDS_GRPC_HOST=friends",
+            "PN_SSBWIIU_FRIENDS_GRPC_PORT=5001",
+            f"PN_SSBWIIU_FRIENDS_GRPC_API_KEY={friends_api_key}",
+            "PN_SSBWIIU_DATASTORE_S3BUCKET=super-smash-bros-wiiu",
+            "PN_SSBWIIU_DATASTORE_S3KEY=minio_pretendo",
+            f"PN_SSBWIIU_DATASTORE_S3SECRET={minio_secret}",
+            "PN_SSBWIIU_DATASTORE_S3URL=minio:9000",
+            f"PN_SSBWIIU_AES_KEY={smash_aes_key}",
+            f"PN_SSBWIIU_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/super_smash_bros_wiiu?sslmode=disable",
+            "PN_SSBWIIU_LOCAL_AUTH=0",
+            "PN_SSBWIIU_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_smash?replicaSet=rs",
+        ]
+
+        # 12. MinIO
+        env_files["minio.local.env"] = [
+            f"MINIO_ROOT_PASSWORD={minio_secret}",
+        ]
+        
+        # 13. Postgres
+        env_files["postgres.local.env"] = [
+            f"POSTGRES_PASSWORD={postgres_pass}",
+        ]
+
+        # 14. Mongo Express
         env_files["mongo-express.local.env"] = [
             "ME_CONFIG_MONGODB_SERVER=mongodb",
             "ME_CONFIG_MONGODB_PORT=27017",
+        ]
+        # 16. MinIO
+        env_files["minio.local.env"] = [
+            f"MINIO_ROOT_PASSWORD={minio_secret}",
         ]
         
         # Write all env files
@@ -2661,7 +2644,6 @@ class PretendoManager(QMainWindow):
                 f.write("\n".join(lines) + "\n")
             self.setup_log.append(f"  [ENV] Created {filename}")
         
-        # Also ensure any *.env files have matching *.local.env (empty if not generated)
         for fname in os.listdir(env_dir):
             if fname.endswith(".env") and not fname.endswith(".local.env"):
                 local_name = fname.replace(".env", ".local.env")
@@ -2676,19 +2658,17 @@ class PretendoManager(QMainWindow):
             f.write(f"SERVER_IP={server_ip}\n")
         self.setup_log.append(f"  [ENV] Created .env (SERVER_IP={server_ip})")
         
-        # Patch Splatoon BOSS schedules to prevent the 'same stage' bug
         self._patch_splatoon_schedules(s_dir)
         
-        # Write secrets.txt for reference
         secrets_path = os.path.join(s_dir, "secrets.txt")
         with open(secrets_path, "w") as f:
             f.write(f"""Pretendo Network server secrets
 ===============================
 
 MinIO root username: minio_pretendo
-MinIO root password: {minio_secret_key}
+MinIO root password: {minio_secret}
 Postgres username: postgres_pretendo
-Postgres password: {postgres_password}
+Postgres password: {postgres_pass}
 Server IP address: {server_ip}
 """)
         self.setup_log.append("  [ENV] Created secrets.txt")
@@ -2724,39 +2704,64 @@ Server IP address: {server_ip}
             self.setup_log.append(f"[WARN] Failed to create SMM metadata placeholder: {e}")
 
     def _fix_go_build_compatibility(self, s_dir):
-        """Fix build errors where latest Delve requires Go 1.24+ by pinning dlv to v1.22.0."""
-        self.setup_log.append("[System] Patching Go Dockerfiles for build compatibility...")
+        """Fix build errors, sync vendors, and patch UI crashes."""
+        self.setup_log.append("[System] Applying deep code patches to microservices...")
         repos_dir = os.path.join(s_dir, "repos")
         if not os.path.isdir(repos_dir):
             return
 
+        # 0. Clean the slate to remove old broken database patches
+        if shutil.which("git"):
+            for repo_name in ["splatoon", "friends", "pikmin-3", "minecraft-wiiu", "super-mario-maker", "juxtaposition-ui"]:
+                r_path = os.path.join(repos_dir, repo_name)
+                if os.path.isdir(r_path):
+                    subprocess.run(["git", "checkout", "--", "."], cwd=r_path, capture_output=True)
+
+        # 1. Patch Dockerfiles (Vendor sync & Delve)
         cnt = 0
         for root, _, files in os.walk(repos_dir):
             if "Dockerfile" in files:
                 fpath = os.path.join(root, "Dockerfile")
                 try:
-                    with open(fpath, "r") as f:
-                        content = f.read()
-                    
+                    with open(fpath, "r") as f: content = f.read()
+                    changed = False
                     if "dlv@latest" in content:
-                        new_content = content.replace("dlv@latest", "dlv@v1.22.0")
-                        if new_content != content:
-                            with open(fpath, "w") as f:
-                                f.write(new_content)
-                            cnt += 1
-                except Exception as e:
-                    self.setup_log.append(f"  [WARN] Failed to patch {fpath}: {e}")
+                        content = content.replace("dlv@latest", "dlv@v1.22.0")
+                        changed = True
+                    if "go build" in content and "go mod vendor" not in content and "COPY . ." in content:
+                        content = content.replace("COPY . .", "COPY . .\nRUN go mod vendor\n", 1)
+                        changed = True
+                    if changed:
+                        with open(fpath, "w") as f: f.write(content)
+                        cnt += 1
+                except: pass
         if cnt > 0:
-            self.setup_log.append(f"[OK] Pinned Delve to v1.22.0 in {cnt} Dockerfiles.")
+            self.setup_log.append(f"[OK] Patched {cnt} Dockerfiles for build compatibility.")
 
-        # Fix gRPC resolver syntax for Splatoon
-        splat_init = os.path.join(s_dir, "repos/splatoon/init.go")
+        # 2. Patch Juxtaposition-UI AWS Endpoint Crash directly in JS Source
+        ui_util_path = os.path.join(repos_dir, "juxtaposition-ui", "src", "util.js")
+        if os.path.isfile(ui_util_path):
+            try:
+                with open(ui_util_path, "r") as f: ui_content = f.read()
+                # Safely fallback to minio:9000 if config.aws.spaces.endpoint is somehow undefined
+                ui_content = re.sub(
+                    r'new aws\.Endpoint\([^)]+\)',
+                    r'new aws.Endpoint((config.aws && config.aws.spaces && config.aws.spaces.endpoint) || "http://minio:9000")',
+                    ui_content
+                )
+                with open(ui_util_path, "w") as f: f.write(ui_content)
+                self.setup_log.append("[OK] Applied safe AWS Endpoint fallback to Juxtaposition UI.")
+            except Exception as e:
+                self.setup_log.append(f"[WARN] Failed to patch Juxtaposition UI: {e}")
+
+        # 3. Splatoon specific gRPC resolver fix
+        splat_init = os.path.join(repos_dir, "splatoon", "init.go")
         if os.path.isfile(splat_init):
             try:
-                with open(splat_init, "r") as f: content = f.read()
-                if 'grpc.NewClient(fmt.Sprintf("dns:%s:%s"' in content:
-                    content = content.replace('dns:%s:%s"', 'dns:///%s:%s"')
-                    with open(splat_init, "w") as f: f.write(content)
+                with open(splat_init, "r") as f: s_content = f.read()
+                if 'grpc.NewClient(fmt.Sprintf("dns:%s:%s"' in s_content:
+                    s_content = s_content.replace('grpc.NewClient(fmt.Sprintf("dns:%s:%s"', 'grpc.NewClient(fmt.Sprintf("dns:///%s:%s"')
+                    with open(splat_init, "w") as f: f.write(s_content)
                     self.setup_log.append("[OK] Patched Splatoon gRPC resolver syntax.")
             except: pass
 
@@ -2794,36 +2799,60 @@ Server IP address: {server_ip}
         except Exception as e:
             self.setup_log.append(f"[ERROR] Failed to update boss.conf: {e}")
 
-    def _fix_juxtaposition_ui_aliases(self, s_dir):
-        """Fix Juxtaposition UI crash caused by incorrect module aliases in package.json."""
-        self.setup_log.append("[System] Patching Juxtaposition UI module aliases...")
-        pkg_path = os.path.join(s_dir, "repos", "juxtaposition-ui", "package.json")
-        if not os.path.isfile(pkg_path):
-            self.setup_log.append("[WARN] Juxtaposition UI package.json not found. Skipping alias fix.")
-            return
+    def _generate_juxtaposition_boot_config(self, s_dir):
+        """Fix Juxtaposition UI crash by creating dummy config and patching aliases."""
+        self.setup_log.append("[System] Generating Juxtaposition UI boot config...")
+        ui_repo = os.path.join(s_dir, "repos", "juxtaposition-ui")
+        if not os.path.isdir(ui_repo): return
 
+        # Extract secrets to populate the config.json correctly
+        env_dir = os.path.join(s_dir, "environment")
+        minio_secret = self._grep_env_file(os.path.join(env_dir, "account.local.env"), "PN_ACT_CONFIG_S3_ACCESS_SECRET") or "dummy"
+        account_aes = self._grep_env_file(os.path.join(env_dir, "account.local.env"), "PN_ACT_CONFIG_AES_KEY") or "dummy"
+        account_grpc = self._grep_env_file(os.path.join(env_dir, "account.local.env"), "PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT") or "dummy"
+        friends_grpc = self._grep_env_file(os.path.join(env_dir, "friends.local.env"), "PN_FRIENDS_CONFIG_GRPC_API_KEY") or "dummy"
+
+        # 1. Create missing config.json in the repo root
+        config_path = os.path.join(ui_repo, "config.json")
+        dummy_config = {
+            "http": {"port": 8080},
+            "mongoose": {"uri": "mongodb://mongodb:27017", "database": "pretendo_juxt", "options": {}},
+            "redis": {"host": "redis", "port": 6379},
+            "aes_key": account_aes,
+            "CDN_domain": "localhost",
+            "aws": {
+                "spaces": {
+                    "endpoint": "http://minio:9000", 
+                    "key": "minio_pretendo", 
+                    "secret": minio_secret
+                }
+            },
+            "grpc": {
+                "friends": {"ip": "friends", "port": 50051, "api_key": friends_grpc},
+                "account": {"ip": "account", "port": 50051, "api_key": account_grpc}
+            }
+        }
         try:
-            with open(pkg_path, "r") as f:
-                data = json.load(f)
-            
+            with open(config_path, "w") as f:
+                json.dump(dummy_config, f, indent=4)
+            self.setup_log.append("[OK] Created/Updated config.json for Juxtaposition UI.")
+        except Exception as e:
+            self.setup_log.append(f"[WARN] Failed to create dummy config.json: {e}")
+
+        # 2. Patch package.json aliases
+        pkg_path = os.path.join(ui_repo, "package.json")
+        try:
+            with open(pkg_path, "r") as f: data = json.load(f)
+            changed = False
             if "_moduleAliases" in data:
-                # The upstream aliases point to invalid absolute paths like "/app/config.js"
-                # We need them to point to the actual locations in our container setup.
-                # Since we bind-mount config.json to the app root, we can just point them there.
                 aliases = data["_moduleAliases"]
-                changed = False
-                
-                # recursive check for all keys ending in config.json as they cause crashes
                 for key in list(aliases.keys()):
                     if key.endswith("config.json"):
-                        # Point to the actual config.json in the container's app workdir
                         aliases[key] = "/home/node/app/config.json"
                         changed = True
-                
-                if changed:
-                    with open(pkg_path, "w") as f:
-                        json.dump(data, f, indent=2)
-                    self.setup_log.append("[OK] Corrected Juxtaposition UI module aliases.")
+            if changed:
+                with open(pkg_path, "w") as f: json.dump(data, f, indent=2)
+                self.setup_log.append("[OK] Corrected Juxtaposition UI module aliases.")
         except Exception as e:
             self.setup_log.append(f"[WARN] Failed to patch Juxtaposition UI aliases: {e}")
 
