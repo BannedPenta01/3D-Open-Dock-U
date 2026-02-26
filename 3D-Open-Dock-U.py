@@ -17,6 +17,7 @@ import zipfile
 import io
 import shlex
 from datetime import datetime
+import time
 
 try:
     import resource
@@ -208,6 +209,23 @@ TEXT_PRIMARY = "#E8E8F0"
 TEXT_SECONDARY = "#8888AA"
 ORANGE_ACCOUNT = "#FF8C00"
 GREEN_MONEY = "#85BB65"
+GREEN_BRIGHT = "#3fb950"
+
+TITLE_MAP = {
+    "00050000-10176900": "Splatoon",
+    "00050000-1010EC00": "MARIO KART 8",
+    "00050000-1018DC00": "Super Mario Maker",
+    "00050000-10144F00": "Super Smash Bros. for Wii U",
+    "00050000-10114000": "Pikmin 3",
+    "00050000-10101D00": "The Legend of Zelda: The Wind Waker HD",
+    "00050000-10143100": "The Legend of Zelda: Breath of the Wild",
+    "00050000-10105700": "New SUPER MARIO BROS. U",
+    "00050000-10145C00": "Minecraft: Wii U Edition",
+    "00050000-101c4d00": "Splatoon (Trial)",
+    "00050000-10102400": "Hyrule Warriors",
+    "00050000-10110300": "TLoZ: Skyward Sword",
+    "00050000-101c4f00": "Xenoblade Chronicles X"
+}
 
 STYLESHEET = f"""
 QMainWindow {{ background-color: {BG_DARKEST}; }}
@@ -331,6 +349,60 @@ def make_scrollable(widget):
     scroller.grabGesture(scroll.viewport(), QScroller.LeftMouseButtonGesture)
     return scroll
 
+class ErrorPopupDialog(QDialog):
+    def __init__(self, parent, error_msg):
+        super().__init__(parent)
+        self.setWindowTitle("Critical Server Error Detected")
+        self.setMinimumWidth(650)
+        self.setStyleSheet(STYLESHEET)
+        
+        layout = QVBoxLayout(self)
+        
+        header = QHBoxLayout()
+        icon = QLabel("⚠️")
+        icon.setStyleSheet("font-size: 32px;")
+        header.addWidget(icon)
+        
+        title_text = QLabel("A Problematic Server Log was Detected")
+        title_text.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {RED_LIGHT};")
+        header.addWidget(title_text, 1)
+        layout.addLayout(header)
+        
+        desc = QLabel("The following error was captured from the server logs while the session was active. "
+                     "This usually indicates a database connection failure, a crash, or an authentication timeout "
+                     "that might disconnect your game.")
+        desc.setWordWrap(True)
+        desc.setStyleSheet(f"color: {TEXT_SECONDARY}; margin-bottom: 10px;")
+        layout.addWidget(desc)
+        
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setPlainText(error_msg)
+        self.text_edit.setStyleSheet(f"background: {BG_INPUT}; color: {CYAN_LIGHT}; font-family: monospace; border: 1px solid {RED_DARK};")
+        self.text_edit.setMinimumHeight(150)
+        layout.addWidget(self.text_edit)
+        
+        hint = QLabel("You can select and copy the text above, or use the button below to copy the full report.")
+        hint.setStyleSheet("font-size: 11px; color: #8888AA; font-style: italic;")
+        layout.addWidget(hint)
+        
+        btn_layout = QHBoxLayout()
+        copy_btn = QPushButton("Copy Report to Clipboard")
+        copy_btn.setStyleSheet(f"background: {BG_CARD_HOVER}; border-color: {CYAN_PRIMARY};")
+        copy_btn.clicked.connect(self.copy_to_clip)
+        btn_layout.addWidget(copy_btn)
+        
+        close_btn = QPushButton("Dismiss")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        
+        layout.addLayout(btn_layout)
+        
+    def copy_to_clip(self):
+        full_text = f"--- 3D Open Dock U CRITICAL ERROR REPORT ---\nTimestamp: {datetime.now().isoformat()}\nDetected Log Line:\n{self.text_edit.toPlainText()}\n--------------------------------------------"
+        QApplication.clipboard().setText(full_text)
+        QMessageBox.information(self, "Copied", "Error report copied to clipboard.")
+
 class SudoPasswordDialog(QDialog):
     def __init__(self, parent=None, current_pw=""):
         super().__init__(parent)
@@ -385,6 +457,9 @@ class PretendoManager(QMainWindow):
         self.server_dir = DEFAULT_SERVER_DIR
         self.settings = QSettings(APP_NAME, "Config")
         self.bypassing_close_prompt = False
+        self.command_lock_count = 0
+        self.last_popup_time = 0
+        self.seen_errors = {} # error -> timestamp
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -567,6 +642,11 @@ class PretendoManager(QMainWindow):
         self.ip_info.setStyleSheet(f"color: {CYAN_LIGHT}; font-size: 16px;")
         self.ip_info.setAlignment(Qt.AlignCenter)
         glay.addWidget(self.ip_info)
+
+        self.detected_game_label = QLabel("Active Session: None Detected")
+        self.detected_game_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 13px; font-style: italic;")
+        self.detected_game_label.setAlignment(Qt.AlignCenter)
+        glay.addWidget(self.detected_game_label)
 
         self.server_toggle_btn = QPushButton("START SERVER")
         self.server_toggle_btn.setObjectName("startBtn")
@@ -1356,6 +1436,37 @@ class PretendoManager(QMainWindow):
                 self.statusBar().showMessage("NETWORK LOSS DETECTED - Safe Mode Active", 15000)
         
         self.last_connectivity_state = is_connected
+        self._detect_current_game()
+
+    def _detect_current_game(self):
+        """Monitor Cemu log for the latest TitleID to show what game is booting."""
+        try:
+            c_data = OS_INFO.get("cemu_data")
+            if not c_data: return
+            
+            cemu_log = os.path.join(c_data, "log.txt")
+            if os.path.exists(cemu_log):
+                with open(cemu_log, "r") as f:
+                    # Seek to near end to avoid parsing multi-MB logs
+                    f.seek(0, 2)
+                    size = f.tell()
+                    offset = max(0, size - 32768) # Check last 32KB
+                    f.seek(offset)
+                    content = f.read()
+                
+                # Cemu log format: [19:02:45.370] TitleId: 00050000-10176900
+                matches = re.findall(r"TitleId: ([0-9a-fA-F-]+)", content)
+                if matches:
+                    tid = matches[-1].lower()
+                    game_name = TITLE_MAP.get(tid, TITLE_MAP.get(tid.upper(), f"Unknown Title ({tid})"))
+                    self.detected_game_label.setText(f"Active Session: {game_name}")
+                    self.detected_game_label.setStyleSheet(f"color: {GREEN_BRIGHT}; font-weight: bold;")
+                    return
+            
+            self.detected_game_label.setText("Active Session: None Detected")
+            self.detected_game_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-style: italic;")
+        except:
+            pass
 
     def show_reset_dialog(self):
         """Helper to show the reset options from different tabs."""
@@ -1438,6 +1549,20 @@ class PretendoManager(QMainWindow):
             return pw
         return None
 
+    def _manage_ui_lock(self, locked: bool):
+        """Disables/Enables the main window to prevent interaction during sensitive background jobs."""
+        if locked:
+            self.command_lock_count += 1
+            if self.command_lock_count == 1:
+                self.setEnabled(False)
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+        else:
+            self.command_lock_count -= 1
+            if self.command_lock_count <= 0:
+                self.command_lock_count = 0
+                self.setEnabled(True)
+                QApplication.restoreOverrideCursor()
+
     def _run_command(self, cmd, log_widget, cwd=None, on_done=None, stdin_data=None, display_cmd=None):
         # If a worker is still running, wait up to 3 seconds for it to finish before giving up
         worker = self.worker  # local reference for type narrowing
@@ -1447,6 +1572,9 @@ class PretendoManager(QMainWindow):
                 QTimer.singleShot(1000, lambda: self._run_command(cmd, log_widget, cwd, on_done, stdin_data, display_cmd))
                 return
         
+        # Locking the UI before starting the worker thread
+        self._manage_ui_lock(True)
+
         # Safe display: never substitute stdin_data into cmd string (could corrupt if pw appears in cmd)
         if display_cmd:
             clean_cmd = display_cmd
@@ -1471,6 +1599,10 @@ class PretendoManager(QMainWindow):
             status_clr = "#3fb950" if code == 0 else RED_LIGHT
             status_txt = "SUCCESS" if code == 0 else f"FAILED ({code})"
             log_widget.append(f"<b>[DONE]</b> Process exited with status: <b style='color:{status_clr};'>{status_txt}</b>\n")
+            
+            # Re-enable the UI
+            self._manage_ui_lock(False)
+            
             if on_done: on_done(code)
             
         worker.finished.connect(handle_done)
@@ -1626,10 +1758,10 @@ class PretendoManager(QMainWindow):
                 inner_cmds = " ; ".join(setup_cmds)
                 if pw and OS_INFO["os"] == "linux":
                     full_cmd = f"sudo -S bash -c {shlex.quote(inner_cmds)}"
-                    self._run_command(full_cmd, self.server_log, s_dir, stdin_data=pw, display_cmd="[Elevated] Post-Boot Initialization", on_done=lambda c: self.stream_docker_logs())
+                    self._run_command(full_cmd, self.server_log, s_dir, stdin_data=pw, display_cmd="[Elevated] Post-Boot Initialization", on_done=self._on_server_boot_finished)
                 else:
                     full_cmd = inner_cmds
-                    self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Standard] Post-Boot Initialization", on_done=lambda c: self.stream_docker_logs())
+                    self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Standard] Post-Boot Initialization", on_done=self._on_server_boot_finished)
 
             self._check_docker_status()
 
@@ -1679,6 +1811,15 @@ class PretendoManager(QMainWindow):
         else:
             self._run_command("docker compose down", self.server_log, s_dir, on_done=lambda c: self._check_docker_status(), display_cmd="docker compose down")
 
+    def _on_server_boot_finished(self, code):
+        """Callback for when the entire server stack is fully operational."""
+        self.stream_docker_logs()
+        if code == 0:
+            QMessageBox.information(self, "Server Success", 
+                "<b>Pretendo Network Server is now ONLINE!</b><br><br>"
+                "Local infrastructure has been successfully initialized and databases are synchronized. "
+                "Your emulators can now connect to the network node.")
+
     def stream_docker_logs(self):
         s_dir = self.server_dir_field.text().strip()
         if not os.path.isdir(s_dir): return
@@ -1692,8 +1833,53 @@ class PretendoManager(QMainWindow):
             self.server_log.append("[System] Restarting log watcher...")
             
         self.log_worker = CommandWorker(cmd, cwd=s_dir)
-        self.log_worker.output.connect(self.server_log.append)
+        self.log_worker.output.connect(self._handle_server_log)
         self.log_worker.start()
+
+    def _handle_server_log(self, html_text):
+        """Processes incoming server logs for both display and critical error detection."""
+        self.server_log.append(html_text)
+        
+        # Strip simple HTML spans to get the raw text back for checking
+        raw_text = re.sub(r'<[^>]+>', '', html_text)
+        
+        # Critical patterns that definitely mean the game disconnected or failed
+        critical_patterns = [
+            "connection refused",
+            "failed request /oauth20/access_token/generate",
+            "failed to retrieve oauth token",
+            "mongooseserverselectionerror",
+            "mongonetworkerror",
+            "invalid memory address or nil pointer dereference",
+            "bad decrypt",
+            "panic:",
+            "segmentation fault",
+            "502 bad gateway",
+            "econnrefused",
+            "request failed with status code",
+            "database is locked"
+        ]
+        
+        low = raw_text.lower()
+        if any(p in low for p in critical_patterns):
+            self._show_critical_error_popup(raw_text)
+
+    def _show_critical_error_popup(self, error_line):
+        """Throttled popup for critical server errors."""
+        now = time.time()
+        
+        # Throttling: same error within 20 seconds, or any popup within 10 seconds
+        error_key = error_line[:100] # Use first 100 chars as key
+        if error_key in self.seen_errors and now - self.seen_errors[error_key] < 20:
+            return
+        if now - self.last_popup_time < 10:
+            return
+            
+        self.seen_errors[error_key] = now
+        self.last_popup_time = now
+        
+        dlg = ErrorPopupDialog(self, error_line)
+        dlg.exec()
 
     def toggle_docker_service(self):
         # Unified Credential Aggregation
@@ -2472,18 +2658,43 @@ try {{
     const hashedPw = await bcrypt.hash(nintendoPw, 10);
 
     let user = await PNID.findOne({{ usernameLower: username.toLowerCase() }});
+
+    // Valid default male Mii template, avoids Nintendo invalid-Mii "???" fallbacks
+    const baseMiiHex = "03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2";
+    const miiBuf = Buffer.alloc(96);
+    miiBuf.write(baseMiiHex, "hex");
+    
+    // Name at offset 0x1A (Max 10 chars, UTF-16 BE)
+    let paddedName = miiName.slice(0, 10);
+    while(paddedName.length < 10) paddedName += String.fromCharCode(0);
+    const nameBuf = Buffer.from(paddedName, "utf16le");
+    nameBuf.swap16(); // Convert to Big Endian
+    nameBuf.copy(miiBuf, 0x1A);
+
+    // Recalculate CRC16-CCITT for the first 0x5E bytes (94 bytes)
+    let crc = 0;
+    for (let i = 0; i < 0x5E; i++) {{
+        crc ^= (miiBuf[i] << 8);
+        for (let j = 0; j < 8; j++) {{
+            if ((crc & 0x8000) !== 0) {{
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
+            }} else {{
+                crc = (crc << 1) & 0xFFFF;
+            }}
+        }}
+    }}
+    miiBuf.writeUInt16BE(crc, 0x5E);
+    const miiDataHex = miiBuf.toString("hex");
+
     if (user) {{
         user.password = hashedPw;
         user.pid = pid;
+        user.mii.name = miiName;
+        user.mii.data = Buffer.from(miiDataHex, "hex").toString("base64");
+        user.mii.author = miiName;
         await user.save();
-        console.log("[Notice] " + username + " is already registered! Updated Password and PID to align locally: " + pid);
+        console.log("[Notice] " + username + " is already registered! Updated Password, PID, and Mii to align locally.");
     }} else {{
-        // name at offset 0x1A (char 52)
-        const nameBuf = Buffer.from(miiName.padEnd(10, '\\0').slice(0, 10), "utf16le");
-        nameBuf.swap16(); 
-        const nameHex = nameBuf.toString("hex");
-        const miiDataHex = ("03000000" + "00".repeat(22) + nameHex).padEnd(192, "0");
-
         user = new PNID({{
             pid: pid,
             creation_date: new Date(),
