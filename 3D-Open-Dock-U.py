@@ -2712,7 +2712,7 @@ Server IP address: {server_ip}
 
         # 0. Clean the slate to remove old broken database patches
         if shutil.which("git"):
-            for repo_name in ["splatoon", "friends", "pikmin-3", "minecraft-wiiu", "super-mario-maker", "juxtaposition-ui"]:
+            for repo_name in ["splatoon", "friends", "pikmin-3", "minecraft-wiiu", "super-mario-maker", "juxtaposition-ui", "super-smash-bros-wiiu"]:
                 r_path = os.path.join(repos_dir, repo_name)
                 if os.path.isdir(r_path):
                     subprocess.run(["git", "checkout", "--", "."], cwd=r_path, capture_output=True)
@@ -3333,6 +3333,7 @@ Server IP address: {server_ip}
         splatoon_aes = self._grep_env_file(os.path.join(s_dir, "environment", "splatoon.local.env"), "PN_SPLATOON_CONFIG_AES_KEY") or ""
         smm_aes = self._grep_env_file(os.path.join(s_dir, "environment", "super-mario-maker.local.env"), "PN_SMM_CONFIG_AES_KEY") or ""
         miiverse_aes = self._grep_env_file(os.path.join(s_dir, "environment", "miiverse-api.local.env"), "PN_MIIVERSE_API_CONFIG_AES_KEY") or ""
+        smash_aes = self._grep_env_file(os.path.join(s_dir, "environment", "super-smash-bros-wiiu.local.env"), "PN_SSBWIIU_AES_KEY") or ""
         
         js_script = f"""
 const {{ connect }} = require("./dist/database");
@@ -3479,6 +3480,7 @@ try {{
     await upsertNexServer("Friend List", "00003200", ["0005001010001C00", "000500301001500A", "000500301001510A", "000500301001520A"], 6000, "{friends_aes}");
     await upsertNexServer("Miiverse", null, ["000500301001600A", "000500301001610A", "000500301001620A"], 80, "{miiverse_aes}", "87cd32617f1985439ea608c2746e4610");
     await upsertNexServer("Pikmin 3", "10113F00", ["0005000010113F00", "0005000010114000", "0005000010114100"], 6010, "");
+    await upsertNexServer("Super Smash Bros. Wii U", "10110E00", ["0005000010110E00", "0005000010144F00", "000500001010ED00"], 6012, "{smash_aes}");
 
     // --- Miiverse Discovery Patch (Fixes 400 error) ---
     try {{
