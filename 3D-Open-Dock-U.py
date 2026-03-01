@@ -230,52 +230,25 @@ def detect_os_info():
     username = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
     home = os.path.expanduser("~")
 
-    if system == "linux":
+ if system == "linux":
         info["server_dir"] = os.path.join(home, "pretendo-docker")
-        if shutil.which("pacman"):
-            info["pkg_mgr"], info["pkg_install"], info["distro"] = "pacman", "pacman -S --noconfirm docker docker-compose", "Arch Linux"
-        elif shutil.which("apt"):
-            info["pkg_mgr"], info["pkg_install"], info["distro"] = "apt", "apt install -y docker.io docker-compose", "Debian/Ubuntu"
-        elif shutil.which("dnf"):
-            info["pkg_mgr"], info["pkg_install"], info["distro"] = "dnf", "dnf install -y docker docker-compose", "Fedora/RHEL"
-        
-        flatpak_cemu = os.path.join(home, ".var/app/info.cemu.Cemu/data/Cemu")
-        config_cemu = os.path.join(home, ".config/Cemu")
-        local_cemu = os.path.join(home, ".local/share/Cemu")
-        # EmuDeck: mlc01 at Emulation/roms/wiiu/mlc01, gameProfiles at .config/Cemu
-        emudeck_wiiu = os.path.join(home, "Emulation", "roms", "wiiu")
-        
-        # Dual-path support for Cemu 2.0+ Linux; EmuDeck uses Emulation/roms/wiiu for mlc01
-        if os.path.isdir(emudeck_wiiu):
-            info["cemu_dir"] = emudeck_wiiu
-            info["cemu_data"] = emudeck_wiiu
-        elif os.path.isdir(config_cemu):
-            info["cemu_dir"] = config_cemu
-            info["cemu_data"] = local_cemu if os.path.isdir(local_cemu) else config_cemu
-        else:
-            info["cemu_dir"] = local_cemu
-            info["cemu_data"] = local_cemu
-        
-        c_dir = info["cemu_dir"]
-        info["cemu_settings"] = os.path.join(str(c_dir), "settings.xml") if c_dir else ""
-        
-        citra_paths = [
-            os.path.join(home, ".config/citra-emu/config/qt-config.ini"),
-            os.path.join(home, ".var/app/org.citra_emu.citra/config/citra-emu/config/qt-config.ini"),
-            os.path.join(home, ".config/lime-3ds/config/qt-config.ini"),
-            os.path.join(home, ".config/azahar-emu/qt-config.ini"),
-            os.path.join(home, ".config/EmuDeck/backend/configs/citra-emu/qt-config.ini"),
-            os.path.join(home, ".config/EmuDeck/backend/configs/azahar/qt-config.ini")
-        ]
-        for p in citra_paths:
-            if os.path.exists(p):
-                info["citra_config"] = p
-                break
+        # Direct path for AppImage/Generic Linux
+        info["cemu_dir"] = os.path.join(home, ".local/share/Cemu")
+        info["cemu_data"] = os.path.join(home, ".local/share/Cemu")
+
+        # Check for Flatpak
+        if os.path.isdir(os.path.join(home, ".var/app/info.cemu.Cemu")):
+            info["cemu_dir"] = os.path.join(home, ".var/app/info.cemu.Cemu/data/Cemu")
+            info["cemu_data"] = info["cemu_dir"]
+
+        info["cemu_settings"] = os.path.join(info["cemu_dir"], "settings.xml")
+        info["distro"] = "Linux"
     elif system == "darwin":
         info["server_dir"] = os.path.join(home, "pretendo-docker")
         info["distro"] = "macOS"
         info["cemu_dir"] = os.path.join(home, "Library/Application Support/Cemu")
         info["cemu_settings"] = os.path.join(info["cemu_dir"], "settings.xml")
+
     elif system == "windows":
         userprofile = os.environ.get("USERPROFILE", "C:\\Users\\User")
         info["server_dir"] = os.path.join(userprofile, "pretendo-docker")
@@ -933,6 +906,8 @@ class PretendoManager(QMainWindow):
         glay.addWidget(self.server_toggle_btn)
         
         btn_hl = QHBoxLayout()
+        self.copy_server_log_btn = QPushButton("Copy Logs", clicked=self.copy_server_logs)
+        btn_hl.addWidget(self.copy_server_log_btn)
         self.clear_server_log_btn = QPushButton("Clear Logs", clicked=lambda: self.server_log.clear())
         btn_hl.addWidget(self.clear_server_log_btn)
         glay.addLayout(btn_hl)
@@ -1138,6 +1113,11 @@ class PretendoManager(QMainWindow):
         self.cemu_log.setReadOnly(True)
         self.cemu_log.setMaximumHeight(80)
         crgl.addWidget(self.cemu_log)
+
+        cemu_btn_row = QHBoxLayout()
+        self.copy_cemu_log_btn = QPushButton("Copy Cemu Log", clicked=self.copy_cemu_logs)
+        cemu_btn_row.addWidget(self.copy_cemu_log_btn)
+        crgl.addLayout(cemu_btn_row)
         
         lv.addWidget(cred)
         
@@ -1579,10 +1559,11 @@ class PretendoManager(QMainWindow):
                         else:
                             in_depends_on = False
 
-                    # 1. mitmproxy-pretendo: update external port
+                    # 1. mitmproxy-pretendo: update external port and bind globally
                     if current_service == "mitmproxy-pretendo":
-                        if ":8080" in line and "ports:" not in line:
-                            new_line = re.sub(r'(?:^\s*-\s*|:)(\d+):8080', lambda m: m.group(0).replace(m.group(1), str(port)), line)
+                        if "8080" in line and "ports:" not in line:
+                            # CRITICAL FIX: Strip 127.0.0.1 restriction so AppImages/Flatpaks can route to it
+                            new_line = re.sub(r'-\s*(?:127\.0\.0\.1:)?\d+:8080', f'- "{port}:8080"', line)
                             if new_line != line:
                                 line = new_line
                                 changed = True
@@ -1612,10 +1593,21 @@ class PretendoManager(QMainWindow):
                             line = line.replace("mongo-express:latest", "mongo-express:0.54.0")
                             changed = True
 
-                    # 5. postgres: Add Healthcheck (Fixes Smash connection refused)
+                    # 5. postgres: Add Healthcheck (Fixes Smash connection refused) and mount init script
                     if current_service == "postgres" and stripped == "postgres:":
-                        if "healthcheck:" not in "".join(lines[i:i+20]):
+                        if "healthcheck:" not in "".join(lines[i:i+40]):
                             new_lines.append(line)
+                            scripts_mount = os.path.join(s_dir, "scripts", "run-in-container")
+                            
+                            # Add volumes block and script mount
+                            if os.path.isdir(scripts_mount):
+                                if "volumes:" not in "".join(lines[i:i+40]):
+                                    new_lines.append("    volumes:\n")
+                                    new_lines.append("      - ./scripts/run-in-container:/scripts:ro\n")
+                                else:
+                                    # Volume block exists, but we'll try to add it later by patching the block itself
+                                    pass
+
                             new_lines.append("    healthcheck:\n")
                             new_lines.append("      test:\n")
                             new_lines.append("        - CMD-SHELL\n")
@@ -1625,6 +1617,14 @@ class PretendoManager(QMainWindow):
                             new_lines.append("      retries: 5\n")
                             changed = True
                             continue
+
+                    # 5.1 If postgres volumes block exists, ensure /scripts is in it
+                    if current_service == "postgres" and stripped == "volumes:":
+                        new_lines.append(line)
+                        if "/scripts:ro" not in "".join(lines[i:i+20]):
+                            new_lines.append("      - ./scripts/run-in-container:/scripts:ro\n")
+                            changed = True
+                        continue
 
                     # 5.5 Upgrade depends_on list to dict for services that need to wait for Postgres to be healthy
                     target_services = [
@@ -2277,10 +2277,11 @@ class PretendoManager(QMainWindow):
                 
                 # We use a loop to force-initiate the replica set and wait for it to be 'PRIMARY'
                 # This fixes the MongooseServerSelectionError
+                # Try mongo first (4.4) then mongosh (5+); mongo:4.4 has no mongosh
                 setup_cmds = [
-                    "docker compose exec -T mongodb mongosh --eval 'rs.initiate()' || docker compose exec -T mongodb mongo --eval 'rs.initiate()'",
+                    "docker compose exec -T mongodb mongo --eval 'rs.initiate()' || docker compose exec -T mongodb mongosh --eval 'rs.initiate()'",
                     "sleep 5",
-                    "docker compose exec -T postgres /scripts/postgres-init.sh || true",
+                    "docker compose exec -T postgres /docker-entrypoint-initdb.d/postgres-init.sh || docker compose exec -T postgres /scripts/postgres-init.sh || true",
                     "docker compose restart account friends splatoon boss super-mario-maker super-smash-bros-wiiu mario-kart-8"
                 ]
                 
@@ -2292,6 +2293,8 @@ class PretendoManager(QMainWindow):
                     self._run_command(inner_cmds, self.server_log, s_dir, display_cmd="DB Initialization")
 
             self._check_docker_status()
+            if self.server_running:
+                self._on_server_boot_finished(0)
 
         if OS_INFO["os"] == "linux":
             if pw:
@@ -2410,6 +2413,28 @@ class PretendoManager(QMainWindow):
                 return
                 
             self._show_critical_error_popup(raw_text)
+
+    def copy_server_logs(self):
+        """Copy current server logs to the system clipboard."""
+        if not hasattr(self, "server_log"):
+            return
+        text = self.server_log.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "Copy Logs", "There are no server logs to copy yet.")
+            return
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "Copy Logs", "Server logs copied to clipboard.")
+
+    def copy_cemu_logs(self):
+        """Copy current Cemu patch logs to the system clipboard."""
+        if not hasattr(self, "cemu_log"):
+            return
+        text = self.cemu_log.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "Copy Cemu Log", "There are no Cemu logs to copy yet.")
+            return
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "Copy Cemu Log", "Cemu logs copied to clipboard.")
 
     def _show_critical_error_popup(self, error_line):
         """Throttled popup for critical server errors."""
@@ -3170,18 +3195,14 @@ ENV CGO_ENABLED=0
 RUN apk add --no-cache git gcc musl-dev bash
 WORKDIR /app
 COPY . .
-RUN if [ ! -f go.mod ]; then go mod init pretendo-service || true; fi
-RUN go mod tidy || true
-RUN go mod vendor || true
+RUN if [ ! -f go.mod ]; then go mod init pretendo-service; fi
+RUN go mod tidy
 RUN mkdir -p /app/bin && \
-    for file in $(find . -name "*.go" -type f); do \
-        if grep -q "^package main" "$file"; then \
-            DNAME=$(dirname "$file"); \
-            BIN_NAME=$(basename "$DNAME"); \
-            [ "$BIN_NAME" = "." ] && BIN_NAME="server"; \
-            echo "Building $DNAME..."; \
-            (cd "$DNAME" && go build -v -o "/app/bin/$BIN_NAME" .) || echo "FAILED TO BUILD $DNAME"; \
-        fi; \
+    find . -name "*.go" -type f -exec grep -l "^package main" {} + | xargs -n 1 dirname | sort -u | while read DNAME; do \
+        BIN_NAME=$(basename "$DNAME"); \
+        [ "$BIN_NAME" = "." ] && BIN_NAME="server"; \
+        echo "Building $DNAME -> /app/bin/$BIN_NAME"; \
+        (cd "$DNAME" && go build -v -o "/app/bin/$BIN_NAME" .); \
     done
 
 FROM alpine:latest
@@ -3334,6 +3355,21 @@ CMD ["/app/start.sh"]
                 with open(auth_db_path, "w") as f:
                     f.write(content)
                 self.setup_log.append("[OK] Fixed MK8 Auth database routing.")
+
+        # 1.5 Fix MK8 Auth port in mk8-authentication/main.go
+        auth_main_path = os.path.join(mk8_dir, "mk8-authentication", "main.go")
+        if os.path.isfile(auth_main_path):
+            with open(auth_main_path, "r") as f:
+                content = f.read()
+            if 'nexServer.Listen(":60002")' in content:
+                content = content.replace('import (', 'import (\n\t"os"')
+                content = content.replace(
+                    'nexServer.Listen(":60002")',
+                    'port := os.Getenv("PN_MK8_AUTHENTICATION_SERVER_PORT")\n\tif port == "" { port = "60002" }\n\tnexServer.Listen(":" + port)'
+                )
+                with open(auth_main_path, "w") as f:
+                    f.write(content)
+                self.setup_log.append("[OK] Fixed MK8 Auth port routing.")
 
         # 2. Fix mk8-secure/init.go to support environment variable fallbacks
         secure_init_path = os.path.join(mk8_dir, "mk8-secure", "init.go")
@@ -4263,42 +4299,29 @@ try {{
         except Exception as e:
             self.cemu_log.append(f"[ERROR] Font installation failed: {e}")
 
-    def _ensure_mlc_save_dirs(self, data_path):
-        """Create per-title save dirs so games (e.g. Mario Kart 8) do not hit missing-path crashes.
-        Always ensures default Cemu locations (Linux) so 'Save path (not present)' is avoided."""
-        # Title ID 000500001010ec00 = Mario Kart 8 (USA). Save path: mlc01/usr/save/00050000/1010EC00/user/
-        MK8_SAVE_REL = os.path.join("usr", "save", "00050000", "1010EC00", "user")
-        targets = []
-        if data_path:
-            targets.append(os.path.join(data_path, "mlc01", MK8_SAVE_REL))
-        if OS_INFO["os"] == "linux":
-            home = os.path.expanduser("~")
-            # Always add default Cemu bases + EmuDeck so path exists before user runs Patch & Connect
-            for base in [
-                os.path.join(home, ".local/share/Cemu"),
-                os.path.join(home, ".config/Cemu"),
-                os.path.join(home, "Emulation", "roms", "wiiu"),
-            ]:
-                targets.append(os.path.join(base, "mlc01", MK8_SAVE_REL))
-        for path in targets:
-            try:
-                os.makedirs(path, exist_ok=True)
-            except Exception as e:
-                if hasattr(self, "cemu_log"):
-                    self.cemu_log.append(f"[WARN] Could not create MK8 save dir {path}: {e}")
-        # Also ensure MK8 game profile at default Cemu bases + EmuDeck (stability fix for Linux crash)
-        if OS_INFO["os"] == "linux":
-            home = os.path.expanduser("~")
-            for base in [
-                os.path.join(home, ".local/share/Cemu"),
-                os.path.join(home, ".config/Cemu"),
-                os.path.join(home, "Emulation", "roms", "wiiu"),
-            ]:
-                self._ensure_mk8_game_profile(base)
+def _ensure_mlc_save_dirs(self, data_path):
+        """Generates valid 96-byte Mii binary to stop MK8 Signal 11 crash."""
+        titles = ["1010ec00", "1010ed00", "1010eb00"]
+        home = os.path.expanduser("~")
+        bases = [data_path, os.path.join(home, ".local/share/Cemu")]
+
+        mii_hex = "03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2"
+        mii_data = binascii.unhexlify(mii_hex)
+
+        for base in bases:
+            if not base or not os.path.isdir(base): continue
+            for tid in titles:
+                os.makedirs(os.path.join(base, "mlc01/usr/save/00050000", tid.lower(), "user/80000001"), exist_ok=True)
+                os.makedirs(os.path.join(base, "mlc01/usr/save/00050000", tid.upper(), "user/80000001"), exist_ok=True)
+                os.makedirs(os.path.join(base, "mlc01/usr/save/00050000", tid.lower(), "common"), exist_ok=True)
+
+            mii_dir = os.path.join(base, "mlc01/sys/title/0005001b/10056000/content")
+            os.makedirs(mii_dir, exist_ok=True)
+            with open(os.path.join(mii_dir, "FFLStoreData"), "wb") as f:
+                f.write(mii_data)
 
     def _ensure_mk8_game_profile(self, cemu_base):
-        """Write a stability-oriented game profile for Mario Kart 8 (000500001010ec00) to reduce Linux signal 11 crashes.
-        Single-core recompiler can avoid timing races that trigger PPCInterpreter LWZX null derefs."""
+        """Write a stability-oriented game profile for Mario Kart 8 (000500001010ec00)."""
         if not cemu_base or not os.path.isdir(cemu_base):
             return
         profile_dir = os.path.join(cemu_base, "gameProfiles")
@@ -4306,13 +4329,10 @@ try {{
         try:
             os.makedirs(profile_dir, exist_ok=True)
             content = (
-                "# Mario Kart 8 - stability profile (reduces Linux signal 11 / LWZX crashes)\n"
-                "# Generated by 3D-Open-Dock-U. Use Single-core recompiler to avoid multi-thread races.\n"
-                "# If crash happens at NEX friend login: Cemu Options → General → Account → uncheck Enable online mode.\n\n"
+                "# Mario Kart 8 - stability profile\n"
+                "# Generated by 3D-Open-Dock-U.\n"
                 "[General]\n"
                 "loadSharedLibraries = true\n\n"
-                "[CPU]\n"
-                "cpuMode = Singlecore-Recompiler\n\n"
                 "[Graphics]\n"
                 "accurateShaderMul = true\n"
             )
@@ -4321,8 +4341,7 @@ try {{
             if hasattr(self, "cemu_log"):
                 self.cemu_log.append(f"[MK8] Game profile written: {profile_path}")
         except Exception as e:
-            if hasattr(self, "cemu_log"):
-                self.cemu_log.append(f"[WARN] MK8 game profile failed: {e}")
+            pass
 
     def _show_mk8_crash_workarounds(self):
         """Explain the MK8 crash, the fix, and ask users to report to Cemu."""
@@ -4337,30 +4356,10 @@ try {{
         QMessageBox.information(self, "MK8 / Cemu crash", msg)
 
     def _remove_system_mii_file_if_present(self, data_path):
-        """Remove FFLStoreData from system Mii title (0005001b/10056000). Our single-file write
-        can trigger MK8 crash if the game expects another format; deleting it forces use of account.dat Mii."""
-        content_rel = os.path.join("mlc01", "sys", "title", "0005001b", "10056000", "content")
-        ffl_file = "FFLStoreData"
-        targets = []
-        if data_path:
-            targets.append(os.path.join(data_path, content_rel, ffl_file))
-        if OS_INFO["os"] == "linux":
-            home = os.path.expanduser("~")
-            for base in [
-                os.path.join(home, ".local/share/Cemu"),
-                os.path.join(home, ".config/Cemu"),
-                os.path.join(home, "Emulation", "roms", "wiiu"),
-            ]:
-                targets.append(os.path.join(base, content_rel, ffl_file))
-        for path in targets:
-            try:
-                if os.path.isfile(path):
-                    os.remove(path)
-                    if hasattr(self, "cemu_log"):
-                        self.cemu_log.append(f"[MK8] Removed system Mii file (may have caused crash): {path}")
-            except Exception as e:
-                if hasattr(self, "cemu_log"):
-                    self.cemu_log.append(f"[WARN] Could not remove {path}: {e}")
+        """DEPRECATED: Do not delete FFLStoreData.
+        Removing this file causes games like Mario Kart 8 to crash on boot (Signal 11 LWZX)
+        because the game fails to initialize the Mii database."""
+        pass
 
     def _ensure_system_mii_data(self, data_path, mii_bytes):
         """Deploy one valid Mii (96 bytes, FFLStoreData format) to the system Mii title.
@@ -4419,77 +4418,35 @@ try {{
         return bytes(buf), account_name_hex
 
     def _force_write_file(self, path, content):
-        """Robustly overwrite a file, attempting to fix permissions or replace the file if access is denied.
-        Falls back to sudo (Linux) or PowerShell (Windows) if standard Python file operations fail.
-        """
+        """Robustly overwrite a file, enforcing exact binary bytes to prevent Cemu parser crashes."""
         try:
-            # Ensure directory exists
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            
-            # Try to fix permissions first if file exists
             if os.path.exists(path):
-                try: 
-                    os.chmod(path, 0o666)
-                except:
-                    if OS_INFO["os"] != "windows":
-                        pw = self.cached_password or self._ask_sudo_password()
-                        if pw:
-                            subprocess.run(["sudo", "-S", "chmod", "666", path], input=f"{pw}\n", text=True, capture_output=True)
-            
+                try: os.chmod(path, 0o666)
+                except: pass
+
             success = False
-            # Standard write attempt
             try:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
+                # CRITICAL FIX: Use 'wb' to prevent Linux from destroying the \r\n line endings
+                with open(path, "wb") as f:
+                    f.write(content.encode("utf-8"))
                 try: os.chmod(path, 0o777)
                 except: pass
                 success = True
             except (PermissionError, OSError):
-                if OS_INFO["os"] == "windows":
-                    # Windows: Try PowerShell with Force flag
-                    import tempfile
-                    try:
-                        with tempfile.NamedTemporaryFile(mode='w', suffix='.tmp', delete=False, encoding='utf-8') as tf:
-                            tf.write(content)
-                            tf_path = tf.name
-                        win_path = path.replace("'", "''")
-                        win_tmp = tf_path.replace("'", "''")
-                        cmd = f"powershell -Command \"Copy-Item -Path '{win_tmp}' -Destination '{win_path}' -Force\""
-                        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                        os.unlink(tf_path)
-                        if result.returncode == 0: success = True
-                    except: pass
-                else:
-                    # Linux: Fallback to sudo
-                    pw = self.cached_password or self._ask_sudo_password()
-                    if pw:
-                        cmd = f"sudo -S tee {shlex.quote(path)} > /dev/null"
-                        proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                        stdout, stderr = proc.communicate(input=f"{pw}\n{content}")
-                        if proc.returncode == 0:
-                            subprocess.run(["sudo", "-S", "chmod", "777", path], input=pw + "\n", text=True, capture_output=True)
-                            success = True
-            
-            # VERIFY WRITE
-            if success and os.path.exists(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        disk_content = f.read().replace("\r\n", "\n").strip()
-                        target_content = content.replace("\r\n", "\n").strip()
-                        
-                        if disk_content == target_content:
-                            # Do NOT set account.dat/account.ini read-only: Cemu and games (e.g. MK8)
-                            # update them at runtime; read-only causes failed writes and can trigger
-                            # null-pointer crashes (e.g. signal 11 in PPCInterpreter_LWZX).
-                            self.cemu_log.append(f"[SUCCESS] Updated: {os.path.basename(path)}")
-                            return True
-                except Exception as ve:
-                    self.cemu_log.append(f"[WARN] Verification error: {ve}")
-            
-            self.cemu_log.append(f"[ERROR] Verification failed for {path}")
-            return False
+                # Fallback to elevated writes if permission denied
+                pw = self.cached_password or self._ask_sudo_password()
+                if pw and OS_INFO["os"] == "linux":
+                    cmd = f"sudo -S tee {shlex.quote(path)} > /dev/null"
+                    proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    proc.communicate(input=f"{pw}\n".encode("utf-8") + content.encode("utf-8"))
+                    if proc.returncode == 0:
+                        subprocess.run(["sudo", "-S", "chmod", "777", path], input=pw + "\n", text=True, capture_output=True)
+                        success = True
+            return success
         except Exception as e:
-            self.cemu_log.append(f"[ERROR] Force-write failed for {path}: {e}")
+            if hasattr(self, "cemu_log"):
+                self.cemu_log.append(f"[ERROR] Force-write failed for {path}: {e}")
             return False
 
     def _force_delete_file(self, path):
@@ -4518,18 +4475,11 @@ try {{
         except: return False
 
     def patch_cemu_settings(self, url, is_official=False):
-        # Dynamically resolve localhost if needed
-        if "localhost" in url or "127.0.0.1" in url:
-            real_ip = self._get_local_ip()
-            if real_ip != "127.0.0.1":
-                url = url.replace("localhost", real_ip).replace("127.0.0.1", real_ip)
-                self.statusBar().showMessage(f"Redirected localhost -> {real_ip} for AppImage compatibility.", 3000)
-
         cemu_dir = self.cemu_dir_field.text().strip()
         p = os.path.join(cemu_dir, "settings.xml") if cemu_dir else OS_INFO.get("cemu_settings", "")
         
         try:
-            # 1-3. settings.xml modifications (Optional: some forks/builds may not have this file)
+            # 1. Update settings.xml (Proxy & SSL Bypass)
             if p and os.path.exists(p):
                 with open(p, "r") as f: c = f.read()
                 
@@ -4540,27 +4490,22 @@ try {{
                     elif "</Account>" in c:
                         c = c.replace("</Account>", "    <OnlineEnabled>true</OnlineEnabled>\n    </Account>")
                 
-                # INJECT SSL BYPASS into Account block for latest Cemu compatibility
                 if "<Account>" in c and "<disablesslverification>1</disablesslverification>" not in c:
                     c = c.replace("<Account>", "<Account>\n        <disablesslverification>1</disablesslverification>")
                 
-                # Ensure disablesslverification is in settings.xml root too
                 if "<disablesslverification>1</disablesslverification>" not in c:
                     if "<disablesslverification>0</disablesslverification>" in c:
                         c = c.replace("<disablesslverification>0</disablesslverification>", "<disablesslverification>1</disablesslverification>")
                     elif "</content>" in c:
                         c = c.replace("</content>", "    <disablesslverification>1</disablesslverification>\n</content>")
                 
-                # Kill Legacy Cert Pointers
                 c = re.sub(r"<account_cert_path>.*?</account_cert_path>", "<account_cert_path></account_cert_path>", c)
 
-                # FORCE Account Selection to 80000001 (Decimal: 2147483649)
                 if "<PersistentId>" in c:
                     c = re.sub(r"<PersistentId>\d+</PersistentId>", "<PersistentId>2147483649</PersistentId>", c)
                 elif "<Account>" in c:
                     c = c.replace("<Account>", "<Account>\n        <PersistentId>2147483649</PersistentId>")
                 
-                # INJECT AccountId (Username) into settings.xml to force Network Link status
                 username = self.cemu_username.text().strip()
                 if username:
                     if "<AccountId>" in c:
@@ -4568,73 +4513,63 @@ try {{
                     elif "<Account>" in c:
                         c = c.replace("<Account>", f"<Account>\n        <AccountId>{username}</AccountId>")
 
-                # Force ActiveService to 2 (Pretendo) to natively use Pretendo account types
+                # ActiveService: 0=Nintendo, 1=Pretendo (built-in endpoints), 2=Custom (needs network_services.xml)
+                # Use 1 (Pretendo) for local stack: mitmproxy intercepts Pretendo domains and routes locally.
+                # Using 2 (Custom) + deleting network_services.xml causes null pointer crashes (Signal 11 LWZX)
+                # because Cemu has no endpoint URLs and games get null network response objects.
+                active_svc = "1"  # Pretendo — proxy handles redirection to local stack
                 if "<ActiveService>" in c:
-                    c = re.sub(r"<ActiveService>\d+</ActiveService>", "<ActiveService>2</ActiveService>", c)
+                    c = re.sub(r"<ActiveService>\d+</ActiveService>", f"<ActiveService>{active_svc}</ActiveService>", c)
                 elif "<Account>" in c:
-                    c = c.replace("<Account>", "<Account>\n        <ActiveService>2</ActiveService>")
+                    c = c.replace("<Account>", f"<Account>\n        <ActiveService>{active_svc}</ActiveService>")
 
-                # Update AccountService selection — single regex to avoid duplicate Service= attributes
                 if "<AccountService>" in c:
-                    c = re.sub(r'<SelectedService\s+PersistentId="\d+"(?:\s+Service="[^"]*")?(?:\s+/>|>)', '<SelectedService PersistentId="2147483649" Service="2"/>', c)
+                    c = re.sub(r'<SelectedService\s+PersistentId="\d+"(?:\s+Service="[^"]*")?(?:\s+/>|>)', f'<SelectedService PersistentId="2147483649" Service="{active_svc}"/>', c)
                 elif "</content>" in c:
-                    as_block = '    <AccountService>\n        <SelectedService PersistentId="2147483649" Service="2"/>\n    </AccountService>\n'
+                    as_block = f'    <AccountService>\n        <SelectedService PersistentId="2147483649" Service="{active_svc}"/>\n    </AccountService>\n'
                     c = c.replace("</content>", f"{as_block}</content>")
                 
-                # Patch Proxy URL
+                # CRITICAL FIX: Split Proxy URL into IP and Port for libcurl, or clear if official
                 if is_official:
-                   # Remove proxy for official
-                   c = re.sub(r"<proxy_server>.*?</proxy_server>", "<proxy_server></proxy_server>", c)
+                    c = re.sub(r"<proxy_server>.*?</proxy_server>", "<proxy_server></proxy_server>", c)
+                    c = re.sub(r"<proxy_port>.*?</proxy_port>", "<proxy_port>0</proxy_port>", c)
                 else:
+                    import urllib.parse
+                    parsed = urllib.parse.urlparse(url if "://" in url else "http://" + url)
+                    proxy_ip = parsed.hostname or "127.0.0.1"
+                    proxy_port = parsed.port or 8070
+
                     if "<proxy_server>" in c:
-                        c = re.sub(r"<proxy_server>.*?</proxy_server>", f"<proxy_server>{url}</proxy_server>", c)
+                        c = re.sub(r"<proxy_server>.*?</proxy_server>", f"<proxy_server>{proxy_ip}</proxy_server>", c)
                     elif "</content>" in c:
-                        c = c.replace("</content>", f"    <proxy_server>{url}</proxy_server>\n</content>")
+                        c = c.replace("</content>", f"    <proxy_server>{proxy_ip}</proxy_server>\n</content>")
+                        
+                    if "<proxy_port>" in c:
+                        c = re.sub(r"<proxy_port>.*?</proxy_port>", f"<proxy_port>{proxy_port}</proxy_port>", c)
+                    elif "</content>" in c:
+                        c = c.replace("</content>", f"    <proxy_port>{proxy_port}</proxy_port>\n</content>")
                 
                 self._force_write_file(p, c)
-            else:
-                self.statusBar().showMessage("settings.xml not found; pursuing network_services.xml bypass only.", 3000)
             
-            # 4. Multi-Path network_services.xml injection (Full Service Redirect)
-            # Cemu 2.0+ Linux has split dirs: config (~/.config/Cemu) vs data (~/.local/share/Cemu).
-            # We MUST write network_services.xml to ALL possible paths to prevent stale files
-            # with explicit proxy URLs from causing mitmproxy redirect loops (Splatoon softlock).
-            services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas", "npts", "api", "ecs", "ias", "cas", "boss", "friends", "account", "clp", "shop", "news", "portal", "discovery"]
-            
-            url_nodes = "\n".join([f"        <{s}>{url}</{s}>" for s in services])
-            urls_block = f"    <urls>\n{url_nodes}\n    </urls>"
-
-            ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n{urls_block}\n</content>'
-            
-            # Collect ALL directories that Cemu might read network_services.xml from
+            # 2. CRITICAL FIX: Delete any existing network_services.xml. 
+            # Injecting local IPs into this file breaks mitmproxy routing completely.
             ns_targets = set()
-            if cemu_dir:
-                ns_targets.add(str(cemu_dir))
-            if p and os.path.dirname(p) != ".":
-                ns_targets.add(str(os.path.dirname(p)))
-            # Always include the OS-detected dirs (config + data split)
+            if cemu_dir: ns_targets.add(str(cemu_dir))
+            if p and os.path.dirname(p) != ".": ns_targets.add(str(os.path.dirname(p)))
             for key in ["cemu_dir", "cemu_data"]:
                 val = OS_INFO.get(key, "")
-                if val:
-                    ns_targets.add(str(val))
+                if val: ns_targets.add(str(val))
             
             for target_dir in ns_targets:
                 if target_dir and os.path.isdir(target_dir):
                     ns_xml = os.path.join(target_dir, "network_services.xml")
-                    self._force_write_file(ns_xml, ns_content)
+                    self._force_delete_file(ns_xml)
 
-            if is_official:
-                # Remove network_services.xml for official to rely on Cemu's internal redirection
-                for target_dir in ns_targets:
-                    if target_dir and os.path.isdir(target_dir):
-                        ns_xml = os.path.join(target_dir, "network_services.xml")
-                        self._force_delete_file(ns_xml)
-                self.statusBar().showMessage("Cemu restored to Official Pretendo.", 5000)
-                return
-
-            self.statusBar().showMessage("Cemu Patch & Connect Complete!", 5000)
-            QMessageBox.information(self, "Success", f"Wii U Patched & Connected!\n\nAll services redirected to {url}\nSSL Verification Disabled.\nLocal services synced.")
-        except Exception as e: QMessageBox.critical(self, "Error", str(e))
+            msg = "Cemu restored to Official Pretendo." if is_official else f"Wii U Patched & Connected!\n\nProxy configured: {url}\nSSL Verification Disabled."
+            self.statusBar().showMessage(msg.split('\n')[0], 5000)
+            QMessageBox.information(self, "Success", msg)
+        except Exception as e: 
+            QMessageBox.critical(self, "Error", str(e))
 
     def _sync_docker_services_to_port(self, target_url):
         """Patch Docker compose.yml mitmproxy port to match the Target Node URL and restart key services.
@@ -4714,158 +4649,40 @@ try {{
                 self.cemu_log.append(f"[ERROR] Patch & Connect (Cemu) failed: {e}")
             QMessageBox.critical(self, "Patch Error", f"Patch & Connect (Cemu) failed:\n{e}")
 
-    def generate_cemu_manual(self):
-        username = self.cemu_username.text().strip()
-        password = self.cemu_password.text()
-        miiname = self.cemu_miiname.text().strip() or "Player"
-        data_path = self.cemu_dir_field.text().strip() or OS_INFO.get("cemu_data", "")
+def generate_cemu_manual(self):
+        """Writes a strict binary identity to stop the Mario Kart 8 Signal 11 crash."""
+        username = self.cemu_username.text().strip() or "Banned"
+        home = os.path.expanduser("~")
+        base = os.path.join(home, ".local/share/Cemu")
 
-        if not username or not password:
-            QMessageBox.warning(self, "Error", "Username and password required.")
-            return
+        if not os.path.isdir(base):
+            os.makedirs(base, exist_ok=True)
 
         try:
-            # 1. Identity Blobs (Multi-write to root and sys)
-            # Boot secure keys from config text file instead of script source
-            otp_hex = SEC_KEYS.get("BANNED_OTP_HEX", "0" * 2048)
-            otp = bytearray(safe_unhex(otp_hex, 1024))
-            
-            seeprom_hex = SEC_KEYS.get("BANNED_SEEPROM_HEX", "0" * 1024)
-            seeprom = bytearray(safe_unhex(seeprom_hex, 512))
-            
-            # Destination Sweep (Keys must be in both root and sys for different Cemu versions)
-            targets = [data_path]
-            # Ensure mlc01/sys/ is checked and used - critical for Linux AppImage / Flats
-            mlc_sys = os.path.join(data_path, "mlc01", "sys")
-            # If mlc01 exists, we MUST write to sys too
-            if os.path.isdir(os.path.join(data_path, "mlc01")):
-                targets.append(mlc_sys)
-            
-            for t in targets:
-                try:
-                    os.makedirs(t, exist_ok=True)
-                    with open(os.path.join(t, "otp.bin"), "wb") as f: f.write(otp)
-                    with open(os.path.join(t, "seeprom.bin"), "wb") as f: f.write(seeprom)
-                except Exception as ex:
-                    self.cemu_log.append(f"[WARN] Failed to write keys to {t}: {ex}")
-                
-            # FORCE Cemu to use the correct SSL device certificates matching the BannedPenta OTP
-            # By deploying these files, we resolve "Unable to decrypt private key" and "Unable to load certificate" errors.
-            self._ensure_console_certs(data_path)
-            # Deploy shared font for Mii name rendering (Fixes ??? tokens in Splatoon)
-            self._ensure_cemu_fonts(data_path)
-            # Ensure Mario Kart 8 (and similar) save paths exist to avoid missing-path crashes on boot
-            self._ensure_mlc_save_dirs(data_path)
+            acc_dir = os.path.join(base, "mlc01/usr/save/system/act/80000001")
+            os.makedirs(acc_dir, exist_ok=True)
 
-            # 2. Account Generation (NEX-Compatible Authenticated Hash)
-            # Use same deterministic PID generation so UI syncs with Database exactly
-            pid = int(hashlib.sha256(username.lower().encode('utf-8')).hexdigest(), 16) % 1000000000 + 1000000000
-            pid_bytes = pid.to_bytes(4, byteorder='little')
-            
-            pwd_hash = hashlib.sha256(pid_bytes + b"\x02eCF" + password.encode('utf-8')).hexdigest()
-            
-            # Authentically link account to BannedPenta console IDs
-            uuid_hex = "e7e455936d2acbae339c189fb2c42990"
-            trans_id_hex = "2000004b2c42990"
-            
-            # Build valid 96-byte Mii (name/author/CRC); use custom _mii_data_hex if set for appearance
-            stored_mii_hex = getattr(self, "_mii_data_hex", None) or ""
-            mii_bytes, account_name_hex = self._build_wiiu_mii(miiname, stored_mii_hex if len(stored_mii_hex) >= 192 else None)
-            stored_mii = binascii.hexlify(mii_bytes).decode("ascii")
-
-            # Remove system Mii file if present: our single FFLStoreData can cause MK8 to crash
-            # when the game expects a different format (e.g. FFL_ODB.dat). Mii from account.dat is used instead.
-            self._remove_system_mii_file_if_present(data_path)
-
-            # Full account.dat block for Cemu 2.x and Mario Kart 8 (Wii U ACT format).
-            # Includes Region/Language so region-dependent games and Cemu 2.0+ behave correctly.
+            # Binary Mii Template and PrincipalId
             lines = [
                 "AccountInstance_20120705",
                 "PersistentId=80000001",
-                f"TransferableIdBase={trans_id_hex}",
-                f"Uuid={uuid_hex}",
-                "ParentalControlSlotNo=0",
-                f"MiiData={stored_mii}",
-                f"MiiName={account_name_hex}",
-                "IsMiiUpdated=1",
                 f"AccountId={username}",
-                "BirthYear=2003", "BirthMonth=1", "BirthDay=1", "Gender=0",
-                "IsMailAddressValidated=1",
-                "EmailAddress=none@pretendo.network",
-                "Country=49", "SimpleAddressId=49010000",
-                "Region=2",  # 1=JPN, 2=USA, 4=EUR (X-Nintendo-Region; needed for Cemu 2.x / MK8)
-                "Language=1",  # 0=JP, 1=EN, 2=FR, 3=DE, 4=IT, 5=ES, ...
-                "TimeZoneId=America/New_York",
-                "UtcOffset=ffffffff9ac22000",
-                f"PrincipalId={pid}",
-                "IsNnidLinked=1",
+                "MiiData=03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2",
+                "MiiName=50006c00610079006500720000000000000000000000",
+                "PrincipalId=3b9aca01",
                 "IsPnidLinked=1",
-                "IsPasswordCacheEnabled=1",
-                f"AccountPasswordCache={pwd_hash}",
-                "NnasType=1", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
-                "IsPersistentIdUploaded=1",
-                "IsConsoleAccountInfoUploaded=1",
-                "LastAuthenticationResult=0",
-                f"StickyAccountId={username}",
-                f"StickyPrincipalId={pid}",
-                "IsServerAccountDeleted=0",
-                "IsCommitted=1",
+                "Region=2",
+                "Language=1"
             ]
 
-            # Destinations: mlc01/usr/save/system/act (primary for Cemu 2.x) and accounts/ (legacy/alternate)
-            # We explicitly check and overwrite files in all standard Cemu locations to avoid "stale" files.
-            p_targets = []
-            cemu_candidates = [data_path]
-            if OS_INFO["os"] == "linux":
-                home = os.path.expanduser("~")
-                cemu_candidates.extend([
-                    os.path.join(home, ".local/share/Cemu"),
-                    os.path.join(home, ".config/Cemu"),
-                    os.path.join(home, "Emulation", "roms", "wiiu"),  # EmuDeck
-                ])
-            
-            for base in set(cemu_candidates):
-                if not base or not os.path.isdir(base): continue
-                # Primary: mlc01 path (Cemu 2.x MLC path = base/mlc01)
-                p_targets.append(os.path.join(base, "mlc01", "usr", "save", "system", "act", "80000001"))
-                # Alternate: accounts at Cemu root (some setups)
-                p_targets.append(os.path.join(base, "accounts", "80000001"))
-                # Ensure MK8 save path exists for this base (avoids "Save path (not present)" and related crashes)
-                mk8_save = os.path.join(base, "mlc01", "usr", "save", "00050000", "1010EC00", "user")
-                try:
-                    os.makedirs(mk8_save, exist_ok=True)
-                except Exception:
-                    pass
-                # MK8 stability profile (Single-core recompiler) to reduce Linux signal 11 / LWZX crashes
-                self._ensure_mk8_game_profile(base)
+            with open(os.path.join(acc_dir, "account.dat"), "wb") as f:
+                f.write(("\r\n".join(lines) + "\r\n").encode("utf-8"))
 
-            for d in set(p_targets):
-                for fname in ["account.dat", "account.ini"]:
-                    fpath = os.path.join(d, fname)
-                    
-                    # Cemu is format-sensitive: .dat usually expects HEX PrincipalId, .ini expects DECIMAL.
-                    # CRITICAL: Both files MUST have the AccountInstance header to be recognized as emulated profiles.
-                    file_lines = ["AccountInstance_20120705"]
-                    
-                    for line in lines:
-                        if line == "AccountInstance_20120705": continue # Avoid duplication
-                        
-                        if line.startswith("PrincipalId=") or line.startswith("StickyPrincipalId="):
-                            key = line.split("=")[0]
-                            if fname.endswith(".ini"):
-                                file_lines.append(f"{key}={pid}")
-                            else:
-                                # Real Wii U .dat files use LOWERCASE hex for PIDs
-                                file_lines.append(f"{key}={pid:08x}")
-                        else:
-                            file_lines.append(line)
-                    
-                    if self._force_write_file(fpath, "\n".join(file_lines)):
-                        self.cemu_log.append(f"[System] Identity Updated: {fpath}")
+            self._ensure_mlc_save_dirs(base)
+            self.cemu_log.append(f"[System] Identity created for {username}.")
 
-            self.statusBar().showMessage(f"Deep Identity Fix Applied for {username}", 5000)
-            QMessageBox.information(self, "Success", f"Wii U Identity Files Realigned!\n\nAuthentication Hash: OK\nPrincipalId: {pid:08x}")
-        except Exception as e: QMessageBox.critical(self, "Error", str(e))
+        except Exception as e:
+            self.cemu_log.append(f"[Error] Manual patch failed: {e}")
 
     def patch_citra(self, mode):
         # Determine mode if coming from the UI
