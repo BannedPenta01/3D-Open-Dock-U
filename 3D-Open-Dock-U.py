@@ -43,29 +43,6 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-# region agent log helper
-def _agent_debug_log(hypothesis_id, location, message, data=None, run_id="initial"):
-    """Lightweight NDJSON logger for debug-mode instrumentation."""
-    try:
-        import json as _json
-        import time as _time
-        payload = {
-            "sessionId": "08b005",
-            "id": f"log_{int(_time.time() * 1000)}_{hypothesis_id}",
-            "timestamp": int(_time.time() * 1000),
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-        }
-        with open("/home/jan/Dev/.cursor/debug-08b005.log", "a") as _f:
-            _f.write(_json.dumps(payload) + "\n")
-    except Exception:
-        # Instrumentation must never break the app
-        pass
-# endregion
-
 # ─── Constants ────────────────────────────────────────────────────────────────
 APP_NAME = "3D Open Dock U"
 APP_VERSION = "1.1.0"
@@ -191,7 +168,7 @@ def _install_wsl2():
         # Use 'wsl --install' which handles both the WSL2 feature and Ubuntu distro
         res = subprocess.run(
             ["powershell", "-Command",
-            "Start-Process 'wsl' -ArgumentList '--install' -Verb RunAs -Wait"],
+             "Start-Process 'wsl' -ArgumentList '--install' -Verb RunAs -Wait"],
             capture_output=True, text=True, timeout=600
         )
         if res.returncode == 0:
@@ -232,41 +209,63 @@ def detect_os_info():
 
     if system == "linux":
         info["server_dir"] = os.path.join(home, "pretendo-docker")
-        # Direct path for AppImage/Generic Linux
-        info["cemu_dir"] = os.path.join(home, ".local/share/Cemu")
-        info["cemu_data"] = os.path.join(home, ".local/share/Cemu")
-
-        # Check for Flatpak
-        if os.path.isdir(os.path.join(home, ".var/app/info.cemu.Cemu")):
-            info["cemu_dir"] = os.path.join(home, ".var/app/info.cemu.Cemu/data/Cemu")
-            info["cemu_data"] = info["cemu_dir"]
-
-        info["cemu_settings"] = os.path.join(info["cemu_dir"], "settings.xml")
-        info["distro"] = "Linux"
+        if shutil.which("pacman"):
+            info["pkg_mgr"], info["pkg_install"], info["distro"] = "pacman", "pacman -S --noconfirm docker docker-compose", "Arch Linux"
+        elif shutil.which("apt"):
+            info["pkg_mgr"], info["pkg_install"], info["distro"] = "apt", "apt install -y docker.io docker-compose", "Debian/Ubuntu"
+        elif shutil.which("dnf"):
+            info["pkg_mgr"], info["pkg_install"], info["distro"] = "dnf", "dnf install -y docker docker-compose", "Fedora/RHEL"
+        
+        flatpak_cemu = os.path.join(home, ".var/app/info.cemu.Cemu/data/Cemu")
+        config_cemu = os.path.join(home, ".config/Cemu")
+        local_cemu = os.path.join(home, ".local/share/Cemu")
+        
+        # Dual-path support for Cemu 2.0+ Linux
+        if os.path.isdir(config_cemu):
+            info["cemu_dir"] = config_cemu # Configuration
+            info["cemu_data"] = local_cemu if os.path.isdir(local_cemu) else config_cemu # MLC/Keys
+        else:
+            info["cemu_dir"] = local_cemu
+            info["cemu_data"] = local_cemu
+        
+        c_dir = info["cemu_dir"]
+        info["cemu_settings"] = os.path.join(str(c_dir), "settings.xml") if c_dir else ""
+        
+        citra_paths = [
+            os.path.join(home, ".config/citra-emu/config/qt-config.ini"),
+            os.path.join(home, ".var/app/org.citra_emu.citra/config/citra-emu/config/qt-config.ini"),
+            os.path.join(home, ".config/lime-3ds/config/qt-config.ini"),
+            os.path.join(home, ".config/azahar-emu/qt-config.ini"),
+            os.path.join(home, ".config/EmuDeck/backend/configs/citra-emu/qt-config.ini"),
+            os.path.join(home, ".config/EmuDeck/backend/configs/azahar/qt-config.ini")
+        ]
+        for p in citra_paths:
+            if os.path.exists(p):
+                info["citra_config"] = p
+                break
     elif system == "darwin":
         info["server_dir"] = os.path.join(home, "pretendo-docker")
         info["distro"] = "macOS"
         info["cemu_dir"] = os.path.join(home, "Library/Application Support/Cemu")
         info["cemu_settings"] = os.path.join(info["cemu_dir"], "settings.xml")
-
     elif system == "windows":
         userprofile = os.environ.get("USERPROFILE", "C:\\Users\\User")
         info["server_dir"] = os.path.join(userprofile, "pretendo-docker")
         info["distro"] = "Windows"
-
+        
         # Detect WSL2
         info["has_wsl"] = _wsl_installed()
         info["has_wsl_distro"] = _wsl_distro_installed()
         info["wsl_distro"] = _get_default_wsl_distro()
-
+        
         # Detect Docker Desktop
         info["has_docker_desktop"] = _docker_desktop_running()
         info["docker_available"] = _docker_available()
-
+        
         # Cemu paths on Windows
         appdata = os.environ.get("APPDATA", "")
         localappdata = os.environ.get("LOCALAPPDATA", "")
-
+        
         # Check multiple Cemu locations on Windows
         cemu_candidates = []
         if appdata:
@@ -277,7 +276,7 @@ def detect_os_info():
         for drive in ["C:", "D:", "E:"]:
             cemu_candidates.append(os.path.join(drive, os.sep, "Cemu"))
             cemu_candidates.append(os.path.join(drive, os.sep, "Games", "Cemu"))
-
+        
         found_cemu = ""
         for cand in cemu_candidates:
             if os.path.isdir(cand):
@@ -285,12 +284,12 @@ def detect_os_info():
                 break
         if not found_cemu and appdata:
             found_cemu = os.path.join(appdata, "Cemu")
-
+        
         info["cemu_dir"] = found_cemu
         info["cemu_data"] = found_cemu  # Windows Cemu uses single directory
         c_dir = info["cemu_dir"] or ""
         info["cemu_settings"] = os.path.join(c_dir, "settings.xml") if c_dir else ""
-
+        
         citra_paths = []
         if appdata:
             citra_paths.extend([
@@ -330,7 +329,7 @@ def load_security_keys():
     k_dir = os.path.join(OS_INFO.get("appdata") or os.path.expanduser("~"), ".config", "OpenDock")
     os.makedirs(k_dir, exist_ok=True)
     fpath = os.path.join(k_dir, "identity_secrets.txt")
-
+    
     d_keys = {
         "WIIU_COMMON_KEY": "d7b00402659ba2abd2cb0db27fa2b197",
         "WIIU_STARBUCK_ANCAST": "d8b4970a7ed12e1002a0c4bf89bee171740d268b",
@@ -347,14 +346,14 @@ def load_security_keys():
         # Restrict permissions so only the owner can read
         if platform.system() != "Windows": os.chmod(fpath, 0o600)
         return d_keys
-
+        
     loaded = {}
     with open(fpath, "r") as f:
         for line in f:
             if '=' in line and not line.startswith('#'):
                 k, v = line.strip().split('=', 1)
                 loaded[k] = v
-
+                
     # Auto-repair missing keys
     changed = False
     for k, v in d_keys.items():
@@ -418,7 +417,7 @@ TITLE_MAP = {
     "00050000-10102400": "Hyrule Warriors",
     "00050000-10110300": "TLoZ: Skyward Sword",
     "00050000-101c4f00": "Xenoblade Chronicles X",
-    "00050000-10191b00": "Pokk\u00e9n Tournament"
+    "00050000-101df400": "Pokkén Tournament"
 }
 
 STYLESHEET = f"""
@@ -470,10 +469,10 @@ class CommandWorker(QThread):
                 "universal_newlines": True
             }
             if OS_INFO["os"] == "windows":
-                popen_kwargs["creationflags"] = 0x08000000
-
+                popen_kwargs["creationflags"] = 0x08000000 
+                
             proc = subprocess.Popen(self.cmd, **popen_kwargs)
-
+            
             if self.stdin_data is not None and proc.stdin:
                 # Send password with multiple newlines to handle sudo's prompt correctly
                 # We send it twice to handle cases where sudo might re-prompt
@@ -488,7 +487,7 @@ class CommandWorker(QThread):
                 if not line:
                     break
                 self.output.emit(self._colorize_log(line.strip()))
-
+            
             proc.wait()
             self.finished.emit(proc.returncode)
         except Exception as e:
@@ -529,104 +528,53 @@ class ErrorPopupDialog(QDialog):
         self.setWindowTitle("Critical Server Error Detected")
         self.setMinimumWidth(650)
         self.setStyleSheet(STYLESHEET)
-
+        
         layout = QVBoxLayout(self)
-
+        
         header = QHBoxLayout()
         icon = QLabel("⚠️")
         icon.setStyleSheet("font-size: 32px;")
         header.addWidget(icon)
-
+        
         title_text = QLabel("A Problematic Server Log was Detected")
         title_text.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {RED_LIGHT};")
         header.addWidget(title_text, 1)
         layout.addLayout(header)
-
+        
         desc = QLabel("The following error was captured from the server logs while the session was active. "
-                    "This usually indicates a database connection failure, a crash, or an authentication timeout "
-                    "that might disconnect your game.")
+                     "This usually indicates a database connection failure, a crash, or an authentication timeout "
+                     "that might disconnect your game.")
         desc.setWordWrap(True)
         desc.setStyleSheet(f"color: {TEXT_SECONDARY}; margin-bottom: 10px;")
         layout.addWidget(desc)
-
+        
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
         self.text_edit.setPlainText(error_msg)
         self.text_edit.setStyleSheet(f"background: {BG_INPUT}; color: {CYAN_LIGHT}; font-family: monospace; border: 1px solid {RED_DARK};")
         self.text_edit.setMinimumHeight(150)
         layout.addWidget(self.text_edit)
-
+        
         hint = QLabel("You can select and copy the text above, or use the button below to copy the full report.")
         hint.setStyleSheet("font-size: 11px; color: #8888AA; font-style: italic;")
         layout.addWidget(hint)
-
+        
         btn_layout = QHBoxLayout()
         copy_btn = QPushButton("Copy Report to Clipboard")
         copy_btn.setStyleSheet(f"background: {BG_CARD_HOVER}; border-color: {CYAN_PRIMARY};")
         copy_btn.clicked.connect(self.copy_to_clip)
         btn_layout.addWidget(copy_btn)
-
+        
         close_btn = QPushButton("Dismiss")
         close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
-
+        
         layout.addLayout(btn_layout)
-
+        
     def copy_to_clip(self):
         full_text = f"--- 3D Open Dock U CRITICAL ERROR REPORT ---\nTimestamp: {datetime.now().isoformat()}\nDetected Log Line:\n{self.text_edit.toPlainText()}\n--------------------------------------------"
         QApplication.clipboard().setText(full_text)
         QMessageBox.information(self, "Copied", "Error report copied to clipboard.")
-
-class StatusWorker(QThread):
-    status_updated = Signal(dict)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.running = True
-        self.last_ip = "127.0.0.1"
-        self.os_info = OS_INFO
-
-    def run(self):
-        import socket
-        import subprocess
-        count = 0
-        while self.running:
-            status = {}
-            # 1. IP Detection (Every 3 ticks / 15s or if last was local)
-            if count % 3 == 0 or self.last_ip == "127.0.0.1":
-                ip = "127.0.0.1"
-                for target in [("8.8.8.8", 80), ("1.1.1.1", 80), ("192.168.1.1", 80)]:
-                    try:
-                        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                        s.settimeout(0.5)
-                        s.connect(target)
-                        ip = s.getsockname()[0]
-                        s.close()
-                        if ip != "127.0.0.1": break
-                    except: continue
-                self.last_ip = ip
-            status["ip"] = self.last_ip
-
-            # 2. Docker Status
-            server_running = False
-            docker_available = False
-            try:
-                flags = 0x08000000 if self.os_info["os"] == "windows" else 0
-                res = subprocess.run(["docker", "info"], capture_output=True, timeout=2, creationflags=flags)
-                docker_available = (res.returncode == 0)
-                if docker_available:
-                    res = subprocess.run(["docker", "ps", "--filter", "name=pretendo", "--format", "{{.Names}}"],
-                                        capture_output=True, text=True, timeout=1)
-                    server_running = bool(res.stdout.strip())
-            except: pass
-
-            status["server_running"] = server_running
-            status["docker_available"] = docker_available
-            self.status_updated.emit(status)
-            for _ in range(50):
-                if not self.running: break
-                time.sleep(0.1)
-            count += 1
 
 class SudoPasswordDialog(QDialog):
     def __init__(self, parent=None, current_pw=""):
@@ -637,12 +585,12 @@ class SudoPasswordDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Sudo Access Required", styleSheet="font-size: 18px; font-weight: bold;"))
         layout.addWidget(QLabel("Enter your Linux password:"))
-
+        
         pass_row = QHBoxLayout()
         self.pass_field = QLineEdit(current_pw)
         self.pass_field.setEchoMode(QLineEdit.Password)
         pass_row.addWidget(self.pass_field)
-
+        
         self.eye_btn = QPushButton("👁")
         self.eye_btn.setCheckable(True)
         self.eye_btn.setFixedSize(32, 32)
@@ -655,18 +603,18 @@ class SudoPasswordDialog(QDialog):
         self.remember_cb.setStyleSheet("color: #8888AA;")
         self.remember_cb.setChecked(True)
         layout.addWidget(self.remember_cb)
-
+        
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
-
+        
     def toggle_visibility(self):
         if self.eye_btn.isChecked():
             self.pass_field.setEchoMode(QLineEdit.Normal)
         else:
             self.pass_field.setEchoMode(QLineEdit.Password)
-
+            
     def get_data(self):
         return self.pass_field.text(), self.remember_cb.isChecked()
 
@@ -676,10 +624,6 @@ class PretendoManager(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(960, 720)
         self.worker = None
-        self.status_worker = StatusWorker(self)
-        self.status_worker.status_updated.connect(self._handle_status_update)
-        self.status_worker.start()
-
         self.cached_password: Optional[str] = None
         self.server_running = False
         self.docker_service_running = False
@@ -689,17 +633,18 @@ class PretendoManager(QMainWindow):
         self.command_lock_count = 0
         self.last_popup_time = 0
         self.seen_errors = {} # error -> timestamp
+        self.session_start_time = None # Track when containers were started
 
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-
+        
         # Header
         title = QLabel(f'<span style="color:{RED_PRIMARY};">3D</span> <span style="color:white;">Open Dock</span> <span style="color:{CYAN_PRIMARY};">U</span>')
         title.setStyleSheet("font-size: 36px; font-weight: bold;")
         title.setAlignment(Qt.AlignCenter)
         root.addWidget(title)
-
+        
         sep = QFrame(objectName="separator")
         sep.setFrameShape(QFrame.HLine)
         root.addWidget(sep)
@@ -713,7 +658,7 @@ class PretendoManager(QMainWindow):
         # Footer Credits & Reset
         footer_layout = QHBoxLayout()
         footer_layout.setContentsMargins(10, 0, 10, 10)
-
+        
         self.atomic_btn = QPushButton("ATOMIC SHUTDOWN & EXIT")
         self.atomic_btn.setStyleSheet(f"font-size: 10px; color: white; background: {RED_DARK}; border: 1px solid {RED_PRIMARY}; padding: 4px 12px; font-weight: bold; border-radius: 4px;")
         self.atomic_btn.setToolTip("Force-stops the server, disables Docker, and quits the application.")
@@ -724,36 +669,24 @@ class PretendoManager(QMainWindow):
         footer.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
         footer.setAlignment(Qt.AlignCenter)
         footer_layout.addWidget(footer, 1)
-
+        
         self.reset_data_btn = QPushButton("Reset Sensitive Data")
         self.reset_data_btn.setStyleSheet(f"font-size: 10px; color: {RED_LIGHT}; border: 1px solid {RED_DARK}; padding: 4px 8px; background: transparent;")
         self.reset_data_btn.clicked.connect(self.clear_sensitive_data)
         footer_layout.addWidget(self.reset_data_btn)
-
+        
         root.addLayout(footer_layout)
-
-        # Start in windowed fullscreen (maximized) every time
-        self.setWindowState(Qt.WindowMaximized)
 
         self.statusBar().setStyleSheet(f"background: {BG_CARD}; color: {TEXT_SECONDARY}; padding: 4px;")
         self.statusBar().showMessage(f"{APP_NAME} v{APP_VERSION} - Ready")
         self.load_settings()
         self.last_connectivity_state = (self._get_local_ip() != "127.0.0.1")
-
+        
         # Start Heartbeat Timer (Checks status & Connectivity every 5s)
         self.heartbeat = QTimer()
         self.heartbeat.timeout.connect(self._on_status_tick)
         self.heartbeat.start(5000)
         self._on_status_tick()
-
-        # region agent log
-        _agent_debug_log(
-            "H1",
-            "3D-Open-Dock-U.py:PretendoManager.__init__",
-            "PretendoManager initialized",
-            {},
-        )
-        # endregion
 
     def load_settings(self):
         """Load user configurations from persistent storage with signal blocking to prevent recursive save cycles."""
@@ -761,53 +694,43 @@ class PretendoManager(QMainWindow):
         self.cemu_username.blockSignals(True)
         self.cemu_password.blockSignals(True)
         self.cemu_miiname.blockSignals(True)
-        if getattr(self, 'cemu_mii_hex', None): self.cemu_mii_hex.blockSignals(True)
-        if getattr(self, 'server_sudo_pass', None): self.server_sudo_pass.blockSignals(True)
-        if getattr(self, 'cemu_dir_field', None): self.cemu_dir_field.blockSignals(True)
-        if getattr(self, 'citra_dir_field', None): self.citra_dir_field.blockSignals(True)
+        if hasattr(self, 'server_sudo_pass'): self.server_sudo_pass.blockSignals(True)
+        if hasattr(self, 'cemu_dir_field'): self.cemu_dir_field.blockSignals(True)
+        if hasattr(self, 'citra_dir_field'): self.citra_dir_field.blockSignals(True)
 
         try:
             self.cemu_username.setText(str(self.settings.value("username", "")))
-
+            
             # Passwords decode (Base64)
             dec_pw = _deobs(self.settings.value("password", ""))
             self.cemu_password.setText(dec_pw)
-
+            
             self.cemu_miiname.setText(str(self.settings.value("miiname", "")))
-
-            mii_h = str(self.settings.value("mii_hex", "")).strip().replace(" ", "")
-            if getattr(self, 'cemu_mii_hex', None):
-                self.cemu_mii_hex.setText(mii_h)
-            if mii_h:
-                setattr(self, '_mii_data_hex', mii_h[:192])
-
-            if getattr(self, 'cemu_dir_field', None):
+            
+            if hasattr(self, 'cemu_dir_field'):
                 self.cemu_dir_field.setText(str(self.settings.value("cemu_dir", CEMU_DIR)))
-            if getattr(self, 'citra_dir_field', None):
+            if hasattr(self, 'citra_dir_field'):
                 self.citra_dir_field.setText(str(self.settings.value("citra_dir", "")))
 
             saved_sudo = self.settings.value("sudo_cache", None)
             self.cached_password = _deobs(saved_sudo) if saved_sudo else None
-
-            if self.cached_password and getattr(self, 'server_sudo_pass', None):
+            
+            if self.cached_password and hasattr(self, 'server_sudo_pass'):
                 self.server_sudo_pass.setText(str(self.cached_password))
+                
+            mii_h = self.settings.value("mii_hex", "")
+            if mii_h: setattr(self, '_mii_data_hex', mii_h)
         finally:
             # Re-enable signals
             self.cemu_username.blockSignals(False)
             self.cemu_password.blockSignals(False)
             self.cemu_miiname.blockSignals(False)
-            if getattr(self, 'cemu_mii_hex', None): self.cemu_mii_hex.blockSignals(False)
-            if getattr(self, 'server_sudo_pass', None): self.server_sudo_pass.blockSignals(False)
-            if getattr(self, 'cemu_dir_field', None): self.cemu_dir_field.blockSignals(False)
-            if getattr(self, 'citra_dir_field', None): self.citra_dir_field.blockSignals(False)
+            if hasattr(self, 'server_sudo_pass'): self.server_sudo_pass.blockSignals(False)
+            if hasattr(self, 'cemu_dir_field'): self.cemu_dir_field.blockSignals(False)
+            if hasattr(self, 'citra_dir_field'): self.citra_dir_field.blockSignals(False)
 
         self.refresh_vault_list()
-        # Ensure MK8 save path exists for default Cemu locations so Cemu does not report "Save path (not present)"
-        try:
-            self._ensure_mlc_save_dirs("")
-        except Exception:
-            pass
-
+        
     def _pick_dir(self, field, title):
         dlg = QFileDialog(self, title, field.text())
         dlg.setFileMode(QFileDialog.Directory)
@@ -826,22 +749,22 @@ class PretendoManager(QMainWindow):
         self.settings.setValue("username", self.cemu_username.text())
         self.settings.setValue("password", _obs(self.cemu_password.text()))
         self.settings.setValue("miiname", self.cemu_miiname.text())
-
-        if getattr(self, 'cemu_dir_field', None):
+        
+        if hasattr(self, 'cemu_dir_field'):
             self.settings.setValue("cemu_dir", self.cemu_dir_field.text())
-        if getattr(self, 'citra_dir_field', None):
+        if hasattr(self, 'citra_dir_field'):
             self.settings.setValue("citra_dir", self.citra_dir_field.text())
-
+        
         # Always persist sudo password if entered, heavily obfuscated
-        if getattr(self, 'server_sudo_pass', None):
+        if hasattr(self, 'server_sudo_pass'):
             sudo_pw = self.server_sudo_pass.text()
             if sudo_pw:
                 self.settings.setValue("sudo_cache", _obs(sudo_pw))
                 self.cached_password = sudo_pw
-
-        mii_h = (getattr(self, 'cemu_mii_hex', None) and self.cemu_mii_hex.text().strip().replace(" ", "")) or getattr(self, '_mii_data_hex', "")
-        self.settings.setValue("mii_hex", (mii_h[:192] if mii_h else ""))
-
+        
+        mii_h = getattr(self, '_mii_data_hex', "")
+        if mii_h: self.settings.setValue("mii_hex", mii_h)
+        
         self.settings.sync()
 
     def _get_target_port(self):
@@ -881,14 +804,14 @@ class PretendoManager(QMainWindow):
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0,0,0,0)
-
+        
         group = QGroupBox("Network Status & Node")
         glay = QVBoxLayout(group)
         self.status_label = QLabel("OFFLINE")
         self.status_label.setStyleSheet(f"color: {RED_PRIMARY}; font-size: 24px; font-weight: bold;")
         self.status_label.setAlignment(Qt.AlignCenter)
         glay.addWidget(self.status_label)
-
+        
         self.ip_info = QLabel(f"Local Network IP: {self._get_local_ip()}")
         self.ip_info.setStyleSheet(f"color: {CYAN_LIGHT}; font-size: 16px;")
         self.ip_info.setAlignment(Qt.AlignCenter)
@@ -904,38 +827,36 @@ class PretendoManager(QMainWindow):
         self.server_toggle_btn.setMinimumHeight(50)
         self.server_toggle_btn.clicked.connect(self.toggle_server)
         glay.addWidget(self.server_toggle_btn)
-
+        
         btn_hl = QHBoxLayout()
-        self.copy_server_log_btn = QPushButton("Copy Logs", clicked=self.copy_server_logs)
-        btn_hl.addWidget(self.copy_server_log_btn)
         self.clear_server_log_btn = QPushButton("Clear Logs", clicked=lambda: self.server_log.clear())
         btn_hl.addWidget(self.clear_server_log_btn)
         glay.addLayout(btn_hl)
-
+        
         self.check_result = QLabel("")
         self.check_result.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
         self.check_result.setWordWrap(True)
         glay.addWidget(self.check_result)
-
+        
         lv.addWidget(group)
-
+        
         self.server_log = QTextEdit(objectName="logBox")
         self.server_log.setReadOnly(True)
         lv.addWidget(self.server_log)
-
+        
         h_layout.addWidget(left, 1)
 
         # RIGHT PANE: Setup Infrastructure
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0,0,0,0)
-
+        
         dep = QGroupBox("Infrastructure Deployment")
         dlay = QVBoxLayout(dep)
-
+        
         self.service_toggle_btn = QPushButton("Enable Docker Service", clicked=self.toggle_docker_service)
         dlay.addWidget(self.service_toggle_btn)
-
+        
         row_dir = QHBoxLayout()
         row_dir.addWidget(QLabel("Stack Dir:"))
         self.server_dir_field = QLineEdit(DEFAULT_SERVER_DIR)
@@ -956,7 +877,7 @@ class PretendoManager(QMainWindow):
             self.server_sudo_pass.setPlaceholderText("Enter sudo password (auto-saved)")
             self.server_sudo_pass.textChanged.connect(self.save_settings)
             sudo_row.addWidget(self.server_sudo_pass, 1)
-
+            
             self.dash_sudo_eye = QPushButton("👁")
             self.dash_sudo_eye.setCheckable(True)
             self.dash_sudo_eye.setFixedSize(30, 24)
@@ -966,26 +887,26 @@ class PretendoManager(QMainWindow):
             dlay.addLayout(sudo_row)
         elif OS_INFO["os"] == "windows":
             self.server_sudo_pass = None  # Windows uses UAC elevation, no inline password
-
+            
             # ─── WSL2 Status & Controls ───
             wsl_group = QGroupBox("Windows Subsystem for Linux (WSL2)")
             wsl_lay = QVBoxLayout(wsl_group)
-
+            
             self.wsl_status_label = QLabel("WSL2: Detecting...")
             self.wsl_status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
             wsl_lay.addWidget(self.wsl_status_label)
-
+            
             wsl_btn_row = QHBoxLayout()
             self.install_wsl_btn = QPushButton("Install WSL2 + Ubuntu", clicked=self._install_wsl2_action)
             self.install_wsl_btn.setToolTip("Automatically installs WSL2 and Ubuntu distro (requires admin privileges and a restart).")
             self.install_wsl_btn.setStyleSheet(f"background: #0366d6; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
             wsl_btn_row.addWidget(self.install_wsl_btn)
-
+            
             self.refresh_wsl_btn = QPushButton("Refresh WSL Status", clicked=self._refresh_wsl_status)
             self.refresh_wsl_btn.setStyleSheet(f"border-color: {CYAN_PRIMARY}; padding: 8px;")
             wsl_btn_row.addWidget(self.refresh_wsl_btn)
             wsl_lay.addLayout(wsl_btn_row)
-
+            
             dlay.addWidget(wsl_group)
         else:
             self.server_sudo_pass = None
@@ -997,11 +918,11 @@ class PretendoManager(QMainWindow):
         elif OS_INFO["os"] == "windows":
             row_sys.addWidget(QPushButton("Open PowerShell", clicked=lambda: subprocess.Popen(["powershell", "-NoExit", "-Command", "Write-Host '3D Open Dock U - PowerShell Session'"], creationflags=0x00000010 if _is_windows() else 0)))
             row_sys.addWidget(QPushButton("Open WSL Terminal", clicked=lambda: subprocess.Popen(["wsl"], creationflags=0x00000010 if _is_windows() else 0) if OS_INFO.get("has_wsl") else QMessageBox.warning(self, "WSL2", "WSL2 is not installed. Click 'Install WSL2 + Ubuntu' first.")))
-
+        
         dlay.addLayout(row_sys)
 
         rv.addWidget(dep)
-
+        
         splat = QGroupBox("Splatoon Fixes")
         slay = QVBoxLayout(splat)
         self.patch_rotations_btn = QPushButton("Patch Splatoon Rotations", clicked=self.apply_splatoon_rotation_patch)
@@ -1012,7 +933,7 @@ class PretendoManager(QMainWindow):
         self.setup_log = QTextEdit(objectName="logBox")
         self.setup_log.setReadOnly(True)
         rv.addWidget(self.setup_log)
-
+        
         h_layout.addWidget(right, 1)
         layout.addLayout(h_layout)
         return w
@@ -1026,136 +947,104 @@ class PretendoManager(QMainWindow):
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0,0,0,0)
-
-        cred = QGroupBox("1. Your account (Wii U / 3DS)")
+        
+        cred = QGroupBox("Console Identity Parameters")
         crgl = QVBoxLayout(cred)
-        crgl.addWidget(QLabel("Same username & password for Patch & Connect. Used by Cemu and Citra."))
         form = QFormLayout()
         self.cemu_username = QLineEdit()
         self.cemu_username.setMaxLength(16)
-        self.cemu_username.setPlaceholderText("e.g. BannedPenta — 6–16 chars")
-        self.cemu_username.setToolTip("Pretendo username (PNID). Must match what you use in Patch & Connect and on the server.")
+        self.cemu_username.setPlaceholderText("6-16 chars (alnum, ., -, _)")
         self.cemu_username.textChanged.connect(self.save_settings)
-        form.addRow("Username (PNID):", self.cemu_username)
+        form.addRow("Username:", self.cemu_username)
         self.cemu_password = QLineEdit()
         self.cemu_password.setEchoMode(QLineEdit.Password)
-        self.cemu_password.setToolTip("Password for this Pretendo account. Use a unique password, not your real email password.")
         self.cemu_password.textChanged.connect(self.save_settings)
         form.addRow("Password:", self.cemu_password)
         self.cemu_miiname = QLineEdit()
         self.cemu_miiname.setMaxLength(10)
-        self.cemu_miiname.setPlaceholderText("Display name, max 10 chars")
-        self.cemu_miiname.setToolTip("Name shown on your Mii in games.")
+        self.cemu_miiname.setPlaceholderText("Max 10 chars")
         self.cemu_miiname.textChanged.connect(self.save_settings)
-        form.addRow("Mii name:", self.cemu_miiname)
-        self.cemu_mii_hex = QLineEdit()
-        self.cemu_mii_hex.setPlaceholderText("Optional: 192 hex chars for custom Mii look")
-        self.cemu_mii_hex.setMaxLength(256)
-        self.cemu_mii_hex.setToolTip("Advanced: custom Mii appearance as hex. Leave empty to use Mii name only.")
-        def _on_mii_hex_changed():
-            h = self.cemu_mii_hex.text().strip().replace(" ", "")
-            if len(h) >= 192 and all(c in "0123456789abcdefABCDEF" for c in h[:192]):
-                setattr(self, "_mii_data_hex", h[:192])
-            elif not h:
-                setattr(self, "_mii_data_hex", "")
-            self.save_settings()
-        self.cemu_mii_hex.textChanged.connect(_on_mii_hex_changed)
-        form.addRow("Custom Mii (hex):", self.cemu_mii_hex)
-
+        form.addRow("Mii Name:", self.cemu_miiname)
+        
         # Cemu Dir with folder button
         cemu_dir_layout = QHBoxLayout()
         self.cemu_dir_field = QLineEdit(self.settings.value("cemu_dir", CEMU_DIR))
-        self.cemu_dir_field.setToolTip("Folder where Cemu is installed or where it stores mlc01 (e.g. ~/.local/share/Cemu or Emulation/roms/wiiu).")
         self.cemu_dir_field.textChanged.connect(self.save_settings)
         cemu_dir_layout.addWidget(self.cemu_dir_field)
         self.cemu_dir_btn = QPushButton("📁")
         self.cemu_dir_btn.setFixedSize(30, 24)
         self.cemu_dir_btn.setStyleSheet("padding: 0;")
-        self.cemu_dir_btn.clicked.connect(lambda: self._pick_dir(self.cemu_dir_field, "Select Cemu directory"))
+        self.cemu_dir_btn.clicked.connect(lambda: self._pick_dir(self.cemu_dir_field, "Select Cemu Directory"))
         cemu_dir_layout.addWidget(self.cemu_dir_btn)
-        form.addRow("Cemu directory:", cemu_dir_layout)
+        form.addRow("Cemu Dir:", cemu_dir_layout)
 
         # Citra Dir with folder button
         citra_dir_layout = QHBoxLayout()
         default_citra = OS_INFO.get("citra_config", "")
         self.citra_dir_field = QLineEdit(self.settings.value("citra_dir", os.path.dirname(os.path.dirname(default_citra)) if default_citra else ""))
-        self.citra_dir_field.setToolTip("Folder where Citra stores config/sdmc (e.g. ~/.local/share/citra-emu).")
         self.citra_dir_field.textChanged.connect(self.save_settings)
         citra_dir_layout.addWidget(self.citra_dir_field)
         self.citra_dir_btn = QPushButton("📁")
         self.citra_dir_btn.setFixedSize(30, 24)
         self.citra_dir_btn.setStyleSheet("padding: 0;")
-        self.citra_dir_btn.clicked.connect(lambda: self._pick_dir(self.citra_dir_field, "Select Citra directory"))
+        self.citra_dir_btn.clicked.connect(lambda: self._pick_dir(self.citra_dir_field, "Select Citra Directory"))
         citra_dir_layout.addWidget(self.citra_dir_btn)
-        form.addRow("Citra directory:", citra_dir_layout)
-
+        form.addRow("Citra Dir:", citra_dir_layout)
+        
         crgl.addLayout(form)
-
+        
         # Security Disclaimer
-        sec_warn = QLabel("⚠️ Use a unique password here — never your real email or main account password.")
+        sec_warn = QLabel("⚠️ WARNING: NEVER use your real passwords for email or primary accounts. Always create filler or unique passwords for use with emulators.")
         sec_warn.setStyleSheet(f"color: {RED_LIGHT}; font-weight: bold; font-size: 11px;")
         sec_warn.setAlignment(Qt.AlignCenter)
         sec_warn.setWordWrap(True)
         crgl.addWidget(sec_warn)
-
+        
         p_row = QHBoxLayout()
-        self.bundle_btn = QPushButton("Generate credentials bundle", objectName="patchBtn", clicked=self.generate_console_bundle_zip)
-        self.bundle_btn.setToolTip("Create a ZIP with account files and instructions to copy into Cemu/Citra.")
-        self.bundle_btn.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #ffffff, stop:1 #e6e6e6; color: #111111; border: 1px solid #cccccc; padding: 10px; font-weight: bold; border-radius: 8px;")
+        self.bundle_btn = QPushButton("Generate Credentials Bundle", objectName="patchBtn", clicked=self.generate_console_bundle_zip)
+        self.bundle_btn.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #ffffff, stop:1 #e6e6e6); color: #111111; border: 1px solid #cccccc; padding: 10px; font-weight: bold; border-radius: 8px;")
         p_row.addWidget(self.bundle_btn)
-        self.mk8_help_btn = QPushButton("MK8 crash help")
-        self.mk8_help_btn.setToolTip("If Mario Kart 8 crashes on Linux (signal 11), open this for options.")
-        self.mk8_help_btn.clicked.connect(self._show_mk8_crash_workarounds)
-        p_row.addWidget(self.mk8_help_btn)
         crgl.addLayout(p_row)
+        
 
         self.cemu_log = QTextEdit(objectName="logBox")
         self.cemu_log.setReadOnly(True)
         self.cemu_log.setMaximumHeight(80)
         crgl.addWidget(self.cemu_log)
-
-        cemu_btn_row = QHBoxLayout()
-        self.copy_cemu_log_btn = QPushButton("Copy Cemu Log", clicked=self.copy_cemu_logs)
-        cemu_btn_row.addWidget(self.copy_cemu_log_btn)
-        crgl.addLayout(cemu_btn_row)
-
+        
         lv.addWidget(cred)
-
-        net = QGroupBox("2. Network & connect")
+        
+        net = QGroupBox("Universal Network Router")
         nlay = QVBoxLayout(net)
-        nlay.addWidget(QLabel("Where Cemu and Citra send online traffic: your local server or public Pretendo."))
         url_row = QHBoxLayout()
-        url_row.addWidget(QLabel("Server URL:"))
+        url_row.addWidget(QLabel("Target Node:"))
         current_ip = self._get_local_ip()
         self.patch_url_input = QLineEdit(f"http://{current_ip}:8070")
-        self.patch_url_input.setToolTip("For local: use your machine's IP and port (e.g. 8070). Cemu/Citra will connect here for online.")
         url_row.addWidget(self.patch_url_input)
         nlay.addLayout(url_row)
-
+        
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Mode:"))
-        self.mode_local = QRadioButton("Local server (your stack)")
-        self.mode_pretendo = QRadioButton("Public Pretendo")
+        mode_row.addWidget(QLabel("Connection Mode:"))
+        self.mode_local = QRadioButton("Private (Local Stack)")
+        self.mode_pretendo = QRadioButton("Public (Pretendo Network)")
         self.mode_local.setChecked(True)
         self.mode_local.setStyleSheet("color: white;")
         self.mode_pretendo.setStyleSheet("color: white;")
-        self.mode_local.setToolTip("Use your own Pretendo server (Docker).")
-        self.mode_pretendo.setToolTip("Use official Pretendo network; no local server needed.")
         mode_row.addWidget(self.mode_local)
         mode_row.addWidget(self.mode_pretendo)
         nlay.addLayout(mode_row)
-
+        
         pat_row = QHBoxLayout()
-        pat_btn = QPushButton("Patch & Connect (Cemu)", objectName="patchBtn")
-        pat_btn.setToolTip("Patch Cemu settings and network URLs, write identity files, and register this account on your server. Start server first for local mode.")
+        pat_btn = QPushButton("Patch \u0026 Connect (Cemu)", objectName="patchBtn")
+        pat_btn.setToolTip("Syncs Docker services to the target port, patches Cemu settings, generates identity files, and registers your account.")
         pat_btn.clicked.connect(lambda: self.apply_cemu_patch_all())
         pat_row.addWidget(pat_btn)
-        citra_btn = QPushButton("Patch & Connect (Citra)", objectName="patchBtn")
-        citra_btn.setToolTip("Patch Citra config and register this account. Start server first for local mode.")
+        citra_btn = QPushButton("Patch \u0026 Connect (Citra)", objectName="patchBtn")
+        citra_btn.setToolTip("Syncs Docker services to the target port, patches Citra config, generates identity files, and registers your account.")
         citra_btn.clicked.connect(lambda: self.patch_citra("ui_trigger"))
         pat_row.addWidget(citra_btn)
         nlay.addLayout(pat_row)
-
+        
         lv.addWidget(net)
         h_layout.addWidget(left, 1)
 
@@ -1163,47 +1052,41 @@ class PretendoManager(QMainWindow):
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0,0,0,0)
-
-        vault = QGroupBox("3. Saved profiles")
+        
+        vault = QGroupBox("Offline Credentials Vault")
         vlay = QVBoxLayout(vault)
-        vlay.addWidget(QLabel("Save and switch between different account profiles (username/password/Mii)."))
+        vlay.addWidget(QLabel("Swap accounts dynamically without manual file management."))
         self.profile_list = QListWidget()
         self.profile_list.setMinimumHeight(150)
         vlay.addWidget(self.profile_list)
-
+        
         vbtn = QHBoxLayout()
-        self.save_curr_btn = QPushButton("Save current profile", clicked=self.save_to_vault)
-        self.apply_sel_btn = QPushButton("Use selected profile", clicked=self.apply_from_vault)
+        self.save_curr_btn = QPushButton("Save Active Profile", clicked=self.save_to_vault)
+        self.apply_sel_btn = QPushButton("Deploy Saved Loadout", clicked=self.apply_from_vault)
         vbtn.addWidget(self.save_curr_btn)
         vbtn.addWidget(self.apply_sel_btn)
         vlay.addLayout(vbtn)
-
+        
         vbtn2 = QHBoxLayout()
-        self.open_vault_btn = QPushButton("Open vault folder", clicked=self.open_vault_folder)
-        self.open_vault_btn.setToolTip("Open the folder where saved profiles are stored.")
-        self.delete_prof_btn = QPushButton("Delete selected profile", clicked=self.delete_profile)
-        self.delete_prof_btn.setToolTip("Remove the selected saved profile from the vault.")
+        self.open_vault_btn = QPushButton("Browse Vault...", clicked=self.open_vault_folder)
+        self.delete_prof_btn = QPushButton("Erase Setup", clicked=self.delete_profile)
         vbtn2.addWidget(self.open_vault_btn)
         vbtn2.addWidget(self.delete_prof_btn)
         vlay.addLayout(vbtn2)
-
+        
         rv.addWidget(vault)
-
-
+        
+        
         n_row = QHBoxLayout()
-        nintendo_btn = QPushButton("Restore Nintendo (official)", clicked=self.restore_nintendo_official)
-        nintendo_btn.setToolTip("Point Cemu/Citra back to Nintendo's servers (no Pretendo).")
+        nintendo_btn = QPushButton("Restore Nintendo Services", clicked=self.restore_nintendo_official)
         nintendo_btn.setStyleSheet(f"background: {RED_DARK}; color: white; padding: 8px;")
-        pretendo_btn = QPushButton("Restore Pretendo (public)", clicked=self.restore_pretendo_official)
-        pretendo_btn.setToolTip("Point Cemu/Citra to the public Pretendo network.")
+        pretendo_btn = QPushButton("Restore Pretendo Mainnet", clicked=self.restore_pretendo_official)
         pretendo_btn.setStyleSheet(f"background: {CYAN_DARK}; color: white; padding: 8px;")
         n_row.addWidget(nintendo_btn)
         n_row.addWidget(pretendo_btn)
         rv.addLayout(n_row)
-
-        reset_btn = QPushButton("Reset to factory defaults", clicked=self.reset_to_defaults, styleSheet="background: #8b4513; color: white; padding: 8px;")
-        reset_btn.setToolTip("Clear all app settings and restore defaults.")
-        rv.addWidget(reset_btn)
+        
+        rv.addWidget(QPushButton("Emergency Factory Defaults", clicked=self.reset_to_defaults, styleSheet="background: #8b4513; color: white; padding: 8px;"))
 
         h_layout.addWidget(right, 1)
         layout.addLayout(h_layout)
@@ -1212,70 +1095,69 @@ class PretendoManager(QMainWindow):
     def _build_guide_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
-
+        
         guide = QTextEdit()
         guide.setReadOnly(True)
         guide.setHtml(f"""
-            <h1 style='color:{RED_PRIMARY};'>Quick Start</h1>
-            <p><b>3D Open Dock U</b> connects Cemu (Wii U) and Citra (3DS) to Pretendo for online play.</p>
+            <h1 style='color:{RED_PRIMARY};'>Quick Start Guide</h1>
+            <p>Welcome to <b>3D Open Dock U</b>. Follow these simple steps to get your private server running and connected.</p>
 
-            <h2 style='color:{CYAN_PRIMARY};'>1. Start your server (local mode)</h2>
+            <h2 style='color:{CYAN_PRIMARY};'>Step 1: Power On</h2>
             <ol>
-                <li>Open <b>Setup & Maintenance</b> → <b>Download Stack</b>.</li>
-                <li>Run <b>Run Full Setup Script</b>, then <b>Build Server Containers</b> (wait ~10 min).</li>
-                <li>On the dashboard, click <b>START SERVER</b>.</li>
+                <li>In <b>Setup & Maintenance</b>, click <b>Download Stack</b>.</li>
+                <li>Click <b>Run Full Setup Script</b> (sets up keys, IPs, and <b>Smash Bros</b> database).</li>
+                <li>Click <b>Build Server Containers</b> (wait ~10 mins).</li>
+                <li>On the main dashboard, click <b>START SERVER</b>.</li>
             </ol>
 
-            <h2 style='color:{CYAN_PRIMARY};'>2. Connect Cemu or Citra</h2>
+            <h2 style='color:{CYAN_PRIMARY};'>Step 2: Connect Emulators</h2>
             <ul>
-                <li>In <b>1. Your account</b>, enter username (PNID) and password. Set <b>Cemu directory</b> (or Citra) to where the emulator stores its files.</li>
-                <li>In <b>2. Network & connect</b>, leave <b>Server URL</b> as-is for local, or enter another server’s URL.</li>
-                <li>Click <b>Patch & Connect (Cemu)</b> or <b>Patch & Connect (Citra)</b>. This patches the emulator and registers your account.</li>
-                <li>In Cemu/Citra, enable online in options, then start a game.</li>
+                <li>In <b>Identities & Emulators</b>, enter your username/password.</li>
+                <li>Click <b>Sync & Patch Cemu</b> (or Citra). This automates everything: fonts, accounts, and server links.</li>
+                <li><b>Game Support:</b> Splatoon, Mario Maker, and <b>Super Smash Bros. Wii U</b> are fully supported.</li>
             </ul>
 
-            <h2 style='color:{CYAN_PRIMARY};'>3. Mario Kart 8 crash on Linux?</h2>
-            <p>Try Cemu from Flathub, or run base game only (no update/DLC). See <b>MK8 crash help</b> for more.</p>
-
-            <h2 style='color:{CYAN_PRIMARY};'>4. Troubleshooting</h2>
+            <h2 style='color:{CYAN_PRIMARY};'>Step 3: Easy Troubleshooting</h2>
             <ul>
-                <li><b>Docker (Windows):</b> If Docker or WSL fails, try <b>Fix Docker Permissions</b> in Setup.</li>
-                <li><b>Port in use:</b> Stop the server, close Steam if needed, then Start again.</li>
-                <li><b>Real Wii U/3DS:</b> Use <b>Generate credentials bundle</b> and copy the files to your console.</li>
+                <li><b>Docker Errors (Windows):</b> If Docker stops responding or shows "WSL stopped", click <b>Fix Docker Permissions</b> in Setup. It will offer to automatically repair the bridge.</li>
+                <li><b>Port Conflicts:</b> Close Steam or click Stop then Start to force-clear ports.</li>
+                <li><b>Real Hardware:</b> Use <b>Generate Console Bundle</b> to play on real Wii U/3DS hardware.</li>
             </ul>
 
-            <h2 style='color:#85bb65;'>Using another server</h2>
-            <p>To use a friend’s or public Pretendo server:</p>
+            <h2 style='color:#85bb65;'>How to Connect to Other Pretendo Servers</h2>
+            <p>You can use this program to connect your emulators to external Pretendo servers (hosted by friends or others) without running your own stack:</p>
             <ul>
-                <li>In <b>2. Network & connect</b>, set <b>Server URL</b> to their address (e.g. <code>http://their-ip:8070</code>).</li>
-                <li>Choose <b>Local server</b> or <b>Public Pretendo</b> as needed, then click <b>Patch & Connect</b>.</li>
+                <li>Go to the <b>Identities & Emulators</b> tab.</li>
+                <li>In the <b>Target Node</b> section, enter the <b>Public IP</b> or <b>Domain Name</b> of the server you wish to join.</li>
+                <li>Make sure the <b>Target Port</b> matches the server's public port (usually 80 or 8070).</li>
+                <li>Click <b>Sync & Patch Cemu</b> (or Citra). The manager will automatically configure your emulator to point to that external node instead of your localhost.</li>
             </ul>
         """)
         layout.addWidget(guide)
-
+        
         reset_row = QHBoxLayout()
         reset_row.addStretch()
-        self.guide_reset_btn = QPushButton("Reset emulator settings to defaults", clicked=self.show_reset_dialog)
+        self.guide_reset_btn = QPushButton("Reset Emulator Settings to Defaults", clicked=self.show_reset_dialog)
         self.guide_reset_btn.setStyleSheet(f"color: {RED_LIGHT}; border-color: {RED_DARK}; padding: 8px 16px;")
         reset_row.addWidget(self.guide_reset_btn)
         layout.addLayout(reset_row)
-
+        
         return w
 
     def refresh_vault_list(self):
         self.profile_list.clear()
         vault_dir = os.path.join(os.path.expanduser("~"), ".config", APP_NAME, "vault")
         if not os.path.exists(vault_dir): return
-
+        
         for name in sorted(os.listdir(vault_dir)):
             path = os.path.join(vault_dir, name)
             if os.path.isdir(path):
                 meta_path = os.path.join(path, "profile_meta.json")
                 item = QListWidgetItem(name)
-
+                
                 is_account = False
                 is_backup = False
-
+                
                 if os.path.exists(meta_path):
                     try:
                         with open(meta_path, "r") as f:
@@ -1285,18 +1167,18 @@ class PretendoManager(QMainWindow):
                         elif t == "backup": is_backup = True
                         elif meta.get("username"): is_account = True
                     except: pass
-
+                
                 # Heuristics if metadata is silent
                 if not (is_account or is_backup):
                     lname = name.lower()
                     if "backup" in lname or "vault" in lname: is_backup = True
                     else: is_account = True # Default to account
-
+                
                 if is_backup:
                     item.setForeground(QColor(GREEN_MONEY))
                 else:
                     item.setForeground(QColor(ORANGE_ACCOUNT))
-
+                
                 self.profile_list.addItem(item)
 
     def open_vault_folder(self):
@@ -1319,42 +1201,26 @@ class PretendoManager(QMainWindow):
         """Ultra-robust helper to find actual data paths for vault harvesting."""
         home = os.path.expanduser("~")
         paths = {}
-
+        
         # 1. Search for Wii U (account.dat)
-        # Priority: Common paths -> EmuDeck -> Flatpak
+        # Priority: Common paths -> Custom search
         c_roots = [
             CEMU_DIR,
             os.path.join(home, ".local/share/Cemu"),
             os.path.join(home, ".config/Cemu"),
-            os.path.join(home, "Emulation", "roms", "wiiu"),  # EmuDeck: mlc01 lives here
-            os.path.join(home, ".var/app/info.cemu.Cemu/data/Cemu"),
+            os.path.join(home, ".var/app/info.cemu.Cemu/data/Cemu")
         ]
-
-        found_mlc = None
+        
         found_cemu = None
         for r in c_roots:
-            if not r: continue
-            # Check both r/mlc01 and r directly to avoid mlc01/mlc01 nesting
-            for cand_base in [os.path.join(r, "mlc01"), r]:
-                acc_path = os.path.join(cand_base, "usr/save/system/act/80000001/account.dat")
-                if os.path.exists(acc_path):
-                    found_mlc = cand_base
-                    found_cemu = r
-                    paths["WiiU/account.dat"] = acc_path
-                    break
-            if found_mlc: break
-
-        if found_mlc:
-            # Keys are typically in the Cemu root (r) or possibly mlc01/sys
+            if r and os.path.exists(os.path.join(r, "mlc01/usr/save/system/act/80000001/account.dat")):
+                found_cemu = r
+                break
+        
+        if found_cemu:
+            paths["WiiU/account.dat"] = os.path.join(found_cemu, "mlc01/usr/save/system/act/80000001/account.dat")
             paths["WiiU/otp.bin"] = os.path.join(found_cemu, "otp.bin")
             paths["WiiU/seeprom.bin"] = os.path.join(found_cemu, "seeprom.bin")
-            # If they aren't in Cemu root, maybe they are in mlc01/sys
-            if not os.path.exists(paths["WiiU/otp.bin"]):
-                alt_otp = os.path.join(found_mlc, "sys/otp.bin")
-                if os.path.exists(alt_otp): paths["WiiU/otp.bin"] = alt_otp
-            if not os.path.exists(paths["WiiU/seeprom.bin"]):
-                alt_see = os.path.join(found_mlc, "sys/seeprom.bin")
-                if os.path.exists(alt_see): paths["WiiU/seeprom.bin"] = alt_see
 
         # 2. Search for 3DS (SecureInfo_A, etc.)
         # The user has AZAHAR at Emulation/storage/azahar/nand/rw/sys/SecureInfo_A
@@ -1366,17 +1232,17 @@ class PretendoManager(QMainWindow):
             os.path.join(home, ".config/lime-3ds"),
             os.path.join(home, ".config/azahar-emu")
         ]
-
+        
         for r in ctx_roots:
             if not os.path.exists(r): continue
-
+            
             # Look for SecureInfo_A in various possible sub-paths
             si_candidates = [
                 "nand/rw/sys/SecureInfo_A",
                 "nand/data/00000000000000000000000000000000/sysdata/00010011/00000000/SecureInfo_A",
                 "nand/data/00000000000000000000000000000000/sysdata/00010011/SecureInfo_A"
             ]
-
+            
             for sub in si_candidates:
                 si_path = os.path.join(r, sub)
                 if os.path.exists(si_path):
@@ -1385,26 +1251,26 @@ class PretendoManager(QMainWindow):
                     base = os.path.dirname(si_path)
                     # For AZAHAR structure
                     if "nand/rw/sys" in sub:
-                        paths["3DS/LocalFriendCodeSeed_B"] = os.path.join(base, "LocalFriendCodeSeed_B")
-                        paths["3DS/CTCert.bin"] = os.path.join(base, "CTCert.bin")
+                         paths["3DS/LocalFriendCodeSeed_B"] = os.path.join(base, "LocalFriendCodeSeed_B")
+                         paths["3DS/CTCert.bin"] = os.path.join(base, "CTCert.bin")
                     else:
-                        # For standard Citra structure
-                        sysdata = os.path.dirname(os.path.dirname(base))
-                        paths["3DS/LocalFriendCodeSeed_B"] = os.path.join(sysdata, "0001000f/00000000/LocalFriendCodeSeed_B")
-                        paths["3DS/CTCert.bin"] = os.path.join(sysdata, "00010010/00000000/CTCert.bin")
+                         # For standard Citra structure
+                         sysdata = os.path.dirname(os.path.dirname(base))
+                         paths["3DS/LocalFriendCodeSeed_B"] = os.path.join(sysdata, "0001000f/00000000/LocalFriendCodeSeed_B")
+                         paths["3DS/CTCert.bin"] = os.path.join(sysdata, "00010010/00000000/CTCert.bin")
                     break
             if "3DS/SecureInfo_A" in paths: break
-
+                
         return paths
 
     def save_to_vault(self):
         # 1. Ask for name and type
         name, ok = QInputDialog.getText(self, "New Vault Entry", "Profile Name (e.g. My_Account):")
         if not (ok and name): return
-
+        
         type_res = QMessageBox.question(self, "Vault Entry Type", "Is this a specific PNID Account? (Choose No for a generic Backup Folder)", QMessageBox.Yes | QMessageBox.No)
         entry_type = "account" if type_res == QMessageBox.Yes else "backup"
-
+        
         vault_path = os.path.join(os.path.expanduser("~"), ".config", APP_NAME, "vault", name)
         os.makedirs(vault_path, exist_ok=True)
 
@@ -1417,7 +1283,7 @@ class PretendoManager(QMainWindow):
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 shutil.copy2(src, dest)
                 count += 1
-
+        
         # 3. Save Metadata
         meta = {
             "type": entry_type,
@@ -1425,28 +1291,31 @@ class PretendoManager(QMainWindow):
             "password": _obs(self.cemu_password.text()),
             "miiname": self.cemu_miiname.text(),
             "mii_hex": getattr(self, '_mii_data_hex', ""),
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now().isoformat()
         }
         try:
-            meta_path = os.path.join(vault_path, "profile_meta.json")
-            with open(meta_path, "w") as f:
+            with open(os.path.join(vault_path, "profile_meta.json"), "w") as f:
                 json.dump(meta, f, indent=4)
         except Exception as e:
-            if hasattr(self, "cemu_log"):
-                self.cemu_log.append(f"[WARN] Failed to save vault metadata for '{name}': {e}")
+            self.cemu_log.append(f"[WARN] Meta-save failed: {e}")
+        
         self.refresh_vault_list()
+        if count > 0:
+            QMessageBox.information(self, "Vault", f"Successfully backed up {count} files and credentials to '{name}'.")
+        else:
+            QMessageBox.warning(self, "Vault", "Profile saved, but no emulator files were found to backup.")
 
     def apply_from_vault(self):
         item = self.profile_list.currentItem()
         if not item: return
         name = item.text()
-
+        
         if QMessageBox.question(self, "Confirm", f"Apply profile '{name}'? This will overwrite your current online files.") != QMessageBox.Yes:
             return
-
+            
         vault_path = os.path.join(os.path.expanduser("~"), ".config", APP_NAME, "vault", name)
         found_paths = self._get_emulator_paths()
-
+        
         if not found_paths:
             QMessageBox.critical(self, "Error", "Could not detect where to restore files. Please launch your emulators once first.")
             return
@@ -1459,14 +1328,12 @@ class PretendoManager(QMainWindow):
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 shutil.copy2(src, dest)
                 count += 1
-
+        
         # 2. Restore Metadata (Credentials)
         self.cemu_username.blockSignals(True)
         self.cemu_password.blockSignals(True)
         self.cemu_miiname.blockSignals(True)
-        if getattr(self, 'cemu_mii_hex', None):
-            self.cemu_mii_hex.blockSignals(True)
-
+        
         try:
             meta_path = os.path.join(vault_path, "profile_meta.json")
             if os.path.exists(meta_path):
@@ -1476,11 +1343,9 @@ class PretendoManager(QMainWindow):
                     self.cemu_username.setText(meta.get("username", ""))
                     self.cemu_password.setText(_deobs(meta.get("password", "")))
                     self.cemu_miiname.setText(meta.get("miiname", ""))
-                    mii_hex = (meta.get("mii_hex", "") or "").strip().replace(" ", "")
+                    mii_hex = meta.get("mii_hex", "")
                     if mii_hex:
-                        setattr(self, '_mii_data_hex', mii_hex[:192])
-                    if getattr(self, 'cemu_mii_hex', None):
-                        self.cemu_mii_hex.setText(mii_hex[:192] if mii_hex else "")
+                        setattr(self, '_mii_data_hex', mii_hex)
                 except Exception as me:
                     self.cemu_log.append(f"[WARN] Failed to load profile meta: {me}")
             else:
@@ -1490,9 +1355,7 @@ class PretendoManager(QMainWindow):
             self.cemu_username.blockSignals(False)
             self.cemu_password.blockSignals(False)
             self.cemu_miiname.blockSignals(False)
-            if getattr(self, 'cemu_mii_hex', None):
-                self.cemu_mii_hex.blockSignals(False)
-
+        
         self.save_settings() # Persist the swapped credentials
         QMessageBox.information(self, "Vault", f"Profile '{name}' applied!\nFiles restored: {count}\nCredentials updated: OK")
 
@@ -1503,10 +1366,10 @@ class PretendoManager(QMainWindow):
             try:
                 with open(act_p, "r", errors="ignore") as f:
                     content = f.read()
-
+                
                 un_match = re.search(r"AccountId=(.*)", content)
                 if un_match: self.cemu_username.setText(un_match.group(1).strip())
-
+                
                 mii_match = re.search(r"MiiName=(.*)", content)
                 if mii_match:
                     try:
@@ -1533,37 +1396,27 @@ class PretendoManager(QMainWindow):
         for fname in ["compose.yaml", "compose.yml", "docker-compose.yml"]:
             path = os.path.join(s_dir, fname)
             if not os.path.exists(path): continue
-
+            
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     lines = f.readlines()
-
+                
                 if not lines: continue
 
                 new_lines = []
                 current_service = None
-                in_depends_on = False
                 changed = False
-
+                
                 for i, line in enumerate(lines):
                     stripped = line.strip()
                     # Service detection (indented exactly 2 spaces)
                     if line.startswith("  ") and not line.startswith("   ") and stripped.endswith(":") and not stripped.startswith("-"):
                         current_service = stripped[:-1].lower()
-                        in_depends_on = False
 
-                    if line.startswith("    ") and not line.startswith("     ") and ":" in stripped:
-                        key_part = stripped.split(":")[0].strip()
-                        if key_part == "depends_on":
-                            in_depends_on = True
-                        else:
-                            in_depends_on = False
-
-                    # 1. mitmproxy-pretendo: update external port and bind globally
+                    # 1. mitmproxy-pretendo: update external port
                     if current_service == "mitmproxy-pretendo":
-                        if "8080" in line and "ports:" not in line:
-                            # CRITICAL FIX: Strip 127.0.0.1 restriction so AppImages/Flatpaks can route to it
-                            new_line = re.sub(r'-\s*(?:127\.0\.0\.1:)?\d+:8080', f'- "{port}:8080"', line)
+                        if ":8080" in line and "ports:" not in line:
+                            new_line = re.sub(r'(?:^\s*-\s*|:)(\d+):8080', lambda m: m.group(0).replace(m.group(1), str(port)), line)
                             if new_line != line:
                                 line = new_line
                                 changed = True
@@ -1573,7 +1426,7 @@ class PretendoManager(QMainWindow):
                         if "127.0.0.1:8070:8080" in line:
                             line = line.replace("127.0.0.1:8070:8080", "127.0.0.1:8088:8080")
                             changed = True
-
+                    
                     # 3. mongodb: pin version and add alias
                     if current_service == "mongodb":
                         if "image: mongo:latest" in line:
@@ -1593,54 +1446,15 @@ class PretendoManager(QMainWindow):
                             line = line.replace("mongo-express:latest", "mongo-express:0.54.0")
                             changed = True
 
-                    # 5. postgres: Add Healthcheck (Fixes Smash connection refused) and mount init script
+                    # 5. postgres: Add Healthcheck (Fixes Smash connection refused)
                     if current_service == "postgres" and stripped == "postgres:":
-                        if "healthcheck:" not in "".join(lines[i:i+40]):
+                        if "healthcheck:" not in "".join(lines[i:i+20]):
                             new_lines.append(line)
-                            scripts_mount = os.path.join(s_dir, "scripts", "run-in-container")
-
-                            # Add volumes block and script mount
-                            if os.path.isdir(scripts_mount):
-                                if "volumes:" not in "".join(lines[i:i+40]):
-                                    new_lines.append("    volumes:\n")
-                                    new_lines.append("      - ./scripts/run-in-container:/scripts:ro\n")
-                                else:
-                                    # Volume block exists, but we'll try to add it later by patching the block itself
-                                    pass
-
                             new_lines.append("    healthcheck:\n")
-                            new_lines.append("      test:\n")
-                            new_lines.append("        - CMD-SHELL\n")
-                            new_lines.append("        - pg_isready -U postgres_pretendo -d postgres\n")
+                            new_lines.append("      test: [\"CMD-SHELL\", \"pg_isready -U postgres_pretendo -d postgres\"]\n")
                             new_lines.append("      interval: 5s\n")
                             new_lines.append("      timeout: 5s\n")
                             new_lines.append("      retries: 5\n")
-                            changed = True
-                            continue
-
-                    # 5.1 If postgres volumes block exists, ensure /scripts is in it
-                    if current_service == "postgres" and stripped == "volumes:":
-                        new_lines.append(line)
-                        if "/scripts:ro" not in "".join(lines[i:i+20]):
-                            new_lines.append("      - ./scripts/run-in-container:/scripts:ro\n")
-                            changed = True
-                        continue
-
-                    # 5.5 Upgrade depends_on list to dict for services that need to wait for Postgres to be healthy
-                    target_services = [
-                        "account", "friends", "splatoon", "super-mario-maker",
-                        "pikmin-3", "wiiu-chat", "minecraft-wiiu", "miiverse-api",
-                        "juxtaposition-ui", "boss", "nintendo-lotus", "discovery",
-                        "mario-kart-8", "pokken-tournament", "super-smash-bros-wiiu"
-                    ]
-                    if in_depends_on and current_service in target_services:
-                        if stripped.startswith("- "):
-                            dep_name = stripped[2:].strip()
-                            indent = line[:len(line) - len(line.lstrip())]
-                            if dep_name == "postgres":
-                                new_lines.append(f"{indent}{dep_name}:\n{indent}  condition: service_healthy\n")
-                            else:
-                                new_lines.append(f"{indent}{dep_name}:\n{indent}  condition: service_started\n")
                             changed = True
                             continue
 
@@ -1669,84 +1483,77 @@ class PretendoManager(QMainWindow):
                         "      internal:\n",
                         "        aliases:\n",
                         "          - super-smash-bros-wiiu\n",
-                        "    dns:\n",
-                        "      - 172.20.0.200\n",
+                        "    dns: 172.20.0.200\n",
                         "    env_file:\n",
                         "      - ./environment/super-smash-bros-wiiu.local.env\n"
                     ]
+                    
+                    # Find 'services:' line to inject under
+                    injected = False
                     for idx, l in enumerate(new_lines):
                         if l.strip().startswith("services:"):
-                            for sl in reversed(smash_service): new_lines.insert(idx + 1, sl)
+                            for sl in reversed(smash_service):
+                                new_lines.insert(idx + 1, sl)
+                            injected = True
                             changed = True
                             break
+                    
+                    if not injected:
+                        # Fallback: find the first service and insert before it
+                        for idx, l in enumerate(new_lines):
+                            if l.startswith("  ") and l.strip().endswith(":"):
+                                for sl in reversed(smash_service):
+                                    new_lines.insert(idx, sl)
+                                changed = True
+                                break
 
-                # 7. Injection: Mario Kart 8
-                if "mario-kart-8:" not in "".join(new_lines).lower():
-                    self.setup_log.append("[System] Injecting Mario Kart 8 service definition...")
-                    mk8_service = [
-                        "\n",
-                        "  mario-kart-8:\n",
-                        "    build: ./repos/mario-kart-8\n",
-                        "    depends_on:\n",
-                        "      postgres:\n",
-                        "        condition: service_healthy\n",
-                        "      account:\n",
-                        "        condition: service_started\n",
-                        "      mongodb:\n",
-                        "        condition: service_started\n",
-                        "    restart: unless-stopped\n",
-                        "    ports:\n",
-                        "      - 127.0.0.1:2353:2345\n",
-                        "      - 6014:6014/udp\n",
-                        "      - 6015:6015/udp\n",
-                        "    networks:\n",
-                        "      internal:\n",
-                        "        aliases:\n",
-                        "          - mario-kart-8\n",
-                        "    dns:\n",
-                        "      - 172.20.0.200\n",
-                        "    env_file:\n",
-                        "      - ./environment/mario-kart-8.local.env\n"
-                    ]
-                    for idx, l in enumerate(new_lines):
-                        if l.strip().startswith("services:"):
-                            for sl in reversed(mk8_service): new_lines.insert(idx + 1, sl)
-                            changed = True
-                            break
-
-                # 8. Injection: Pokken Tournament
+                # 7. Injection: Pokken Tournament with Health Dependency
                 if "pokken-tournament:" not in "".join(new_lines).lower():
-                    self.setup_log.append("[System] Injecting Pokk\u00ebn Tournament service definition...")
+                    self.setup_log.append("[System] Injecting Pokken Tournament service definition...")
                     pokken_service = [
                         "\n",
                         "  pokken-tournament:\n",
-                        "    build: ./repos/pokken-tournament\n",
+                        "    build:\n",
+                        "      context: ./repos/pokken-tournament\n",
+                        "      dockerfile: Dockerfile\n",
                         "    depends_on:\n",
                         "      postgres:\n",
                         "        condition: service_healthy\n",
                         "      account:\n",
                         "        condition: service_started\n",
-                        "      mongodb:\n",
+                        "      friends:\n",
                         "        condition: service_started\n",
                         "    restart: unless-stopped\n",
                         "    ports:\n",
-                        "      - 127.0.0.1:2354:2345\n",
-                        "      - 6016:6016/udp\n",
-                        "      - 6017:6017/udp\n",
+                        "      - 60008:60008/udp\n",
+                        "      - 60009:60009/udp\n",
                         "    networks:\n",
                         "      internal:\n",
                         "        aliases:\n",
                         "          - pokken-tournament\n",
-                        "    dns:\n",
-                        "      - 172.20.0.200\n",
+                        "    dns: 172.20.0.200\n",
                         "    env_file:\n",
                         "      - ./environment/pokken-tournament.local.env\n"
                     ]
+                    
+                    # Find 'services:' line to inject under
+                    injected = False
                     for idx, l in enumerate(new_lines):
                         if l.strip().startswith("services:"):
-                            for sl in reversed(pokken_service): new_lines.insert(idx + 1, sl)
+                            for sl in reversed(pokken_service):
+                                new_lines.insert(idx + 1, sl)
+                            injected = True
                             changed = True
                             break
+                    
+                    if not injected:
+                        # Fallback: find the first service and insert before it
+                        for idx, l in enumerate(new_lines):
+                            if l.startswith("  ") and l.strip().endswith(":"):
+                                for sl in reversed(pokken_service):
+                                    new_lines.insert(idx, sl)
+                                changed = True
+                                break
 
                 if changed and new_lines:
                     self._patch_mitmproxy_addon(s_dir)
@@ -1758,41 +1565,44 @@ class PretendoManager(QMainWindow):
                             new_pg = []
                             for pl in pg_lines:
                                 if "databases=" in pl:
+                                    # Properly append without duplicating and handling quotes
                                     current_dbs = re.search(r'databases="([^"]*)"', pl)
                                     if current_dbs:
                                         db_list = current_dbs.group(1).split()
-                                        for new_db in ["super_smash_bros_wiiu", "mario_kart_8", "pokken_tournament"]:
-                                            if new_db not in db_list: db_list.append(new_db)
+                                        if "super_smash_bros_wiiu" not in db_list:
+                                            db_list.append("super_smash_bros_wiiu")
+                                        if "pokken_tournament" not in db_list:
+                                            db_list.append("pokken_tournament")
                                         pl = f'databases="{" ".join(db_list)}"\n'
                                 new_pg.append(pl)
                             with open(pg_init, "w") as f: f.writelines(new_pg)
                         except: pass
-
+                    
                     # Write the patched compose file
                     with open(path, "w", encoding="utf-8") as f:
                         f.writelines(new_lines)
                     applied_any = True
                     # Stop after first successful patch to avoid conflicting compose files
                     break
-
+                    
             except Exception as e:
                 self.setup_log.append(f"[ERROR] Failed to patch {fname}: {e}")
-
+                
         return applied_any
 
     def _patch_mitmproxy_addon(self, s_dir):
         """Fix the mitmproxy addon to prevent infinite loops when patching via IP address."""
         addon_path = os.path.join(s_dir, "repos/mitmproxy-pretendo/pretendo_addon.py")
         if not os.path.exists(addon_path): return
-
+        
         try:
             with open(addon_path, "r") as f: content = f.read()
             changed = False
-
+            
             if "import re" not in content and "from mitmproxy" in content:
                 content = content.replace("from mitmproxy", "import re\nfrom mitmproxy")
                 changed = True
-
+                
             loop_fix = 'or re.match(r"^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$", flow.request.pretty_host)'
             if loop_fix not in content:
                 # Find the pretendo condition block
@@ -1802,7 +1612,7 @@ class PretendoManager(QMainWindow):
                         "or \"pretendo-cdn.b-cdn.net\" in flow.request.pretty_host\n                " + loop_fix
                     )
                     changed = True
-
+            
             if changed:
                 with open(addon_path, "w") as f: f.write(content)
                 self.setup_log.append("[System] mitmproxy addon patched for IP-based loop prevention.")
@@ -1814,10 +1624,10 @@ class PretendoManager(QMainWindow):
         """Perform a deep system audit for dependencies and configuration."""
         missing = []
         warnings = []
-
+        
         # 1. Engine Check
         if not shutil.which("docker"): missing.append("Docker Engine (Missing binary)")
-
+        
         has_compose = False
         if shutil.which("docker-compose"): has_compose = True
         else:
@@ -1842,10 +1652,10 @@ class PretendoManager(QMainWindow):
                 missing.append("WSL2 (Required for bash scripts — Click 'Install WSL2 + Ubuntu')")
             elif not OS_INFO.get("has_wsl_distro"):
                 missing.append("WSL2 Linux Distro (WSL2 installed but no distro — run 'wsl --install -d Ubuntu')")
-
+            
             if not shutil.which("git"):
                 warnings.append("Git not found in PATH (Install Git for Windows from https://git-scm.com)")
-
+            
             # Check if bash is available (via Git Bash or WSL)
             if not shutil.which("bash") and not OS_INFO.get("has_wsl"):
                 warnings.append("No bash available (Install Git for Windows or WSL2)")
@@ -1857,7 +1667,7 @@ class PretendoManager(QMainWindow):
         else:
             has_yml = any(os.path.isfile(os.path.join(s_dir, f)) for f in ["compose.yml", "docker-compose.yml"])
             if not has_yml: missing.append("compose.yml (Missing stack files)")
-
+            
             env_dir = os.path.join(s_dir, "environment")
             if os.path.isdir(env_dir):
                 for e in ["miiverse-api.local.env", "account.local.env"]:
@@ -1907,13 +1717,13 @@ class PretendoManager(QMainWindow):
         msg.setWindowTitle("Reset to Defaults")
         msg.setText("Which emulator settings would you like to reset to defaults?")
         msg.setIcon(QMessageBox.Question)
-
+        
         wiiu_btn = msg.addButton("Wii U", QMessageBox.ActionRole)
         ds3_btn = msg.addButton("3DS", QMessageBox.ActionRole)
         cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
-
+        
         msg.exec()
-
+        
         if msg.clickedButton() == wiiu_btn:
             self.patch_cemu_settings("")
             QMessageBox.information(self, "Success", "Wii U settings reset to default.")
@@ -1921,47 +1731,29 @@ class PretendoManager(QMainWindow):
             self.patch_citra("reset_default")
             QMessageBox.information(self, "Success", "3DS settings reset to default.")
 
-    def _handle_status_update(self, status):
-        """Called by the background worker to update UI components efficiently."""
-        self.server_running = status.get("server_running", False)
-        current_ip = status.get("ip", "127.0.0.1")
+    def _on_status_tick(self):
+        """Periodic check for system status and dynamic network sync."""
+        self._check_docker_status()
+        current_ip = self._get_local_ip()
         is_connected = (current_ip != "127.0.0.1")
-
-        # Update IP info label if changed
-        if getattr(self, 'ip_info', None):
+        
+        # 1. Update IP Label Dynamically
+        if hasattr(self, 'ip_info'):
             self.ip_info.setText(f"Local Network IP: {current_ip}")
-
-        # Connectivity Safeguard - only shut down if it was previously connected
-        if not is_connected and getattr(self, 'last_connectivity_state', False):
-            if self.server_running or getattr(self, 'docker_service_running', False):
+        
+        # 2. Automated Safeguard
+        if not is_connected and self.last_connectivity_state:
+            if self.server_running or self.docker_service_running:
                 msg = "\n[ALARM] Connection Terminated! Triggering Secure Shutdown Protocol...\n"
                 self.server_log.append(msg)
                 self.setup_log.append(msg)
+                
                 if self.server_running: self.stop_server()
                 if self.docker_service_running: self.toggle_docker_service()
+                
                 self.statusBar().showMessage("NETWORK LOSS DETECTED - Safe Mode Active", 15000)
-
+        
         self.last_connectivity_state = is_connected
-        self._update_server_status_ui()
-
-    def _update_server_status_ui(self):
-        """Refresh UI labels based on cached server_running state."""
-        if self.server_running:
-            self.status_label.setText("ONLINE")
-            self.status_label.setStyleSheet(f"color: {GREEN_BRIGHT}; font-size: 24px; font-weight: bold;")
-            self.server_toggle_btn.setText("STOP SERVER")
-            self.server_toggle_btn.setObjectName("stopBtn")
-        else:
-            self.status_label.setText("OFFLINE")
-            self.status_label.setStyleSheet(f"color: {RED_PRIMARY}; font-size: 24px; font-weight: bold;")
-            self.server_toggle_btn.setText("START SERVER")
-            self.server_toggle_btn.setObjectName("startBtn")
-
-        # Update style
-        self.server_toggle_btn.setStyle(self.server_toggle_btn.style())
-
-    def _on_status_tick(self):
-        """Periodic heartbeat for low-intensity UI updates (Game Detection)."""
         self._detect_current_game()
 
     def _detect_current_game(self):
@@ -1969,7 +1761,7 @@ class PretendoManager(QMainWindow):
         try:
             c_data = OS_INFO.get("cemu_data")
             if not c_data: return
-
+            
             cemu_log = os.path.join(c_data, "log.txt")
             if os.path.exists(cemu_log):
                 with open(cemu_log, "r") as f:
@@ -1979,7 +1771,7 @@ class PretendoManager(QMainWindow):
                     offset = max(0, size - 32768) # Check last 32KB
                     f.seek(offset)
                     content = f.read()
-
+                
                 # Cemu log format: [19:02:45.370] TitleId: 00050000-10176900
                 matches = re.findall(r"TitleId: ([0-9a-fA-F-]+)", content)
                 if matches:
@@ -1988,7 +1780,7 @@ class PretendoManager(QMainWindow):
                     self.detected_game_label.setText(f"Active Session: {game_name}")
                     self.detected_game_label.setStyleSheet(f"color: {GREEN_BRIGHT}; font-weight: bold;")
                     return
-
+            
             self.detected_game_label.setText("Active Session: None Detected")
             self.detected_game_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-style: italic;")
         except:
@@ -2002,11 +1794,11 @@ class PretendoManager(QMainWindow):
         try:
             s_dir = self.server_dir_field.text().strip()
             stack_exists = os.path.isdir(s_dir) and (os.path.isfile(os.path.join(s_dir, "compose.yml")) or os.path.isfile(os.path.join(s_dir, "docker-compose.yml")))
-
+            
             # Use a timeout to prevent GUI freezes if the docker socket is unresponsive
             res = subprocess.run(["docker", "ps", "--filter", "name=pretendo", "--format", "{{.Names}}"], capture_output=True, text=True, timeout=3, creationflags=0x08000000 if OS_INFO["os"] == "windows" else 0)
             self.server_running = bool(res.stdout.strip())
-
+            
             if not stack_exists:
                 self.server_toggle_btn.setEnabled(False)
                 self.server_toggle_btn.setText("Error: Install Docker Services")
@@ -2025,11 +1817,11 @@ class PretendoManager(QMainWindow):
                     self.status_label.setStyleSheet(f"color: {RED_PRIMARY}; font-size: 24px; font-weight: bold;")
                     self.server_toggle_btn.setText("START SERVER")
                     self.server_toggle_btn.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1a5c1a, stop:1 #1a7f37); border-color: #2ea043; color: white; font-size: 16px; border-radius: 12px; padding: 12px;")
-
+            
             if OS_INFO["os"] == "linux":
                 svc = subprocess.run(["systemctl", "is-active", "docker"], capture_output=True, text=True)
                 self.docker_service_running = (svc.stdout.strip() == "active")
-
+                
                 if not stack_exists:
                     self.service_toggle_btn.setEnabled(False)
                     self.service_toggle_btn.setText("Error: Install Docker Services")
@@ -2044,7 +1836,7 @@ class PretendoManager(QMainWindow):
                         self.service_toggle_btn.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1a7f37, stop:1 #2ea043); border-color: #1a5c1a; color: white; font-weight: bold; border-radius: 8px; padding: 12px;")
             elif OS_INFO["os"] == "windows":
                 self.docker_service_running = _docker_desktop_running() or _docker_available()
-
+                
                 if not stack_exists:
                     self.service_toggle_btn.setEnabled(False)
                     self.service_toggle_btn.setText("Error: Install Docker Services")
@@ -2057,9 +1849,9 @@ class PretendoManager(QMainWindow):
                     else:
                         self.service_toggle_btn.setText("Start Docker Desktop")
                         self.service_toggle_btn.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0366d6, stop:1 #2188ff); border-color: #0366d6; color: white; font-weight: bold; border-radius: 8px; padding: 12px;")
-
+                
                 # Update WSL status label if it exists
-                if getattr(self, 'wsl_status_label', None):
+                if hasattr(self, 'wsl_status_label'):
                     if OS_INFO["has_wsl"] and OS_INFO["has_wsl_distro"]:
                         distro = OS_INFO.get("wsl_distro", "Unknown")
                         self.wsl_status_label.setText(f"WSL2: ✔ Active ({distro})")
@@ -2074,7 +1866,7 @@ class PretendoManager(QMainWindow):
 
     def _get_effective_sudo_password(self):
         """Unified helper to get password from UI field or cache."""
-        if getattr(self, 'server_sudo_pass', None) and self.server_sudo_pass.text():
+        if hasattr(self, 'server_sudo_pass') and self.server_sudo_pass.text():
             pw = self.server_sudo_pass.text()
             self.cached_password = pw
             return pw
@@ -2085,14 +1877,14 @@ class PretendoManager(QMainWindow):
             return ""
         pw = self._get_effective_sudo_password()
         if pw: return pw.strip() # Added strip()
-
+        
         dlg = SudoPasswordDialog(self)
         if dlg.exec():
             pw, _ = dlg.get_data()
             if not pw: return None
             pw = pw.strip() # Clean input
             self.cached_password = pw
-            if getattr(self, 'server_sudo_pass', None):
+            if hasattr(self, 'server_sudo_pass'):
                 self.server_sudo_pass.blockSignals(True)
                 self.server_sudo_pass.setText(pw)
                 self.server_sudo_pass.blockSignals(False)
@@ -2122,7 +1914,7 @@ class PretendoManager(QMainWindow):
                 log_widget.append("<b style='color:orange;'>[WARN]</b> Previous command still running - queuing after 1s...")
                 QTimer.singleShot(1000, lambda: self._run_command(cmd, log_widget, cwd, on_done, stdin_data, display_cmd))
                 return
-
+        
         # Locking the UI before starting the worker thread
         self._manage_ui_lock(True)
 
@@ -2138,31 +1930,31 @@ class PretendoManager(QMainWindow):
         else:
             clean_cmd = cmd
         log_widget.append(f"<b>[EXEC]</b> <span style='color:{CYAN_PRIMARY};'>guest@pretendo-manager:</span> <span style='color:white;'>{clean_cmd}</span>")
-
+        
         if stdin_data:
             log_widget.append(f"<i style='color:{TEXT_SECONDARY};'>[SYSTEM] Elevating privileges for secure task...</i>")
-
+            
         worker = CommandWorker(cmd, cwd, stdin_data)
         self.worker = worker
         worker.output.connect(log_widget.append)
-
+        
         def handle_done(code):
             status_clr = "#3fb950" if code == 0 else RED_LIGHT
             status_txt = "SUCCESS" if code == 0 else f"FAILED ({code})"
             log_widget.append(f"<b>[DONE]</b> Process exited with status: <b style='color:{status_clr};'>{status_txt}</b>\n")
-
+            
             # Re-enable the UI
             self._manage_ui_lock(False)
-
+            
             if on_done: on_done(code)
-
+            
         worker.finished.connect(handle_done)
         worker.start()
 
     def _force_shutdown_sync(self, show_progress=True):
         """Blocking shutdown: kills containers, stops Docker, terminates workers. ALWAYS succeeds."""
         s_dir = self.server_dir_field.text().strip()
-        pw = self.cached_password or (self.server_sudo_pass.text() if getattr(self, 'server_sudo_pass', None) else None)
+        pw = self.cached_password or (self.server_sudo_pass.text() if hasattr(self, 'server_sudo_pass') else None)
         custom_port = self._get_target_port()
         ports_to_kill = f"80 443 21 53 8080 {custom_port} 9231"
 
@@ -2174,7 +1966,7 @@ class PretendoManager(QMainWindow):
         if worker is not None and worker.isRunning():
             worker.terminate()
             worker.wait(2000)
-        if getattr(self, 'log_worker', None) and self.log_worker.isRunning():
+        if hasattr(self, 'log_worker') and self.log_worker is not None and self.log_worker.isRunning():
             self.log_worker.terminate()
             self.log_worker.wait(1000)
 
@@ -2215,9 +2007,9 @@ class PretendoManager(QMainWindow):
     def emergency_exit(self):
         """ATOMIC SHUTDOWN: force stops everything and kills the process unconditionally."""
         msg = ("ATOMIC SHUTDOWN INITIATED\n\n"
-            "This will IMMEDIATELY stop all Pretendo containers, kill the Docker service, "
-            "and force-quit the application.\n\n"
-            "Proceed?")
+               "This will IMMEDIATELY stop all Pretendo containers, kill the Docker service, "
+               "and force-quit the application.\n\n"
+               "Proceed?")
         if QMessageBox.critical(self, "Emergency Shutdown", msg, QMessageBox.Yes | QMessageBox.No) == QMessageBox.No:
             return
 
@@ -2262,39 +2054,150 @@ class PretendoManager(QMainWindow):
                 pw = self._ask_sudo_password()
                 if not pw: return # User cancelled
 
-        ports = f"80 443 21 53 8080 {custom_port} 9231 6000 6001 6002 6003 6004 6005 6006 6007 6008 6009 6010 6011 6012 6013 6014 6015 6016 6017"
+        ports = f"80 443 21 53 8080 {custom_port} 9231"
         # Add timeout to fuser to prevent long hangs on busy sockets
         fuser_cmd = " ; ".join([f"timeout 2 fuser -k -n tcp {p} || true" for p in ports.split()])
-
+        
         # Helper to finalize and kickstart mongo replica
         def _on_start(code):
+            # Mark session start time to filter old error logs
+            self.session_start_time = datetime.now()
+            
             if code != 0:
                 self.server_log.append("<b>[System] Skipping initialization tasks due to start failure.</b>")
                 return
-
             if s_dir:
-                self.server_log.append("[System] Waiting for MongoDB to initialize Replica Set...")
+                setup_cmds = []
+                self.server_log.append("[System] Running post-boot database initialization...")
+                
+                # 1. MongoDB RS Init + wait for PRIMARY
+                setup_cmds.append("for i in {1..15}; do if docker compose exec -T mongodb mongo --eval 'rs.initiate()' >/dev/null 2>&1; then break; fi; sleep 2; done")
+                # Wait for replica set to elect PRIMARY (required before writes)
+                setup_cmds.append("sleep 3")
+                setup_cmds.append("for i in {1..15}; do if docker compose exec -T mongodb mongo --quiet --eval 'rs.status().myState' 2>/dev/null | grep -q '^1$'; then break; fi; sleep 2; done")
+                
+                # 2. Register Pokken Tournament server in account database (all access modes)
+                # The account service queries by BOTH game_server_id AND access_mode,
+                # so we must create entries for prod, test, and dev.
+                # We register both 101DF400 and 101C5800 as Pokken Game Server IDs.
+                for gs_id in ['101DF400', '101C5800']:
+                    for access_mode in ['prod', 'test', 'dev']:
+                        pokken_registration = f"""db.servers.updateOne(
+                            {{game_server_id: '{gs_id}', access_mode: '{access_mode}'}},
+                            {{$setOnInsert: {{
+                                ip: '10.49.173.98',
+                                port: 60008,
+                                service_name: 'Pokken Tournament ({"Primary" if gs_id == "101DF400" else "Alt"})',
+                                service_type: 'nex',
+                                game_server_id: '{gs_id}',
+                                title_ids: ['00050000101DF400', '00050000101df400', '0005000E101DF400', '0005000e101df400', '00050002101DF400', '00050002101df400'],
+                                access_mode: '{access_mode}',
+                                maintenance_mode: false,
+                                device: 1,
+                                aes_key: '{"0" * 64}',
+                                __v: 0
+                            }}}},
+                            {{upsert: true}}
+                        )"""
+                        setup_cmds.append(f"docker compose exec -T mongodb mongo pretendo_account --quiet --eval {shlex.quote(pokken_registration)} >/dev/null 2>&1 || true")
+                
+                # 2b. Add Pokken Tournament to Friend List (required for friend service authentication)
+                pokken_friend_update = """db.servers.updateMany(
+                    {game_server_id: '00003200', service_name: 'Friend List'},
+                    {$addToSet: {title_ids: {$each: ['00050000101DF400', '00050000101df400', '0005000E101DF400', '0005000e101df400']}}}
+                )"""
+                setup_cmds.append(f"docker compose exec -T mongodb mongo pretendo_account --quiet --eval {shlex.quote(pokken_friend_update)} >/dev/null 2>&1 || true")
+                
+                # 3. Postgres Init (Force creation of game DBs)
+                pg_host_script = os.path.join(s_dir, "scripts/run-in-container/postgres-init.sh")
+                if os.path.exists(pg_host_script):
+                    with open(pg_host_script, 'r') as f: pg_content = f.read()
+                    setup_cmds.append(f"docker compose exec -T postgres sh -c {shlex.quote(pg_content)}")
+                
+                # 4. Wait specifically for Smash DB to be ready before restarting app
+                setup_cmds.append("for i in {1..10}; do if docker compose exec -T postgres psql -U postgres_pretendo -d super_smash_bros_wiiu -c 'SELECT 1' >/dev/null 2>&1; then break; fi; sleep 2; done")
+                
+                # 5. Patch account service to handle Cemu's title ID format (with dash: 00050000-101df400)
+                # Create a patch script that will be executed
+                patch_script = os.path.join(s_dir, "patch_account_titleid.sh")
+                patch_content = """#!/bin/bash
+# Patch account service to strip dashes from title IDs before parsing
+PROVIDER_FILE="repos/account/src/services/nnas/routes/provider.ts"
 
-                # We use a loop to force-initiate the replica set and wait for it to be 'PRIMARY'
-                # This fixes the MongooseServerSelectionError
-                # Try mongo first (4.4) then mongosh (5+); mongo:4.4 has no mongosh
-                setup_cmds = [
-                    "docker compose exec -T mongodb mongo --eval 'rs.initiate()' || docker compose exec -T mongodb mongosh --eval 'rs.initiate()'",
-                    "sleep 5",
-                    "docker compose exec -T postgres /docker-entrypoint-initdb.d/postgres-init.sh || docker compose exec -T postgres /scripts/postgres-init.sh || true",
-                    "docker compose restart account friends splatoon boss super-mario-maker super-smash-bros-wiiu mario-kart-8"
-                ]
+if [ -f "$PROVIDER_FILE" ]; then
+    # Check if patch is already applied
+    if ! grep -q "titleID.replace(/-/g" "$PROVIDER_FILE"; then
+        echo "Applying title ID dash-stripping patch..."
+        # Replace all occurrences of parseInt(titleID, 16) with parseInt(titleID.replace(/-/g, ''), 16)
+        sed -i.bak "s/parseInt(titleID, 16)/parseInt(titleID.replace(\\/-\\/g, ''), 16)/g" "$PROVIDER_FILE"
+        # Rebuild account service
+        docker compose build account >/dev/null 2>&1
+        echo "Patch applied and account service rebuilt"
+    else
+        echo "Title ID patch already applied"
+    fi
+fi
+"""
+                try:
+                    with open(patch_script, 'w') as f:
+                        f.write(patch_content)
+                    os.chmod(patch_script, 0o755)
+                    setup_cmds.append(f"bash {shlex.quote(patch_script)}")
+                except Exception as e:
+                    self.server_log.append(f"[System] Warning: Could not create patch script: {e}")
+                
+                # 6. Fix Cemu account.dat files (add missing ServerAccountStatus field)
+                cemu_account_fix = """#!/bin/bash
+# Fix Cemu account.dat files to add missing ServerAccountStatus field
+CEMU_ACT_DIR="$HOME/.local/share/Cemu/mlc01/usr/save/system/act"
 
-                inner_cmds = " && ".join(setup_cmds)
+if [ -d "$CEMU_ACT_DIR" ]; then
+    echo "Checking Cemu account.dat files..."
+    for account_dir in "$CEMU_ACT_DIR"/*/; do
+        account_dat="$account_dir/account.dat"
+        if [ -f "$account_dat" ]; then
+            # Check if ServerAccountStatus is missing
+            if ! grep -q "ServerAccountStatus" "$account_dat"; then
+                echo "Fixing $account_dat - adding ServerAccountStatus=0"
+                # Backup original
+                cp "$account_dat" "$account_dat.backup"
+                # Add ServerAccountStatus=0 after IsServerAccountDeleted
+                sed -i '/IsServerAccountDeleted=0/a ServerAccountStatus=0' "$account_dat"
+            fi
+        fi
+    done
+    echo "Cemu account.dat files checked and fixed"
+fi
+"""
+                cemu_fix_script = os.path.join(s_dir, "fix_cemu_accounts.sh")
+                try:
+                    with open(cemu_fix_script, 'w') as f:
+                        f.write(cemu_account_fix)
+                    os.chmod(cemu_fix_script, 0o755)
+                    setup_cmds.append(f"bash {shlex.quote(cemu_fix_script)}")
+                except Exception as e:
+                    self.server_log.append(f"[System] Warning: Could not create Cemu fix script: {e}")
+                
+                setup_cmds.append("docker compose restart account friends splatoon super-mario-maker super-smash-bros-wiiu pokken-tournament")
+                
+                inner_cmds = " ; ".join(setup_cmds)
                 if pw and OS_INFO["os"] == "linux":
                     full_cmd = f"sudo -S bash -c {shlex.quote(inner_cmds)}"
-                    self._run_command(full_cmd, self.server_log, s_dir, stdin_data=pw, display_cmd="DB Initialization")
+                    self._run_command(full_cmd, self.server_log, s_dir, stdin_data=pw, display_cmd="[Elevated] Post-Boot Initialization", on_done=self._on_server_boot_finished)
+                elif OS_INFO["os"] == "windows":
+                    if OS_INFO.get("has_wsl") and OS_INFO.get("has_wsl_distro"):
+                        wsl_cwd = _win_to_wsl_path(s_dir)
+                        escaped = inner_cmds.replace('"', '\\"')
+                        full_cmd = f'wsl bash -lc "cd {shlex.quote(wsl_cwd)} && {escaped}"'
+                    else:
+                        self.server_log.append("[System] WSL2 not available — using simplified post-boot init...")
+                        full_cmd = "docker compose exec -T mongodb mongo --eval \"rs.initiate()\" & timeout /t 8 & docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website super-smash-bros-wiiu pokken-tournament"
+                    self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Windows] Post-Boot Initialization", on_done=self._on_server_boot_finished)
                 else:
-                    self._run_command(inner_cmds, self.server_log, s_dir, display_cmd="DB Initialization")
+                    full_cmd = inner_cmds
+                    self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Standard] Post-Boot Initialization", on_done=self._on_server_boot_finished)
 
             self._check_docker_status()
-            if self.server_running:
-                self._on_server_boot_finished(0)
 
         if OS_INFO["os"] == "linux":
             if pw:
@@ -2327,14 +2230,14 @@ class PretendoManager(QMainWindow):
     def stop_server(self):
         s_dir = self.server_dir_field.text().strip()
         if not os.path.isdir(s_dir): return
-
+        
         custom_port = self._get_target_port()
         if not custom_port.isdigit(): return
-
-        ports = f"80 443 21 53 8080 {custom_port} 9231 6000 6001 6002 6003 6004 6005 6006 6007 6008 6009 6010 6011 6012 6013 6014 6015 6016 6017"
+        
+        ports = f"80 443 21 53 8080 {custom_port} 9231"
         # Ensure fuser doesn't cause the whole chain to fail
         fuser_cmd = " ; ".join([f"fuser -k -n tcp {p} || true" for p in ports.split()])
-
+        
         if OS_INFO["os"] == "linux":
             # Unified Credential Aggregation
             pw = self._get_effective_sudo_password()
@@ -2363,7 +2266,7 @@ class PretendoManager(QMainWindow):
         """Callback for when the entire server stack is fully operational."""
         self.stream_docker_logs()
         if code == 0:
-            QMessageBox.information(self, "Server Success",
+            QMessageBox.information(self, "Server Success", 
                 "<b>Pretendo Network Server is now ONLINE!</b><br><br>"
                 "Local infrastructure has been successfully initialized and databases are synchronized. "
                 "Your emulators can now connect to the network node.")
@@ -2371,15 +2274,15 @@ class PretendoManager(QMainWindow):
     def stream_docker_logs(self):
         s_dir = self.server_dir_field.text().strip()
         if not os.path.isdir(s_dir): return
-
+        
         self.server_log.append("[System] Connecting to deep Docker event stream...")
         self.server_log.append("--------------------------------------------------")
         cmd = "docker compose logs -f --tail=20"
-
-        if getattr(self, 'log_worker', None) and getattr(self.log_worker, 'isRunning', None) and self.log_worker.isRunning():
+        
+        if hasattr(self, 'log_worker') and getattr(self.log_worker, 'isRunning')():
             self.log_worker.terminate()
             self.server_log.append("[System] Restarting log watcher...")
-
+            
         self.log_worker = CommandWorker(cmd, cwd=s_dir)
         self.log_worker.output.connect(self._handle_server_log)
         self.log_worker.start()
@@ -2387,10 +2290,35 @@ class PretendoManager(QMainWindow):
     def _handle_server_log(self, html_text):
         """Processes incoming server logs for both display and critical error detection."""
         self.server_log.append(html_text)
-
+        
         # Strip simple HTML spans to get the raw text back for checking
         raw_text = re.sub(r'<[^>]+>', '', html_text)
-
+        
+        # Parse timestamp from log line - support multiple formats
+        # Format 1: [HH:MM:SS.mmm] (Cemu logs)
+        # Format 2: [YYYY-MM-DDTHH:MM:SS] (Docker logs)
+        # Only show errors from CURRENT session (after containers started)
+        if self.session_start_time:
+            # Try Docker timestamp format first
+            timestamp_match = re.search(r'\[(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\]', raw_text)
+            if timestamp_match:
+                year, month, day, hour, minute, second = map(int, timestamp_match.groups())
+                log_time = datetime(year, month, day, hour, minute, second)
+                
+                # If log time is before session start, ignore it (old error)
+                if log_time < self.session_start_time:
+                    return
+            else:
+                # Try Cemu format [HH:MM:SS.mmm]
+                timestamp_match = re.search(r'\[(\d{2}):(\d{2}):(\d{2})\.\d+\]', raw_text)
+                if timestamp_match:
+                    log_hour, log_min, log_sec = map(int, timestamp_match.groups())
+                    log_time = datetime.now().replace(hour=log_hour, minute=log_min, second=log_sec, microsecond=0)
+                    
+                    # If log time is before session start, ignore it (old error)
+                    if log_time < self.session_start_time:
+                        return
+        
         critical_patterns = [
             "failed request /oauth20/access_token/generate",
             "failed to retrieve oauth token",
@@ -2404,52 +2332,50 @@ class PretendoManager(QMainWindow):
             "request failed with status code",
             "database is locked"
         ]
-
+        
         low = raw_text.lower()
         if any(p in low for p in critical_patterns):
             # Ignore panic loops caused by Docker containers starting before the database is ready.
             # Docker natively self-heals these crashes via 'restart: unless-stopped'.
-            if any(ignore in low for ignore in ["connection refused", "dial tcp", "database system is starting up", "econnrefused"]):
+            ignore_patterns = [
+                "connection refused", 
+                "dial tcp", 
+                "database system is starting up", 
+                "econnrefused",
+                "pokken_tournament\" does not exist",
+                "pokken_tournament&quot; does not exist",
+                "super_mario_maker\" does not exist",
+                "super_mario_maker&quot; does not exist",
+                "super_smash_bros_wiiu\" does not exist",
+                "super_smash_bros_wiiu&quot; does not exist",
+                "mario_kart_8\" does not exist",
+                "mario_kart_8&quot; does not exist",
+                "pikmin3\" does not exist",
+                "pikmin3&quot; does not exist",
+                "splatoon\" does not exist",
+                "splatoon&quot; does not exist",
+                "friends\" does not exist",
+                "friends&quot; does not exist"
+            ]
+            if any(ignore in low for ignore in ignore_patterns):
                 return
-
+                
             self._show_critical_error_popup(raw_text)
-
-    def copy_server_logs(self):
-        """Copy current server logs to the system clipboard."""
-        if not hasattr(self, "server_log"):
-            return
-        text = self.server_log.toPlainText()
-        if not text.strip():
-            QMessageBox.information(self, "Copy Logs", "There are no server logs to copy yet.")
-            return
-        QApplication.clipboard().setText(text)
-        QMessageBox.information(self, "Copy Logs", "Server logs copied to clipboard.")
-
-    def copy_cemu_logs(self):
-        """Copy current Cemu patch logs to the system clipboard."""
-        if not hasattr(self, "cemu_log"):
-            return
-        text = self.cemu_log.toPlainText()
-        if not text.strip():
-            QMessageBox.information(self, "Copy Cemu Log", "There are no Cemu logs to copy yet.")
-            return
-        QApplication.clipboard().setText(text)
-        QMessageBox.information(self, "Copy Cemu Log", "Cemu logs copied to clipboard.")
 
     def _show_critical_error_popup(self, error_line):
         """Throttled popup for critical server errors."""
         now = time.time()
-
+        
         # Throttling: same error within 20 seconds, or any popup within 10 seconds
         error_key = error_line[:100] # Use first 100 chars as key
         if error_key in self.seen_errors and now - self.seen_errors[error_key] < 20:
             return
         if now - self.last_popup_time < 10:
             return
-
+            
         self.seen_errors[error_key] = now
         self.last_popup_time = now
-
+        
         dlg = ErrorPopupDialog(self, error_line)
         dlg.exec()
 
@@ -2460,7 +2386,7 @@ class PretendoManager(QMainWindow):
         # Aggressive port cleaning logic
         custom_port = self._get_target_port()
         if not custom_port.isdigit(): return
-        ports = f"80 443 21 53 8080 {custom_port} 9231 6000 6001 6002 6003 6004 6005 6006 6007 6008 6009 6010 6011 6012 6013 6014 6015 6016 6017"
+        ports = f"80 443 21 53 8080 {custom_port} 9231"
 
         if OS_INFO["os"] == "windows":
             # ─── Windows: Docker Desktop Toggle ───
@@ -2501,14 +2427,14 @@ class PretendoManager(QMainWindow):
             if not pw:
                 pw = self._ask_sudo_password()
                 if not pw: return
-
+            
             self.setup_log.append("[System] Activating Docker services...")
             self._run_command("sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: self._check_docker_status())
 
     def automated_install_stack(self):
         """Combined multi-step workflow for deployment."""
         s_dir = self.server_dir_field.text().strip()
-
+        
         # Check if directory exists but is broken (missing compose.yml)
         needs_clone = False
         if not os.path.isdir(s_dir):
@@ -2542,7 +2468,7 @@ class PretendoManager(QMainWindow):
                                     win_path = s_dir.replace("'", "''")
                                     cmd = f'powershell -Command "Remove-Item -Path \'{win_path}\' -Recurse -Force -ErrorAction Stop"'
                                     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-
+                                
                                 if result.returncode == 0:
                                     removed = True
                                     self.setup_log.append("[OK] Directory removed with elevated privileges.")
@@ -2554,14 +2480,14 @@ class PretendoManager(QMainWindow):
                             self.setup_log.append("[ERROR] Sudo password required to remove root-owned files. Aborted.")
                     except Exception as e:
                         self.setup_log.append(f"[ERROR] Failed to remove directory: {e}")
-
+                    
                     if not removed:
                         return
                     needs_clone = True
                 else:
                     self.setup_log.append("[WARN] Cannot proceed without compose.yml. Aborted.")
                     return
-
+        
         if needs_clone:
             reply = QMessageBox.question(self, "Proceed", f"Clone Pretendo Docker repository to '{s_dir}'?", QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.Yes:
@@ -2572,26 +2498,26 @@ class PretendoManager(QMainWindow):
                     on_done=lambda c: self._on_clone_finished(c)
                 )
             return
-
+        
         # Directory exists and has compose file - proceed to setup
         self._on_clone_finished(0)
-
+            
     def _on_clone_finished(self, code):
         """Called after git clone completes (or skipped if dir already valid)."""
         if code != 0:
             self.setup_log.append("[ERROR] Git clone failed. Check your internet connection and try again.")
             return
-
+        
         s_dir = self.server_dir_field.text().strip()
-
+        
         # Validate the clone result
         has_compose = any(os.path.isfile(os.path.join(s_dir, f)) for f in ["compose.yml", "docker-compose.yml"])
         if not has_compose:
             self.setup_log.append("[ERROR] Clone completed but compose.yml still missing. Repository may be corrupted.")
             return
-
+        
         self.setup_log.append("\n[System] Stack downloaded. Checking for game-specific repositories...")
-
+        
         # Ensure Super Smash Bros. Wii U repo is present (Custom Addition)
         smash_dir = os.path.join(s_dir, "repos", "super-smash-bros-wiiu")
         if not os.path.isdir(smash_dir):
@@ -2600,36 +2526,24 @@ class PretendoManager(QMainWindow):
             self._run_command(
                 f"git clone {smash_repo} {shlex.quote(smash_dir)}",
                 self.setup_log,
-                on_done=lambda c: self._on_clone_finished(c)
+                on_done=lambda c: self._on_clone_finished(0) # Re-run to continue
             )
             return
 
-        # Ensure Mario Kart 8 repo is present
-        mk8_dir = os.path.join(s_dir, "repos", "mario-kart-8")
-        if not os.path.isdir(mk8_dir):
-            self.setup_log.append("[System] Downloading Mario Kart 8 server...")
-            mk8_repo = "https://github.com/PretendoNetwork/mario-kart-8"
-            self._run_command(
-                f"git clone {mk8_repo} {shlex.quote(mk8_dir)}",
-                self.setup_log,
-                on_done=lambda c: self._on_clone_finished(c)
-            )
-            return
-
-        # Ensure Pokken Tournament repo is present
+        # Ensure Pokken Tournament repo is present (Custom Addition)
         pokken_dir = os.path.join(s_dir, "repos", "pokken-tournament")
         if not os.path.isdir(pokken_dir):
-            self.setup_log.append("[System] Downloading Pokk\u00ebn Tournament server...")
+            self.setup_log.append("[System] Downloading Pokken Tournament server...")
             pokken_repo = "https://github.com/PretendoNetwork/pokken-tournament"
             self._run_command(
                 f"git clone {pokken_repo} {shlex.quote(pokken_dir)}",
                 self.setup_log,
-                on_done=lambda c: self._on_clone_finished(c)
+                on_done=lambda c: self._on_clone_finished(0) # Re-run to continue
             )
             return
 
         self.setup_log.append("[OK] All required repositories are present. Applying submodule patches...")
-
+        
         # Run submodule patches (CRITICAL for Super Mario Maker and other fixes)
         patch_script = os.path.join(s_dir, "scripts", "setup-submodule-patches.sh")
         if os.path.isfile(patch_script):
@@ -2655,7 +2569,7 @@ class PretendoManager(QMainWindow):
             else:
                 # macOS / other
                 patch_cmd = f"bash {shlex.quote(patch_script)}" if shutil.which("bash") else shlex.quote(patch_script)
-
+                
             self._run_command(
                 patch_cmd,
                 self.setup_log,
@@ -2680,7 +2594,7 @@ class PretendoManager(QMainWindow):
         self._apply_compose_patches(custom_port, s_dir)
 
         local_ip = self._get_local_ip()
-
+        
         # Generate .env and local environment files in Python (reliable, no bash dependencies)
         self.setup_log.append("[System] Generating environment configuration...")
         try:
@@ -2709,82 +2623,64 @@ class PretendoManager(QMainWindow):
         self._deploy_step2_clear_and_pull(s_dir, local_ip, custom_port, pw)
 
     def _generate_env_files(self, s_dir, server_ip):
-        """Fixed Env Generator: Corrects BOSS key lengths and ensures all DB URIs are present."""
+        """Corrected Env Generator: Fixed S3 protocols and missing MongoDB URIs."""
         import secrets as sec_module
         import string
-
+        
         def gen_password(length=32):
             chars = string.ascii_letters + string.digits
             return ''.join(sec_module.choice(chars) for _ in range(length))
-
-        def gen_hex(length=32):
-            chars = 'abcdef0123456789' # BOSS often prefers lowercase hex
+        
+        def gen_hex(length=64):
+            chars = 'ABCDEF0123456789'
             return ''.join(sec_module.choice(chars) for _ in range(length))
-
+        
         env_dir = os.path.join(s_dir, "environment")
         os.makedirs(env_dir, exist_ok=True)
-
-        def get_existing(fname, key, fallback, required_len=0):
+        
+        def get_existing(fname, key, fallback):
             val = self._grep_env_file(os.path.join(env_dir, fname), key)
-            # If the existing value is the wrong length or "dummy", use the fallback
-            if val and required_len > 0 and len(val) != required_len:
-                return fallback
             return val if val else fallback
 
-        # BOSS Keys must be exactly 32 chars (16 bytes)
-        boss_wiiu_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY", gen_hex(32), 32)
-        boss_wiiu_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY", gen_hex(32), 32)
-        boss_3ds_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_AES_KEY", gen_hex(32), 32)
-        boss_3ds_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY", gen_hex(32), 32)
-
-        # Postgres and Account Keys
-        postgres_pass = get_existing("postgres.local.env", "POSTGRES_PASSWORD", gen_password(32))
+        # Secrets aggregation
+        account_aes_key = get_existing("account.local.env", "PN_ACT_CONFIG_AES_KEY", gen_hex(64))
+        account_datastore_secret = get_existing("account.local.env", "PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET", gen_hex(32))
         account_grpc_key = get_existing("account.local.env", "PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT", gen_password(32))
-        account_aes_key = get_existing("account.local.env", "PN_ACT_CONFIG_AES_KEY", gen_hex(64), 64)
-        account_datastore_secret = get_existing("account.local.env", "PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET", gen_hex(32), 32)
         minio_secret = get_existing("account.local.env", "PN_ACT_CONFIG_S3_ACCESS_SECRET", gen_password(32))
-
-        # Friends
+        postgres_pass = get_existing("postgres.local.env", "POSTGRES_PASSWORD", gen_password(32))
+        
         friends_auth_pw = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD", gen_password(32))
         friends_secure_pw = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_SECURE_PASSWORD", gen_password(32))
         friends_api_key = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_GRPC_API_KEY", gen_password(32))
-        friends_aes_key = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_AES_KEY", gen_hex(64), 64)
-
-        # Game Kerberos and AES Keys
+        friends_aes_key = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_AES_KEY", gen_hex(64))
+        
         chat_kerberos_pw = get_existing("wiiu-chat.local.env", "PN_WIIU_CHAT_KERBEROS_PASSWORD", gen_password(32))
         smm_kerberos_pw = get_existing("super-mario-maker.local.env", "PN_SMM_KERBEROS_PASSWORD", gen_password(32))
-        smm_aes_key = get_existing("super-mario-maker.local.env", "PN_SMM_CONFIG_AES_KEY", gen_hex(64), 64)
-
+        smm_aes_key = get_existing("super-mario-maker.local.env", "PN_SMM_CONFIG_AES_KEY", gen_hex(64))
+        
         splat_kerberos_pw = get_existing("splatoon.local.env", "PN_SPLATOON_KERBEROS_PASSWORD", gen_password(32))
-        splat_aes_key = get_existing("splatoon.local.env", "PN_SPLATOON_CONFIG_AES_KEY", gen_hex(64), 64)
-
-        smash_kerberos_pw = get_existing("super-smash-bros-wiiu.local.env", "PN_SUPERSMASHBROSWIIU_KERBEROS_PASSWORD",
-                                        get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_KERBEROS_PASSWORD", gen_password(32)))
-        smash_aes_key = get_existing("super-smash-bros-wiiu.local.env", "PN_SUPERSMASHBROSWIIU_AES_KEY",
-                                    get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_AES_KEY", gen_hex(64), 64))
-
+        splat_aes_key = get_existing("splatoon.local.env", "PN_SPLATOON_CONFIG_AES_KEY", gen_hex(64))
+        
+        smash_kerberos_pw = get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_KERBEROS_PASSWORD", 
+                                         get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_KERBEROS_PASSWORD", gen_password(32)))
+        smash_aes_key = get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_AES_KEY", 
+                                     get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_CONFIG_AES_KEY", gen_hex(64)))
+        
         minecraft_kerberos_pw = get_existing("minecraft-wiiu.local.env", "PN_MINECRAFT_KERBEROS_PASSWORD", gen_password(32))
         pikmin3_kerberos_pw = get_existing("pikmin-3.local.env", "PN_PIKMIN3_KERBEROS_PASSWORD", gen_password(32))
-
-        mk8_kerberos_pw = get_existing("mario-kart-8.local.env", "PN_MARIOKART8_KERBEROS_PASSWORD",
-                                    get_existing("mario-kart-8.local.env", "PN_MK8_KERBEROS_PASSWORD", gen_password(32)))
-        mk8_aes_key = get_existing("mario-kart-8.local.env", "PN_MARIOKART8_CONFIG_AES_KEY",
-                                get_existing("mario-kart-8.local.env", "PN_MK8_CONFIG_AES_KEY", gen_hex(64), 64))
-
-        pokken_kerberos_pw = get_existing("pokken-tournament.local.env", "PN_POKKENTOURNAMENT_KERBEROS_PASSWORD",
-                                        get_existing("pokken-tournament.local.env", "PN_POKKEN_KERBEROS_PASSWORD", gen_password(32)))
-        pokken_aes_key = get_existing("pokken-tournament.local.env", "PN_POKKENTOURNAMENT_CONFIG_AES_KEY",
-                                    get_existing("pokken-tournament.local.env", "PN_POKKEN_CONFIG_AES_KEY", gen_hex(64), 64))
-
+        
         boss_api_key = get_existing("boss.local.env", "PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY", gen_password(32))
-
-        # Re-map the BOSS environment file with BOTH naming conventions (old and new)
+        boss_wiiu_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY", gen_hex(32))
+        boss_wiiu_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY", gen_hex(32))
+        boss_3ds_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_AES_KEY", gen_hex(32))
+        boss_3ds_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY", gen_hex(32))
+        
         env_files = {}
 
         # 1. Account Server
         env_files["account.local.env"] = [
             f"PN_ACT_CONFIG_AES_KEY={account_aes_key}",
-            f"PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET={get_existing('account.local.env', 'PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET', gen_hex(32), 32)}",
+            f"PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET={account_datastore_secret}",
             f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT={account_grpc_key}",
             f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_API={account_grpc_key}",
             f"PN_ACT_CONFIG_S3_ACCESS_SECRET={minio_secret}",
@@ -2797,10 +2693,10 @@ class PretendoManager(QMainWindow):
         env_files["friends.local.env"] = [
             f"PN_FRIENDS_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
             f"PN_FRIENDS_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
-            f"PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD={get_existing('friends.local.env', 'PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD', gen_password(32))}",
-            f"PN_FRIENDS_CONFIG_SECURE_PASSWORD={get_existing('friends.local.env', 'PN_FRIENDS_CONFIG_SECURE_PASSWORD', gen_password(32))}",
-            f"PN_FRIENDS_CONFIG_GRPC_API_KEY={get_existing('friends.local.env', 'PN_FRIENDS_CONFIG_GRPC_API_KEY', gen_password(32))}",
-            f"PN_FRIENDS_CONFIG_AES_KEY={get_existing('friends.local.env', 'PN_FRIENDS_CONFIG_AES_KEY', gen_hex(64), 64)}",
+            f"PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD={friends_auth_pw}",
+            f"PN_FRIENDS_CONFIG_SECURE_PASSWORD={friends_secure_pw}",
+            f"PN_FRIENDS_CONFIG_GRPC_API_KEY={friends_api_key}",
+            f"PN_FRIENDS_CONFIG_AES_KEY={friends_aes_key}",
             f"PN_FRIENDS_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/friends?sslmode=disable",
             f"PN_FRIENDS_SECURE_SERVER_HOST={server_ip}",
             f"PN_FRIENDS_CONFIG_SECURE_SERVER_HOST={server_ip}",
@@ -2814,11 +2710,11 @@ class PretendoManager(QMainWindow):
             f"PN_MIIVERSE_API_CONFIG_S3_ACCESS_SECRET={minio_secret}",
             "PN_MIIVERSE_API_CONFIG_S3_ENDPOINT=minio:9000",
             "PN_MIIVERSE_API_CONFIG_S3_ACCESS_KEY=minio_pretendo",
-            f"PN_MIIVERSE_API_CONFIG_GRPC_FRIENDS_API_KEY={get_existing('friends.local.env', 'PN_FRIENDS_CONFIG_GRPC_API_KEY', gen_password(32))}",
+            f"PN_MIIVERSE_API_CONFIG_GRPC_FRIENDS_API_KEY={friends_api_key}",
             f"PN_MIIVERSE_API_CONFIG_AES_KEY={account_aes_key}",
             "PN_MIIVERSE_API_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_miiverse?replicaSet=rs",
         ]
-
+        
         # 4. Juxtaposition UI
         env_files["juxtaposition-ui.local.env"] = [
             f"JUXT_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
@@ -2826,7 +2722,7 @@ class PretendoManager(QMainWindow):
             f"JUXT_CONFIG_AWS_SPACES_SECRET={minio_secret}",
             "JUXT_CONFIG_AWS_SPACES_ENDPOINT=minio:9000",
             "JUXT_CONFIG_AWS_SPACES_ACCESS_KEY=minio_pretendo",
-            f"JUXT_CONFIG_GRPC_FRIENDS_API_KEY={get_existing('friends.local.env', 'PN_FRIENDS_CONFIG_GRPC_API_KEY', gen_password(32))}",
+            f"JUXT_CONFIG_GRPC_FRIENDS_API_KEY={friends_api_key}",
             f"JUXT_CONFIG_AES_KEY={account_aes_key}",
             "JUXT_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_juxt?replicaSet=rs",
         ]
@@ -2834,21 +2730,15 @@ class PretendoManager(QMainWindow):
         # 5. BOSS
         env_files["boss.local.env"] = [
             f"PN_BOSS_CONFIG_GRPC_ACCOUNT_SERVER_API_KEY={account_grpc_key}",
+            f"PN_BOSS_CONFIG_S3_ACCESS_SECRET={minio_secret}",
+            "PN_BOSS_CONFIG_S3_ENDPOINT=minio:9000",
+            "PN_BOSS_CONFIG_S3_ACCESS_KEY=minio_pretendo",
             f"PN_BOSS_CONFIG_GRPC_FRIENDS_SERVER_API_KEY={friends_api_key}",
             f"PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY={boss_api_key}",
-            "PN_BOSS_CONFIG_S3_ENDPOINT=minio:9000",
-            "PN_BOSS_S3_ENDPOINT=minio:9000",
-            f"PN_BOSS_CONFIG_S3_ACCESS_SECRET={minio_secret}",
-            f"PN_BOSS_S3_ACCESS_KEY=minio_pretendo",
-            # Ensure these are exactly 32 chars (16 bytes)
             f"PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY={boss_wiiu_aes}",
-            f"PN_BOSS_BOSS_WIIU_AES_KEY={boss_wiiu_aes}",
             f"PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY={boss_wiiu_hmac}",
-            f"PN_BOSS_BOSS_WIIU_HMAC_KEY={boss_wiiu_hmac}",
             f"PN_BOSS_CONFIG_BOSS_3DS_AES_KEY={boss_3ds_aes}",
-            f"PN_BOSS_BOSS_3DS_AES_KEY={boss_3ds_aes}",
             f"PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY={boss_3ds_hmac}",
-            f"PN_BOSS_BOSS_3DS_HMAC_KEY={boss_3ds_hmac}",
             "PN_BOSS_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_boss?replicaSet=rs",
         ]
 
@@ -2877,7 +2767,7 @@ class PretendoManager(QMainWindow):
             f"PN_WIIU_CHAT_SECURE_SERVER_LOCATION={server_ip}",
             f"PN_WIIU_CHAT_CONFIG_SECURE_SERVER_LOCATION={server_ip}",
         ]
-
+        
         # 8. Splatoon
         env_files["splatoon.local.env"] = [
             f"PN_SPLATOON_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
@@ -2890,7 +2780,7 @@ class PretendoManager(QMainWindow):
             f"PN_SPLATOON_CONFIG_SECURE_SERVER_HOST={server_ip}",
             "PN_SPLATOON_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_splatoon?replicaSet=rs",
         ]
-
+        
         # 9. Minecraft
         env_files["minecraft-wiiu.local.env"] = [
             f"PN_MINECRAFT_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
@@ -2899,9 +2789,8 @@ class PretendoManager(QMainWindow):
             f"PN_MINECRAFT_SECURE_SERVER_HOST={server_ip}",
             f"PN_MINECRAFT_CONFIG_SECURE_SERVER_HOST={server_ip}",
             "PN_MINECRAFT_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_minecraft?replicaSet=rs",
-            "PN_MINECRAFT_ALLOW_PUBLIC_MATCHMAKING=1",
         ]
-
+        
         # 10. Pikmin 3
         env_files["pikmin-3.local.env"] = [
             f"PN_PIKMIN3_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
@@ -2917,197 +2806,67 @@ class PretendoManager(QMainWindow):
         # 11. Super Smash Bros. Wii U
         env_files["super-smash-bros-wiiu.local.env"] = [
             f"PN_SSBWIIU_KERBEROS_PASSWORD={smash_kerberos_pw}",
-            f"PN_SUPERSMASHBROSWIIU_KERBEROS_PASSWORD={smash_kerberos_pw}",
             "PN_SSBWIIU_AUTHENTICATION_SERVER_PORT=6012",
-            "PN_SUPERSMASHBROSWIIU_AUTHENTICATION_SERVER_PORT=6012",
             "PN_SSBWIIU_SECURE_SERVER_PORT=6013",
-            "PN_SUPERSMASHBROSWIIU_SECURE_SERVER_PORT=6013",
             f"PN_SSBWIIU_SECURE_SERVER_HOST={server_ip}",
-            f"PN_SUPERSMASHBROSWIIU_SECURE_SERVER_HOST={server_ip}",
             "PN_SSBWIIU_ACCOUNT_GRPC_HOST=account",
-            "PN_SUPERSMASHBROSWIIU_ACCOUNT_GRPC_HOST=account",
             "PN_SSBWIIU_ACCOUNT_GRPC_PORT=5000",
-            "PN_SUPERSMASHBROSWIIU_ACCOUNT_GRPC_PORT=5000",
             f"PN_SSBWIIU_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
-            f"PN_SUPERSMASHBROSWIIU_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
             "PN_SSBWIIU_FRIENDS_GRPC_HOST=friends",
-            "PN_SUPERSMASHBROSWIIU_FRIENDS_GRPC_HOST=friends",
             "PN_SSBWIIU_FRIENDS_GRPC_PORT=5001",
-            "PN_SUPERSMASHBROSWIIU_FRIENDS_GRPC_PORT=5001",
             f"PN_SSBWIIU_FRIENDS_GRPC_API_KEY={friends_api_key}",
-            f"PN_SUPERSMASHBROSWIIU_FRIENDS_GRPC_API_KEY={friends_api_key}",
             "PN_SSBWIIU_DATASTORE_S3BUCKET=super-smash-bros-wiiu",
-            "PN_SUPERSMASHBROSWIIU_DATASTORE_S3BUCKET=super-smash-bros-wiiu",
             "PN_SSBWIIU_DATASTORE_S3KEY=minio_pretendo",
-            "PN_SUPERSMASHBROSWIIU_DATASTORE_S3KEY=minio_pretendo",
             f"PN_SSBWIIU_DATASTORE_S3SECRET={minio_secret}",
-            f"PN_SUPERSMASHBROSWIIU_DATASTORE_S3SECRET={minio_secret}",
             "PN_SSBWIIU_DATASTORE_S3URL=minio:9000",
-            "PN_SUPERSMASHBROSWIIU_DATASTORE_S3URL=minio:9000",
             f"PN_SSBWIIU_AES_KEY={smash_aes_key}",
-            f"PN_SUPERSMASHBROSWIIU_AES_KEY={smash_aes_key}",
             f"PN_SSBWIIU_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/super_smash_bros_wiiu?sslmode=disable",
-            f"PN_SUPERSMASHBROSWIIU_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/super_smash_bros_wiiu?sslmode=disable",
             "PN_SSBWIIU_LOCAL_AUTH=0",
-            "PN_SUPERSMASHBROSWIIU_LOCAL_AUTH=0",
             "PN_SSBWIIU_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_smash?replicaSet=rs",
-            "PN_SUPERSMASHBROSWIIU_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_smash?replicaSet=rs",
-            "PN_SSBWIIU_MONGODB_URI=mongodb://mongodb:27017/pretendo_smash?replicaSet=rs",
-            "PN_SUPERSMASHBROSWIIU_MONGODB_URI=mongodb://mongodb:27017/pretendo_smash?replicaSet=rs",
-            "PN_SSBWIIU_S3_ENDPOINT=minio:9000",
-            "PN_SUPERSMASHBROSWIIU_S3_ENDPOINT=minio:9000",
-            "PN_SSBWIIU_S3_URL=minio:9000",
-            "PN_SUPERSMASHBROSWIIU_S3_URL=minio:9000",
-            "PN_SSBWIIU_S3_ACCESS_KEY=minio_pretendo",
-            "PN_SUPERSMASHBROSWIIU_S3_ACCESS_KEY=minio_pretendo",
-            f"PN_SSBWIIU_S3_ACCESS_SECRET={minio_secret}",
-            f"PN_SUPERSMASHBROSWIIU_S3_ACCESS_SECRET={minio_secret}",
         ]
 
-        # 12. Mario Kart 8
-        env_files["mario-kart-8.local.env"] = [
-            f"PN_MK8_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
-            f"PN_MARIOKART8_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
-            f"PN_MK8_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
-            f"PN_MARIOKART8_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
-            f"PN_MK8_KERBEROS_PASSWORD={mk8_kerberos_pw}",
-            f"PN_MARIOKART8_KERBEROS_PASSWORD={mk8_kerberos_pw}",
-            f"PN_MK8_CONFIG_AES_KEY={mk8_aes_key}",
-            f"PN_MARIOKART8_CONFIG_AES_KEY={mk8_aes_key}",
-            f"PN_MK8_AES_KEY={mk8_aes_key}",
-            f"PN_MARIOKART8_AES_KEY={mk8_aes_key}",
-            "PN_MK8_CONFIG_S3_ENDPOINT=minio:9000",
-            "PN_MARIOKART8_CONFIG_S3_ENDPOINT=minio:9000",
-            "PN_MK8_S3_ENDPOINT=minio:9000",
-            "PN_MARIOKART8_S3_ENDPOINT=minio:9000",
-            f"PN_MK8_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/mario_kart_8?sslmode=disable",
-            f"PN_MARIOKART8_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/mario_kart_8?sslmode=disable",
-            f"PN_MK8_SECURE_SERVER_HOST={server_ip}",
-            f"PN_MARIOKART8_SECURE_SERVER_HOST={server_ip}",
-            f"PN_MK8_CONFIG_SECURE_SERVER_HOST={server_ip}",
-            f"PN_MARIOKART8_CONFIG_SECURE_SERVER_HOST={server_ip}",
-            "PN_MK8_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_mk8?replicaSet=rs",
-            "PN_MARIOKART8_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_mk8?replicaSet=rs",
-            "PN_MK8_MONGODB_URI=mongodb://mongodb:27017/pretendo_mk8?replicaSet=rs",
-            "PN_MARIOKART8_MONGODB_URI=mongodb://mongodb:27017/pretendo_mk8?replicaSet=rs",
-            "PN_MK8_AUTHENTICATION_SERVER_PORT=6014",
-            "PN_MARIOKART8_AUTHENTICATION_SERVER_PORT=6014",
-            "PN_MK8_SECURE_SERVER_PORT=6015",
-            "PN_MARIOKART8_SECURE_SERVER_PORT=6015",
-            "PN_MK8_ACCOUNT_GRPC_HOST=account",
-            "PN_MARIOKART8_ACCOUNT_GRPC_HOST=account",
-            "PN_MK8_ACCOUNT_GRPC_PORT=5000",
-            "PN_MARIOKART8_ACCOUNT_GRPC_PORT=5000",
-            "PN_MK8_FRIENDS_GRPC_HOST=friends",
-            "PN_MARIOKART8_FRIENDS_GRPC_HOST=friends",
-            "PN_MK8_FRIENDS_GRPC_PORT=5001",
-            "PN_MARIOKART8_FRIENDS_GRPC_PORT=5001",
-            f"PN_MK8_FRIENDS_GRPC_API_KEY={friends_api_key}",
-            f"PN_MARIOKART8_FRIENDS_GRPC_API_KEY={friends_api_key}",
-            "PN_MK8_DATASTORE_S3BUCKET=mario-kart-8",
-            "PN_MARIOKART8_DATASTORE_S3BUCKET=mario-kart-8",
-            "PN_MK8_DATASTORE_S3KEY=minio_pretendo",
-            "PN_MARIOKART8_DATASTORE_S3KEY=minio_pretendo",
-            f"PN_MK8_DATASTORE_S3SECRET={minio_secret}",
-            f"PN_MARIOKART8_DATASTORE_S3SECRET={minio_secret}",
-            "PN_MK8_DATASTORE_S3URL=minio:9000",
-            "PN_MARIOKART8_DATASTORE_S3URL=minio:9000",
-            "PN_MK8_S3_ACCESS_KEY=minio_pretendo",
-            "PN_MARIOKART8_S3_ACCESS_KEY=minio_pretendo",
-            f"PN_MK8_S3_ACCESS_SECRET={minio_secret}",
-            f"PN_MARIOKART8_S3_ACCESS_SECRET={minio_secret}",
-            "PN_MK8_S3_URL=minio:9000",
-            "PN_MARIOKART8_S3_URL=minio:9000",
-            "PN_MK8_CONFIG_S3_ACCESS_KEY=minio_pretendo",
-            "PN_MARIOKART8_CONFIG_S3_ACCESS_KEY=minio_pretendo",
-            f"PN_MK8_CONFIG_S3_ACCESS_SECRET={minio_secret}",
-            f"PN_MARIOKART8_CONFIG_S3_ACCESS_SECRET={minio_secret}",
-            "PN_MK8_LOCAL_AUTH=0",
-            "PN_MARIOKART8_LOCAL_AUTH=0",
-        ]
-
-        # 13. Pokken Tournament
+        # 12. Pokken Tournament
+        pokken_kerberos_pw = get_existing("pokken-tournament.local.env", "PN_POKKENTOURNAMENT_KERBEROS_PASSWORD", gen_password(32))
         env_files["pokken-tournament.local.env"] = [
-            f"PN_POKKEN_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
-            f"PN_POKKENTOURNAMENT_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
-            f"PN_POKKEN_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
-            f"PN_POKKENTOURNAMENT_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
-            f"PN_POKKEN_KERBEROS_PASSWORD={pokken_kerberos_pw}",
-            f"PN_POKKENTOURNAMENT_KERBEROS_PASSWORD={pokken_kerberos_pw}",
-            f"PN_POKKEN_CONFIG_AES_KEY={pokken_aes_key}",
-            f"PN_POKKENTOURNAMENT_CONFIG_AES_KEY={pokken_aes_key}",
-            f"PN_POKKEN_AES_KEY={pokken_aes_key}",
-            f"PN_POKKENTOURNAMENT_AES_KEY={pokken_aes_key}",
-            "PN_POKKEN_CONFIG_S3_ENDPOINT=minio:9000",
-            "PN_POKKENTOURNAMENT_CONFIG_S3_ENDPOINT=minio:9000",
-            "PN_POKKEN_S3_ENDPOINT=minio:9000",
-            "PN_POKKENTOURNAMENT_S3_ENDPOINT=minio:9000",
-            "PN_POKKEN_S3_ACCESS_KEY=minio_pretendo",
-            "PN_POKKENTOURNAMENT_S3_ACCESS_KEY=minio_pretendo",
-            f"PN_POKKEN_S3_ACCESS_SECRET={minio_secret}",
-            f"PN_POKKENTOURNAMENT_S3_ACCESS_SECRET={minio_secret}",
-            "PN_POKKEN_S3_URL=minio:9000",
-            "PN_POKKENTOURNAMENT_S3_URL=minio:9000",
-            f"PN_POKKEN_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/pokken_tournament?sslmode=disable",
-            f"PN_POKKENTOURNAMENT_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/pokken_tournament?sslmode=disable",
-            f"PN_POKKEN_SECURE_SERVER_HOST={server_ip}",
+            "PN_POKKENTOURNAMENT_AUTHENTICATION_SERVER_PORT=60008",
             f"PN_POKKENTOURNAMENT_SECURE_SERVER_HOST={server_ip}",
-            f"PN_POKKEN_CONFIG_SECURE_SERVER_HOST={server_ip}",
-            f"PN_POKKENTOURNAMENT_CONFIG_SECURE_SERVER_HOST={server_ip}",
-            "PN_POKKEN_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_pokken?replicaSet=rs",
-            "PN_POKKENTOURNAMENT_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_pokken?replicaSet=rs",
-            "PN_POKKEN_MONGODB_URI=mongodb://mongodb:27017/pretendo_pokken?replicaSet=rs",
-            "PN_POKKENTOURNAMENT_MONGODB_URI=mongodb://mongodb:27017/pretendo_pokken?replicaSet=rs",
-            "PN_POKKEN_AUTHENTICATION_SERVER_PORT=6016",
-            "PN_POKKENTOURNAMENT_AUTHENTICATION_SERVER_PORT=6016",
-            "PN_POKKEN_SECURE_SERVER_PORT=6017",
-            "PN_POKKENTOURNAMENT_SECURE_SERVER_PORT=6017",
-            "PN_POKKEN_ACCOUNT_GRPC_HOST=account",
+            "PN_POKKENTOURNAMENT_SECURE_SERVER_PORT=60009",
             "PN_POKKENTOURNAMENT_ACCOUNT_GRPC_HOST=account",
-            "PN_POKKEN_ACCOUNT_GRPC_PORT=5000",
             "PN_POKKENTOURNAMENT_ACCOUNT_GRPC_PORT=5000",
-            "PN_POKKEN_FRIENDS_GRPC_HOST=friends",
+            f"PN_POKKENTOURNAMENT_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
             "PN_POKKENTOURNAMENT_FRIENDS_GRPC_HOST=friends",
-            "PN_POKKEN_FRIENDS_GRPC_PORT=5001",
             "PN_POKKENTOURNAMENT_FRIENDS_GRPC_PORT=5001",
-            f"PN_POKKEN_FRIENDS_GRPC_API_KEY={friends_api_key}",
             f"PN_POKKENTOURNAMENT_FRIENDS_GRPC_API_KEY={friends_api_key}",
-            "PN_POKKEN_DATASTORE_S3BUCKET=pokken-tournament",
-            "PN_POKKENTOURNAMENT_DATASTORE_S3BUCKET=pokken-tournament",
-            "PN_POKKEN_DATASTORE_S3KEY=minio_pretendo",
-            "PN_POKKENTOURNAMENT_DATASTORE_S3KEY=minio_pretendo",
-            f"PN_POKKEN_DATASTORE_S3SECRET={minio_secret}",
-            f"PN_POKKENTOURNAMENT_DATASTORE_S3SECRET={minio_secret}",
-            "PN_POKKEN_DATASTORE_S3URL=minio:9000",
-            "PN_POKKENTOURNAMENT_DATASTORE_S3URL=minio:9000",
-            "PN_POKKEN_LOCAL_AUTH=0",
-            "PN_POKKENTOURNAMENT_LOCAL_AUTH=0",
+            f"PN_POKKENTOURNAMENT_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/pokken_tournament?sslmode=disable",
+            "PN_POKKENTOURNAMENT_S3_ENDPOINT=minio:9000",
+            "PN_POKKENTOURNAMENT_S3_ACCESS_KEY=minio_pretendo",
+            f"PN_POKKENTOURNAMENT_S3_ACCESS_SECRET={minio_secret}",
+            "PN_POKKENTOURNAMENT_S3_BUCKET=pokken-tournament",
         ]
 
-        # 12. MinIO
+        # 13. MinIO
         env_files["minio.local.env"] = [
             f"MINIO_ROOT_PASSWORD={minio_secret}",
         ]
-
-        # 13. Postgres
+        
+        # 14. Postgres
         env_files["postgres.local.env"] = [
             f"POSTGRES_PASSWORD={postgres_pass}",
         ]
 
-        # 14. Mongo Express
+        # 15. Mongo Express
         env_files["mongo-express.local.env"] = [
             "ME_CONFIG_MONGODB_SERVER=mongodb",
             "ME_CONFIG_MONGODB_PORT=27017",
         ]
-
-
+        
         # Write all env files
         for filename, lines in env_files.items():
             filepath = os.path.join(env_dir, filename)
             with open(filepath, "w") as f:
                 f.write("\n".join(lines) + "\n")
             self.setup_log.append(f"  [ENV] Created {filename}")
-
+        
         for fname in os.listdir(env_dir):
             if fname.endswith(".env") and not fname.endswith(".local.env"):
                 local_name = fname.replace(".env", ".local.env")
@@ -3116,13 +2875,14 @@ class PretendoManager(QMainWindow):
                     with open(local_path, "w") as f:
                         f.write("# Auto-generated empty local env\n")
                     self.setup_log.append(f"  [ENV] Created empty {local_name}")
-
+        
         root_env = os.path.join(s_dir, ".env")
         with open(root_env, "w") as f:
             f.write(f"SERVER_IP={server_ip}\n")
+        self.setup_log.append(f"  [ENV] Created .env (SERVER_IP={server_ip})")
+        
         self._patch_splatoon_schedules(s_dir)
-        self._patch_mario_kart_8(s_dir)
-
+        
         secrets_path = os.path.join(s_dir, "secrets.txt")
         with open(secrets_path, "w") as f:
             f.write(f"""Pretendo Network server secrets
@@ -3142,9 +2902,9 @@ Server IP address: {server_ip}
         if os.path.exists(dest_path):
             self.setup_log.append("[INFO] SMM metadata file already exists.")
             return
-
+            
         self.setup_log.append("[System] Ensuring Super Mario Maker metadata (900000.bin)...")
-
+        
         # Attempt download from a known mirror first
         mirror_url = "https://raw.githubusercontent.com/MatthewL246/pretendo-docker/master/console-files/900000.bin"
         if HAS_REQUESTS:
@@ -3161,7 +2921,7 @@ Server IP address: {server_ip}
         # Fallback: Create placeholder to satisfy the Stat check (patch handles rest)
         try:
             with open(dest_path, "wb") as f:
-                f.write(b"")
+                f.write(b"") 
             self.setup_log.append("[OK] SMM metadata placeholder created (0 bytes).")
         except Exception as e:
             self.setup_log.append(f"[WARN] Failed to create SMM metadata placeholder: {e}")
@@ -3173,57 +2933,12 @@ Server IP address: {server_ip}
         if not os.path.isdir(repos_dir):
             return
 
-        # 0. Clean the slate to remove old broken database patches & init submodules
+        # 0. Clean the slate to remove old broken database patches
         if shutil.which("git"):
-            for repo_name in ["splatoon", "friends", "pikmin-3", "minecraft-wiiu", "super-mario-maker", "juxtaposition-ui", "super-smash-bros-wiiu", "mario-kart-8", "pokken-tournament"]:
+            for repo_name in ["splatoon", "friends", "pikmin-3", "minecraft-wiiu", "super-mario-maker", "juxtaposition-ui", "super-smash-bros-wiiu"]:
                 r_path = os.path.join(repos_dir, repo_name)
                 if os.path.isdir(r_path):
                     subprocess.run(["git", "checkout", "--", "."], cwd=r_path, capture_output=True)
-                    # Force submodule initialization in case they were cloned empty
-                    subprocess.run(["git", "submodule", "update", "--init", "--recursive"], cwd=r_path, capture_output=True)
-
-        # 0.5 Generate missing/broken Dockerfiles for game servers
-        for repo_name in ["mario-kart-8", "pokken-tournament", "super-smash-bros-wiiu"]:
-            repo_path = os.path.join(repos_dir, repo_name)
-            dockerfile_path = os.path.join(repo_path, "Dockerfile")
-            if os.path.isdir(repo_path):
-                # Always overwrite for these three to ensure multi-binary support is present
-                try:
-                    with open(dockerfile_path, "w") as f:
-                        f.write(r"""FROM golang:1.22-alpine AS builder
-ENV CGO_ENABLED=0
-RUN apk add --no-cache git gcc musl-dev bash
-WORKDIR /app
-COPY . .
-RUN if [ ! -f go.mod ]; then go mod init pretendo-service; fi
-RUN go mod tidy
-RUN mkdir -p /app/bin && \
-    find . -name "*.go" -type f -exec grep -l "^package main" {} + | xargs -n 1 dirname | sort -u | while read DNAME; do \
-        BIN_NAME=$(basename "$DNAME"); \
-        [ "$BIN_NAME" = "." ] && BIN_NAME="server"; \
-        echo "Building $DNAME -> /app/bin/$BIN_NAME"; \
-        (cd "$DNAME" && go build -v -o "/app/bin/$BIN_NAME" .); \
-    done
-
-FROM alpine:latest
-RUN apk add --no-cache ca-certificates tzdata bash
-WORKDIR /app
-COPY --from=builder /app/bin /app/bin
-RUN echo '#!/bin/bash' > /app/start.sh && \
-    echo 'for bin in /app/bin/*; do' >> /app/start.sh && \
-    echo '  if [ -x "$bin" ] && [ ! -d "$bin" ]; then' >> /app/start.sh && \
-    echo '    echo "Starting $bin..."' >> /app/start.sh && \
-    echo '    "$bin" &' >> /app/start.sh && \
-    echo '  fi' >> /app/start.sh && \
-    echo 'done' >> /app/start.sh && \
-    echo 'wait -n' >> /app/start.sh && \
-    echo 'exit $?' >> /app/start.sh && \
-    chmod +x /app/start.sh
-CMD ["/app/start.sh"]
-""")
-                    self.setup_log.append(f"[OK] Generated dynamic multi-binary Dockerfile for {repo_name}.")
-                except Exception as e:
-                    self.setup_log.append(f"[ERROR] Failed to generate Dockerfile for {repo_name}: {e}")
 
         # 1. Patch Dockerfiles (Vendor sync & Delve)
         cnt = 0
@@ -3262,50 +2977,23 @@ CMD ["/app/start.sh"]
             except Exception as e:
                 self.setup_log.append(f"[WARN] Failed to patch Juxtaposition UI: {e}")
 
+        # 3. Splatoon specific gRPC resolver fix
+        splat_init = os.path.join(repos_dir, "splatoon", "init.go")
+        if os.path.isfile(splat_init):
+            try:
+                with open(splat_init, "r") as f: s_content = f.read()
+                if 'grpc.NewClient(fmt.Sprintf("dns:%s:%s"' in s_content:
+                    s_content = s_content.replace('grpc.NewClient(fmt.Sprintf("dns:%s:%s"', 'grpc.NewClient(fmt.Sprintf("dns:///%s:%s"')
+                    with open(splat_init, "w") as f: f.write(s_content)
+                    self.setup_log.append("[OK] Patched Splatoon gRPC resolver syntax.")
             except: pass
-
-        # Ensure Super Smash Bros. Wii U repo is present
-        smash_dir = os.path.join(s_dir, "repos", "super-smash-bros-wiiu")
-        if not os.path.isdir(smash_dir):
-            self.setup_log.append("[System] Downloading Super Smash Bros. Wii U server...")
-            smash_repo = "https://github.com/PretendoNetwork/super-smash-bros-wiiu"
-            self._run_command(
-                f"git clone --recurse-submodules {smash_repo} {shlex.quote(smash_dir)}",
-                self.setup_log,
-                on_done=lambda c: self._on_clone_finished(c)
-            )
-            return
-
-        # Ensure Mario Kart 8 repo is present
-        mk8_dir = os.path.join(s_dir, "repos", "mario-kart-8")
-        if not os.path.isdir(mk8_dir):
-            self.setup_log.append("[System] Downloading Mario Kart 8 server...")
-            mk8_repo = "https://github.com/PretendoNetwork/mario-kart-8"
-            self._run_command(
-                f"git clone --recurse-submodules {mk8_repo} {shlex.quote(mk8_dir)}",
-                self.setup_log,
-                on_done=lambda c: self._on_clone_finished(c)
-            )
-            return
-
-        # Ensure Pokken Tournament repo is present
-        pokken_dir = os.path.join(s_dir, "repos", "pokken-tournament")
-        if not os.path.isdir(pokken_dir):
-            self.setup_log.append("[System] Downloading Pokk\u00ebn Tournament server...")
-            pokken_repo = "https://github.com/PretendoNetwork/pokken-tournament"
-            self._run_command(
-                f"git clone --recurse-submodules {pokken_repo} {shlex.quote(pokken_dir)}",
-                self.setup_log,
-                on_done=lambda c: self._on_clone_finished(c)
-            )
-            return
 
     def _patch_splatoon_schedules(self, s_dir):
         """Modify Nginx config to pull live Splatoon rotation schedules from the public Pretendo CDN, fixing online hangs."""
         self.setup_log.append("[System] Patching NGINX to route Splatoon BOSS requests to public Pretendo CDN...")
         nginx_conf_dir = os.path.join(s_dir, "config/nginx")
         boss_conf_path = os.path.join(nginx_conf_dir, "boss.conf")
-
+        
         boss_conf_content = """server {
     listen 80;
     server_name npdi.cdn.pretendo.cc npdl.cdn.pretendo.cc npfl.c.app.pretendo.cc
@@ -3324,7 +3012,7 @@ CMD ["/app/start.sh"]
             with open(boss_conf_path, "w") as f:
                 f.write(boss_conf_content)
             self.setup_log.append("[OK] Updated BOSS Nginx proxy config.")
-
+            
             # Restart Nginx if container is running
             try:
                 subprocess.check_call("docker restart pretendo-network-nginx-1", shell=True, cwd=s_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -3333,102 +3021,6 @@ CMD ["/app/start.sh"]
                 pass
         except Exception as e:
             self.setup_log.append(f"[ERROR] Failed to update boss.conf: {e}")
-
-    def _patch_mario_kart_8(self, s_dir):
-        """Fix Mario Kart 8 hardcoded IPs, configuration fallbacks, and build process."""
-        self.setup_log.append("[System] Patching Mario Kart 8 source and build config...")
-        mk8_dir = os.path.join(s_dir, "repos", "mario-kart-8")
-        if not os.path.isdir(mk8_dir): return
-
-        # 1. Fix hardcoded MongoDB IP in mk8-authentication/database.go
-        auth_db_path = os.path.join(mk8_dir, "mk8-authentication", "database.go")
-        if os.path.isfile(auth_db_path):
-            with open(auth_db_path, "r") as f:
-                content = f.read()
-
-            if '"mongodb://143.198.126.113:27017/"' in content:
-                content = content.replace('import (', 'import (\n\t"os"')
-                content = content.replace(
-                    'mongoClient, _ = mongo.NewClient(options.Client().ApplyURI("mongodb://143.198.126.113:27017/"))',
-                    'mongoURI = os.Getenv("PN_MK8_MONGODB_URI")\n\tif mongoURI == "" { mongoURI = os.Getenv("PN_MARIOKART8_MONGODB_URI") }\n\tif mongoURI == "" { mongoURI = "mongodb://mongodb:27017/" }\n\tmongoClient, _ = mongo.NewClient(options.Client().ApplyURI(mongoURI))'
-                )
-                with open(auth_db_path, "w") as f:
-                    f.write(content)
-                self.setup_log.append("[OK] Fixed MK8 Auth database routing.")
-
-        # 1.5 Fix MK8 Auth port in mk8-authentication/main.go
-        auth_main_path = os.path.join(mk8_dir, "mk8-authentication", "main.go")
-        if os.path.isfile(auth_main_path):
-            with open(auth_main_path, "r") as f:
-                content = f.read()
-            if 'nexServer.Listen(":60002")' in content:
-                content = content.replace('import (', 'import (\n\t"os"')
-                content = content.replace(
-                    'nexServer.Listen(":60002")',
-                    'port := os.Getenv("PN_MK8_AUTHENTICATION_SERVER_PORT")\n\tif port == "" { port = "60002" }\n\tnexServer.Listen(":" + port)'
-                )
-                with open(auth_main_path, "w") as f:
-                    f.write(content)
-                self.setup_log.append("[OK] Fixed MK8 Auth port routing.")
-
-        # 2. Fix mk8-secure/init.go to support environment variable fallbacks
-        secure_init_path = os.path.join(mk8_dir, "mk8-secure", "init.go")
-        if os.path.isfile(secure_init_path):
-            new_init = """package main
-import (
-    "os"
-)
-var hmacSecret []byte
-func init() {
-    var err error
-    config, err = ImportConfigFromFile("secure.config")
-    if err != nil {
-        config = &ServerConfig{
-            ServerName:            "Pretendo MK8 Secure",
-            ServerPort:            os.Getenv("PN_MK8_SECURE_SERVER_PORT"),
-            PrudpVersion:          1,
-            SignatureVersion:      1,
-            KerberosKeySize:       32,
-            AccessKey:             os.Getenv("PN_MK8_ACCESS_KEY"),
-            NexVersion:            30500,
-            DatabaseIP:            "mongodb",
-            DatabasePort:          "27017",
-            DatabaseUseAuth:       false,
-            AccountDatabase:       "pretendo_account",
-            PNIDCollection:        "pnids",
-            NexAccountsCollection: "nexaccounts",
-            MK8Database:           "pretendo_mk8",
-            RoomsCollection:       "rooms",
-            SessionsCollection:    "sessions",
-            UsersCollection:       "users",
-            RegionsCollection:     "regions",
-            TournamentsCollection: "tourneys",
-        }
-        if config.ServerPort == "" { config.ServerPort = "6001" }
-    }
-    connectMongo()
-}
-"""
-            with open(secure_init_path, "w") as f:
-                f.write(new_init)
-            self.setup_log.append("[OK] Fixed MK8 Secure configuration logic.")
-
-        # 3. Fix Dockerfile build loop
-        dockerfile_path = os.path.join(mk8_dir, "Dockerfile")
-        if os.path.isfile(dockerfile_path):
-            with open(dockerfile_path, "r") as f:
-                lines = f.readlines()
-
-            changed = False
-            for i, line in enumerate(lines):
-                if 'go build -v -o "/app/bin/$BIN_NAME" .' in line and 'go mod tidy' not in line:
-                    lines[i] = line.replace('go build -v -o "/app/bin/$BIN_NAME" .', '([ ! -f go.mod ] && go mod init "$BIN_NAME" || true) && go mod tidy && go build -v -o "/app/bin/$BIN_NAME" .')
-                    changed = True
-
-            if changed:
-                with open(dockerfile_path, "w") as f:
-                    f.writelines(lines)
-                self.setup_log.append("[OK] Fixed MK8 Dockerfile build process.")
 
     def _generate_juxtaposition_boot_config(self, s_dir):
         """Fix Juxtaposition UI crash by creating dummy config and patching aliases."""
@@ -3453,8 +3045,8 @@ func init() {
             "CDN_domain": "localhost",
             "aws": {
                 "spaces": {
-                    "endpoint": "http://minio:9000",
-                    "key": "minio_pretendo",
+                    "endpoint": "http://minio:9000", 
+                    "key": "minio_pretendo", 
                     "secret": minio_secret
                 }
             },
@@ -3493,7 +3085,7 @@ func init() {
         if not os.path.exists(s_dir):
             QMessageBox.warning(self, "Invalid Path", "Server directory not found.")
             return
-
+        
         self.setup_log.append("[Action] Applying Live Splatoon Rotations and Mii Font Fix...")
         try:
             # Trigger font fix as well since it's frequently needed alongside rotation fixes
@@ -3509,12 +3101,12 @@ func init() {
 
     def _deploy_step2_clear_and_pull(self, s_dir, local_ip, custom_port, pw=None):
         """Step 2: Clear ports and remove old containers."""
-        ports_to_kill = f"80 443 21 53 8080 {custom_port} 9231 6000 6001 6002 6003 6004 6005 6006 6007 6008 6009 6010 6011 6012 6013 6014 6015 6016 6017"
+        ports_to_kill = f"80 443 21 53 8080 {custom_port} 9231"
         self.setup_log.append("[System] Wiping port conflicts and removing old containers...")
-
+        
         # Build commands for port killing and container downing
         kill_cmd = self._get_kill_ports_cmd(ports_to_kill, pw)
-
+        
         if OS_INFO["os"] == "windows":
             d_cmd = "docker compose down --remove-orphans 2>NUL || docker-compose down --remove-orphans 2>NUL || echo done"
             full_cmd = f"{kill_cmd} & {d_cmd}"
@@ -3523,21 +3115,21 @@ func init() {
             if pw and OS_INFO["os"] == "linux":
                 d_cmd = f"sudo -S {d_cmd}"
             full_cmd = f"{kill_cmd} ; {d_cmd}"
-
+        
         self._run_command(full_cmd, self.setup_log, cwd=s_dir, stdin_data=pw,
-                        on_done=lambda c: self._deploy_step3_pull(s_dir, pw),
-                        display_cmd="Clean Ports & Down Containers")
+                          on_done=lambda c: self._deploy_step3_pull(s_dir, pw),
+                          display_cmd="Clean Ports & Down Containers")
 
     def _deploy_step3_pull(self, s_dir, pw):
         """Step 3: Pull docker images."""
         self.setup_log.append("\n[System] Pulling Docker images (this may take several minutes)...")
-
+        
         def _on_pull_done(code):
             if code != 0:
                 self.setup_log.append(f"[WARN] Pull exited with code {code}. Some images may need to be built instead.")
             # Proceed to build regardless
             QTimer.singleShot(500, lambda: self._deploy_step4_build(s_dir, pw))
-
+        
         # Ensure Docker is active before pulling
         def _do_pull():
             if OS_INFO["os"] == "windows":
@@ -3553,14 +3145,14 @@ func init() {
                 on_done=_on_pull_done,
                 display_cmd="docker compose pull"
             ))
-
+        
         # Ensure Docker is active on all platforms
         self._ensure_docker_active(_do_pull)
 
     def _deploy_step4_build(self, s_dir, pw):
         """Step 4: Build docker images."""
         self.setup_log.append("\n[System] Building Docker images (this may take 5-15 minutes)...")
-
+        
         def _on_build_done(code):
             if code == 0:
                 self.setup_log.append("\n[SUCCESS] Full Stack Deployment Finished! Ready to boot.")
@@ -3573,7 +3165,7 @@ func init() {
                 self.setup_log.append(f"\n[ERROR] Build failed with exit code {code}.")
                 self.setup_log.append("[HINT] Try running 'Health Check' to diagnose issues.")
             self._check_docker_status()
-
+        
         def _do_build():
             cmd = "docker compose build"
             if pw and OS_INFO["os"] == "linux":
@@ -3584,7 +3176,7 @@ func init() {
                 on_done=_on_build_done,
                 display_cmd="docker compose build"
             ))
-
+        
         # Ensure Docker is active on all platforms
         self._ensure_docker_active(_do_build)
 
@@ -3625,10 +3217,10 @@ func init() {
             msg = "Warning: Setup conflicts detected:\n" + "\n".join(conflicts) + "\n\nThese will be force-killed."
             if QMessageBox.warning(self, "Conflicts", msg, QMessageBox.Ok | QMessageBox.Cancel) == QMessageBox.Cancel:
                 return
-
+            
         local_ip = self._get_local_ip()
         ports_to_kill = f"80 443 21 53 8080 {custom_port} 9231"
-
+        
         pw = None
         if OS_INFO["os"] == "linux":
             pw = self._ask_sudo_password()
@@ -3638,11 +3230,11 @@ func init() {
 
         self.setup_log.append("[System] Wiping port conflicts and removing old containers...")
         kill_cmd = self._get_kill_ports_cmd(ports_to_kill, pw)
-
+        
         # Check if setup.sh exists and has its required dependencies
         setup_script = os.path.join(s_dir, "setup.sh")
         framework_script = os.path.join(s_dir, "scripts", "internal", "framework.sh")
-
+        
         if os.path.isfile(setup_script) and os.path.isfile(framework_script) and OS_INFO["os"] == "linux":
             cmd = f"docker compose down --remove-orphans ; {kill_cmd} ; chmod +x ./setup.sh && ./setup.sh --force --server-ip {local_ip}"
         elif os.path.isfile(setup_script) and os.path.isfile(framework_script) and OS_INFO["os"] == "windows":
@@ -3670,7 +3262,7 @@ func init() {
                 self.setup_log.append("[WARN] setup.sh not found in stack.")
             elif not os.path.isfile(framework_script):
                 self.setup_log.append("[WARN] scripts/internal/framework.sh not found (submodules may be missing).")
-
+            
             self.setup_log.append("[System] Generating environment configuration in-app...")
             try:
                 self._generate_env_files(s_dir, local_ip)
@@ -3678,7 +3270,7 @@ func init() {
             except Exception as e:
                 self.setup_log.append(f"[ERROR] Failed to generate environment: {e}")
                 return
-
+            
             if OS_INFO["os"] == "windows":
                 # Windows: no sudo needed, use & instead of ; for cmd.exe chaining
                 inner = f"docker compose down --remove-orphans & {kill_cmd} & docker compose pull --ignore-buildable 2>NUL & docker compose pull 2>NUL & docker compose build"
@@ -3690,10 +3282,10 @@ func init() {
                     cmd = f"sudo -S bash -c {shlex.quote(inner)}"
                 else:
                     cmd = inner
-
+        
         self.setup_log.append(f"[System] Starting comprehensive setup with IP: {local_ip}...")
-        self._run_command(cmd, self.setup_log, cwd=s_dir, stdin_data=pw,
-                        on_done=lambda c: self._post_setup_build(c))
+        self._run_command(cmd, self.setup_log, cwd=s_dir, stdin_data=pw, 
+                          on_done=lambda c: self._post_setup_build(c))
 
     def _post_setup_build(self, code):
         if code != 0:
@@ -3721,7 +3313,7 @@ func init() {
             # On Windows, ensure Docker Desktop is running
             self._ensure_docker_desktop(on_ready)
             return
-
+        
         if OS_INFO["os"] != "linux":
             on_ready()
             return
@@ -3732,10 +3324,10 @@ func init() {
                 on_ready()
                 return
         except: pass
-
+        
         pw = self._ask_sudo_password()
         if not pw: return
-
+            
         self.setup_log.append("[System] Resetting and starting Docker services...")
         self._run_command("sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: on_ready() if c == 0 else None)
 
@@ -3770,7 +3362,7 @@ func init() {
                     actual_user = os.environ.get("USER", os.environ.get("LOGNAME", "user"))
                 cmd = f"sudo -S bash -c 'groupadd -f docker && usermod -aG docker {actual_user} && chmod 666 /var/run/docker.sock'"
                 self._run_command(cmd, self.setup_log, stdin_data=pw, on_done=lambda c: QMessageBox.information(self, "Permissions", "Docker permissions applied! Restart the app to finish.") if c == 0 else None)
-
+            
             self._ensure_docker_active(_do_fix)
         elif OS_INFO["os"] == "windows":
             # Windows: Diagnostic check for Docker Desktop
@@ -3781,7 +3373,7 @@ func init() {
                     _start_docker_desktop()
             else:
                 if not _docker_available():
-                    reply = QMessageBox.question(self, "Docker Issue",
+                    reply = QMessageBox.question(self, "Docker Issue", 
                         "Docker Desktop is running, but the 'docker' command is unresponsive.\n\n"
                         "This often means the WSL integration has crashed (distro stopped).\n\n"
                         "Attempt an automated 'WSL Repair' (Shutdown + Restart Docker)?",
@@ -3816,11 +3408,11 @@ func init() {
         if OS_INFO["os"] != "windows":
             QMessageBox.information(self, "WSL2", "WSL2 is only applicable on Windows.")
             return
-
+        
         if OS_INFO.get("has_wsl") and OS_INFO.get("has_wsl_distro"):
             QMessageBox.information(self, "WSL2", f"WSL2 is already installed with distro: {OS_INFO.get('wsl_distro', 'Unknown')}.")
             return
-
+        
         reply = QMessageBox.question(
             self, "Install WSL2",
             "This will install WSL2 and Ubuntu on your system.\n\n"
@@ -3832,11 +3424,11 @@ func init() {
         )
         if reply != QMessageBox.Yes:
             return
-
+        
         self.setup_log.append("[System] Installing WSL2 + Ubuntu (this requires admin and may take several minutes)...")
         self.setup_log.append("[System] A UAC elevation prompt will appear — please approve it.")
         QApplication.processEvents()
-
+        
         # Run the install in the background worker
         self._run_command(
             'powershell -Command "Start-Process wsl -ArgumentList \'--install\' -Verb RunAs -Wait"',
@@ -3864,14 +3456,14 @@ func init() {
         """Re-probe WSL2 status on Windows and update the UI."""
         if OS_INFO["os"] != "windows":
             return
-
+        
         self.setup_log.append("[System] Refreshing WSL2 status...")
         OS_INFO["has_wsl"] = _wsl_installed()
         OS_INFO["has_wsl_distro"] = _wsl_distro_installed()
         OS_INFO["wsl_distro"] = _get_default_wsl_distro()
         OS_INFO["has_docker_desktop"] = _docker_desktop_running()
         OS_INFO["docker_available"] = _docker_available()
-
+        
         if OS_INFO["has_wsl"] and OS_INFO["has_wsl_distro"]:
             distro = OS_INFO.get("wsl_distro", "Unknown")
             self.setup_log.append(f"[OK] WSL2 Active — Default Distro: {distro}")
@@ -3879,7 +3471,7 @@ func init() {
             self.setup_log.append("[WARN] WSL2 is installed but no Linux distro found. Click 'Install WSL2 + Ubuntu'.")
         else:
             self.setup_log.append("[WARN] WSL2 is not installed.")
-
+        
         self._check_docker_status()
 
     def _ensure_docker_desktop(self, on_ready):
@@ -3887,11 +3479,11 @@ func init() {
         if OS_INFO["os"] != "windows":
             on_ready()
             return
-
+        
         if _docker_available():
             on_ready()
             return
-
+        
         self.setup_log.append("[System] Docker is not responding. Attempting to start Docker Desktop...")
         if _start_docker_desktop():
             self.setup_log.append("[System] Docker Desktop launch initiated. Waiting for it to become ready (up to 60s)...")
@@ -3926,19 +3518,19 @@ func init() {
         if res == QMessageBox.Yes:
             # Disable docker server and services before deleting credentials to prevent softlock
             self._force_shutdown_sync(show_progress=True)
-
+            
             self.cached_password = None
             self.cemu_username.clear()
             self.cemu_password.clear()
             self.cemu_miiname.clear()
-            if getattr(self, "server_sudo_pass", None):
+            if hasattr(self, "server_sudo_pass"):
                 self.server_sudo_pass.clear()
-
+            
             # Wipe QSettings completely
             for key in self.settings.allKeys():
                 self.settings.remove(key)
             self.settings.sync()
-
+            
             self.statusBar().showMessage("SENSITIVE DATA PURGED", 5000)
             QMessageBox.information(self, "Data Wiped", "All sensitive data and administrator credentials have been permanently cleared.")
 
@@ -3946,37 +3538,26 @@ func init() {
         """Execute a node.js script inside the container to inject an account."""
         username = self.cemu_username.text().strip()
         password = self.cemu_password.text()
-        miiname = self.cemu_miiname.text().strip() or username or "Player"
-
-        # region agent log
-        _agent_debug_log(
-            "H6",
-            "3D-Open-Dock-U.py:create_local_account_entry",
-            "Entering create_local_account",
-            {"username_present": bool(username), "password_present": bool(password)},
-        )
-        # endregion
-
+        miiname = self.cemu_miiname.text().strip() or "Player"
+        
         if not username or not password or not username.isalnum():
             QMessageBox.warning(self, "Input Error", "Please provide a valid alphanumeric Username and a Password.")
             return
-
+            
         if not self.server_running:
             QMessageBox.warning(self, "Network Error", "The Pretendo Server must be RUNNING (ONLINE) to create an account in the database.")
             return
         pid = int(hashlib.sha256(username.lower().encode('utf-8')).hexdigest(), 16) % 1000000000 + 1000000000
         local_ip = self._get_local_ip()
         s_dir = self.server_dir_field.text().strip()
-
+        
         # Pull AES keys from host env files to sync into the container's database
         friends_aes = self._grep_env_file(os.path.join(s_dir, "environment", "friends.local.env"), "PN_FRIENDS_CONFIG_AES_KEY") or ""
         splatoon_aes = self._grep_env_file(os.path.join(s_dir, "environment", "splatoon.local.env"), "PN_SPLATOON_CONFIG_AES_KEY") or ""
         smm_aes = self._grep_env_file(os.path.join(s_dir, "environment", "super-mario-maker.local.env"), "PN_SMM_CONFIG_AES_KEY") or ""
         miiverse_aes = self._grep_env_file(os.path.join(s_dir, "environment", "miiverse-api.local.env"), "PN_MIIVERSE_API_CONFIG_AES_KEY") or ""
         smash_aes = self._grep_env_file(os.path.join(s_dir, "environment", "super-smash-bros-wiiu.local.env"), "PN_SSBWIIU_AES_KEY") or ""
-        mk8_aes = self._grep_env_file(os.path.join(s_dir, "environment", "mario-kart-8.local.env"), "PN_MK8_AES_KEY") or "00"*32
-        pokken_aes = self._grep_env_file(os.path.join(s_dir, "environment", "pokken-tournament.local.env"), "PN_POKKEN_AES_KEY") or ""
-
+        
         js_script = f"""
 const {{ connect }} = require("./dist/database");
 const {{ PNID }} = require("./dist/models/pnid");
@@ -4006,7 +3587,7 @@ try {{
     const baseMiiHex = "03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2";
     const miiBuf = Buffer.alloc(96);
     miiBuf.write(baseMiiHex, "hex");
-
+    
     // Name at offset 0x1A (Max 10 chars, UTF-16 BE)
     let paddedName = miiName.slice(0, 10);
     while(paddedName.length < 10) paddedName += String.fromCharCode(0);
@@ -4124,27 +3705,6 @@ try {{
     await upsertNexServer("Pikmin 3", "10113F00", ["0005000010113F00", "0005000010114000", "0005000010114100"], 6010, "");
     await upsertNexServer("Super Smash Bros. Wii U", "10110E00", ["0005000010110E00", "0005000010144F00", "000500001010ED00"], 6012, "{smash_aes}");
 
-    // CRITICAL FIX FOR 102-1021: Register MK8 Server in the 'account' database
-    // This tells the Auth server that MK8 exists on this local IP at port 6014
-    await Server.findOneAndUpdate(
-        {{ game_server_id: "1010EC00" }},
-        {{
-            service_name: "Mario Kart 8",
-            service_type: "nex",
-            // We must include all regional variations (EUR/USA/JAP) to prevent 102-1021
-            title_ids: ["000500001010EB00", "000500001010EC00", "000500001010ED00"],
-            ip: "{local_ip}",
-            port: 6014,
-            aes_key: "{mk8_aes}",
-            access_mode: "prod",
-            device: 1
-        }},
-        {{ upsert: true }}
-    );
-    console.log("[Success] Mario Kart 8 Service Registered locally (Universal Region Patch).");
-
-    await upsertNexServer("Pokk\u00ebn Tournament", "10191B00", ["0005000010191B00", "0005000010191C00", "0005000010191A00"], 6016, "{pokken_aes}");
-
     // --- Miiverse Discovery Patch (Fixes 400 error) ---
     try {{
         const miiverseDb = mongoose.connection.useDb("pretendo_miiverse");
@@ -4166,6 +3726,30 @@ try {{
         console.log("[Notice] Miiverse sync error: " + mErr.message);
     }}
 
+    // --- AUTO-FIX: Create account for 'BanndPenta' typo if current is 'BannedPenta' ---
+    if (username.toLowerCase() === "bannedpenta") {{
+        console.log("[Notice] Creating alias for 'BanndPenta' typo...");
+        const altUsername = "BanndPenta";
+        const altPid = 1617601004; 
+        let altUser = await PNID.findOne({{ usernameLower: altUsername.toLowerCase() }});
+        if (!altUser) {{
+            altUser = new PNID(user.toObject());
+            altUser._id = new mongoose.Types.ObjectId();
+            altUser.username = altUsername;
+            altUser.usernameLower = altUsername.toLowerCase();
+            altUser.pid = altPid;
+            await altUser.save();
+            
+            let altNex = new NEXAccount(nex.toObject());
+            altNex._id = new mongoose.Types.ObjectId();
+            altNex.pid = altPid;
+            altNex.owning_pid = altPid;
+            await altNex.save();
+            console.log("[Success] Alias 'BanndPenta' created with PID " + altPid);
+        }}
+    }}
+
+
     process.exit(0);
 }} catch(e) {{
     console.error(e);
@@ -4176,23 +3760,15 @@ try {{
         s_dir = self.server_dir_field.text().strip()
         # Use docker compose exec -T for robust service targeting and project name handling
         cmd = f"docker compose exec -T account node -e {shlex.quote(js_script)}"
-
-        pw = self.cached_password or (self.server_sudo_pass.text() if getattr(self, 'server_sudo_pass', None) else None)
+        
+        pw = self.cached_password or (self.server_sudo_pass.text() if hasattr(self, 'server_sudo_pass') else None)
         if pw and OS_INFO["os"] == "linux":
             # Direct sudo execution for reliable docker access
             cmd = f"sudo -S {cmd}"
-
+        
         self.cemu_log.append("[System] Injecting Account into Local Service Layer...")
-
+        
         def _on_reg_done(code):
-            # region agent log
-            _agent_debug_log(
-                "H6",
-                "3D-Open-Dock-U.py:create_local_account_done",
-                "create_local_account finished docker exec",
-                {"exit_code": code},
-            )
-            # endregion
             if code == 0:
                 self._track_account_in_vault(username, password, miiname)
                 QMessageBox.information(self, "Registration", f"Account '{username}' Registration task completed!\n\nAdded to Credentials Vault as: Account:{username}")
@@ -4213,240 +3789,133 @@ try {{
             "timestamp": datetime.now().isoformat()
         }
         try:
-            # region agent log
-            _agent_debug_log(
-                "H5",
-                "3D-Open-Dock-U.py:_track_account_in_vault",
-                "Tracking account in vault",
-                {"has_username": bool(username)},
-            )
-            # endregion
             with open(os.path.join(vpath, "profile_meta.json"), "w") as f:
                 json.dump(vmeta, f, indent=4)
             self.refresh_vault_list()
         except: pass
 
     def _ensure_console_certs(self, data_path):
-        """Deploy essential ccerts and scerts matching BannedPenta OTP to ALL possible MLC paths."""
+        """Deploy essential ccerts and scerts matching BannedPenta OTP to resolve decryption errors."""
         try:
-            # Collect targets (both data_path and standard Linux dirs)
-            targets = [data_path]
-            if OS_INFO["os"] == "linux":
-                home = os.path.expanduser("~")
-                targets.extend([
-                    os.path.join(home, ".local/share/Cemu"),
-                    os.path.join(home, ".config/Cemu"),
-                    os.path.join(home, "Emulation", "roms", "wiiu"),
-                ])
-
+            # Base content path: mlc01/sys/title/0005001b/10054000/content/
+            base_content = os.path.join(str(data_path), "mlc01", "sys", "title", "0005001b", "10054000", "content")
+            
             # Decompress cert data
             raw_json = zlib.decompress(base64.b64decode(CONSOLE_CERTS_PACKED)).decode()
             certs_dict = json.loads(raw_json)
-
-            for base in set(targets):
-                if not base or not os.path.isdir(base): continue
-                # Base content path for system certs title
-                base_content = os.path.join(base, "mlc01", "sys", "title", "0005001b", "10054000", "content")
-
-                for rel_file, b64_data in certs_dict.items():
-                    target_f = os.path.join(base_content, rel_file)
-                    os.makedirs(os.path.dirname(target_f), exist_ok=True)
-                    with open(target_f, "wb") as f:
-                        f.write(base64.b64decode(b64_data))
-
+            
+            for rel_file, b64_data in certs_dict.items():
+                target_f = os.path.join(base_content, rel_file)
+                os.makedirs(os.path.dirname(target_f), exist_ok=True)
+                with open(target_f, "wb") as f:
+                    f.write(base64.b64decode(b64_data))
+            
             self.cemu_log.append("[System] Console Certificates (ccerts & scerts) Synchronized.")
         except Exception as e:
             self.cemu_log.append(f"[ERROR] Failed to deploy console certs: {e}")
 
     def _ensure_cemu_fonts(self, data_path):
-        """Download and deploy shared fonts to ALL possible MLC paths."""
+        """Download and deploy the CafeStd.ttf shared font required for Splatoon Mii names.
+        Deploys to all regions (EU, US, JP) to ensure compatibility.
+        """
         font_url = "https://raw.githubusercontent.com/BannedPenta01/3D-Open-Dock-U/06b4aca5702eb58f77adad772f8c6bf520bb4cb7/CafeStd.ttf"
-        regions = ["10042000", "10042300", "10042400"] # JP, US, EU
-
-        targets = [data_path]
-        if OS_INFO["os"] == "linux":
-            home = os.path.expanduser("~")
-            targets.extend([
-                os.path.join(home, ".local/share/Cemu"),
-                os.path.join(home, ".config/Cemu"),
-                os.path.join(home, "Emulation", "roms", "wiiu"),
-            ])
-
+        
+        # Region title IDs: JP, US, EU
+        regions = ["10042000", "10042300", "10042400"]
+        
         font_data = None
         try:
-            for base in set(targets):
-                if not base or not os.path.isdir(base): continue
-                for region_id in regions:
-                    content_path = os.path.join(base, "mlc01", "sys", "title", "0005001b", region_id, "content")
-                    os.makedirs(content_path, exist_ok=True)
-
-                    for font_name in ["CafeStd.ttf", "CafeDMP7.ttf"]:
-                        target_f = os.path.join(content_path, font_name)
-                        if not os.path.exists(target_f):
-                            if font_data is None:
-                                self.cemu_log.append(f"[System] Downloading shared font...")
-                                if HAS_REQUESTS:
-                                    r = requests.get(font_url, timeout=15)
-                                    if r.status_code == 200: font_data = r.content
-                                else:
-                                    import urllib.request
-                                    with urllib.request.urlopen(font_url) as response: font_data = response.read()
-
-                            if font_data:
-                                with open(target_f, "wb") as f: f.write(font_data)
-                                self.cemu_log.append(f"[OK] Installed {font_name} in {region_id} ({base})")
-            if font_data: self.cemu_log.append("[System] Shared Fonts Synchronized.")
+            for region_id in regions:
+                content_path = os.path.join(str(data_path), "mlc01", "sys", "title", "0005001b", region_id, "content")
+                os.makedirs(content_path, exist_ok=True)
+                
+                # We install BOTH filenames as some games/Cemu versions look for DMP7
+                for font_name in ["CafeStd.ttf", "CafeDMP7.ttf"]:
+                    target_f = os.path.join(content_path, font_name)
+                    
+                    if not os.path.exists(target_f):
+                        if font_data is None:
+                            self.cemu_log.append(f"[System] Downloading shared font for Mii names...")
+                            if HAS_REQUESTS:
+                                r = requests.get(font_url, timeout=15)
+                                if r.status_code == 200: font_data = r.content
+                            else:
+                                import urllib.request
+                                with urllib.request.urlopen(font_url) as response:
+                                    font_data = response.read()
+                        
+                        if font_data:
+                            with open(target_f, "wb") as f:
+                                f.write(font_data)
+                            self.cemu_log.append(f"[OK] Installed {font_name} in {region_id}")
+            
+            if font_data:
+                self.cemu_log.append("[System] Shared Fonts synchronized across all regions.")
+            else:
+                if not os.path.exists(os.path.join(str(data_path), "mlc01", "sys", "title", "0005001b", "10042400", "content", "CafeStd.ttf")):
+                    self.cemu_log.append("[ERROR] Could not download shared fonts.")
         except Exception as e:
             self.cemu_log.append(f"[ERROR] Font installation failed: {e}")
 
-    def _ensure_mlc_save_dirs(self, data_path):
-        """Generates valid 96-byte Mii binary to stop MK8 Signal 11 crash."""
-        titles = ["1010ec00", "1010ed00", "1010eb00"]
-        home = os.path.expanduser("~")
-        bases = [data_path, os.path.join(home, ".local/share/Cemu")]
-
-        mii_hex = "03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2"
-        mii_data = binascii.unhexlify(mii_hex)
-
-        for base in bases:
-            if not base or not os.path.isdir(base): continue
-            for tid in titles:
-                os.makedirs(os.path.join(base, "mlc01/usr/save/00050000", tid.lower(), "user/80000001"), exist_ok=True)
-                os.makedirs(os.path.join(base, "mlc01/usr/save/00050000", tid.upper(), "user/80000001"), exist_ok=True)
-                os.makedirs(os.path.join(base, "mlc01/usr/save/00050000", tid.lower(), "common"), exist_ok=True)
-
-            mii_dir = os.path.join(base, "mlc01/sys/title/0005001b/10056000/content")
-            os.makedirs(mii_dir, exist_ok=True)
-            with open(os.path.join(mii_dir, "FFLStoreData"), "wb") as f:
-                f.write(mii_data)
-
-    def _ensure_mk8_game_profile(self, cemu_base):
-        """Write a stability-oriented game profile for Mario Kart 8 (000500001010ec00)."""
-        if not cemu_base or not os.path.isdir(cemu_base):
-            return
-        profile_dir = os.path.join(cemu_base, "gameProfiles")
-        profile_path = os.path.join(profile_dir, "000500001010ec00.ini")
-        try:
-            os.makedirs(profile_dir, exist_ok=True)
-            content = (
-                "# Mario Kart 8 - stability profile\n"
-                "# Generated by 3D-Open-Dock-U.\n"
-                "[General]\n"
-                "loadSharedLibraries = true\n\n"
-                "[Graphics]\n"
-                "accurateShaderMul = true\n"
-            )
-            with open(profile_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            if hasattr(self, "cemu_log"):
-                self.cemu_log.append(f"[MK8] Game profile written: {profile_path}")
-        except Exception as e:
-            pass
-
-    def _show_mk8_crash_workarounds(self):
-        """Explain the MK8 crash, the fix, and ask users to report to Cemu."""
-        msg = (
-            "The problem: Cemu’s PPC interpreter sometimes reads from an invalid memory address (e.g. in LWZX). "
-            "That causes a crash (signal 11 / SIGSEGV) in games like Mario Kart 8.\n\n"
-            "The fix: Before reading, Cemu should check that the address is in a valid range (e.g. with memory_isAddressRangeAccessible). "
-            "If it isn’t, return 0 instead of dereferencing. That needs to be added in Cemu’s usermode interpreter (PPCInterpreterImpl.cpp, ppcMem_readDataU32).\n\n"
-            "Please report your crash and log to the Cemu project so they can add this fix:\n"
-            "github.com/cemu-project/Cemu/issues"
-        )
-        QMessageBox.information(self, "MK8 / Cemu crash", msg)
-
-    def _remove_system_mii_file_if_present(self, data_path):
-        """DEPRECATED: Do not delete FFLStoreData.
-        Removing this file causes games like Mario Kart 8 to crash on boot (Signal 11 LWZX)
-        because the game fails to initialize the Mii database."""
-        pass
-
-    def _ensure_system_mii_data(self, data_path, mii_bytes):
-        """Deploy one valid Mii (96 bytes, FFLStoreData format) to the system Mii title.
-        Games like Mario Kart 8 may load Mii from mlc01/sys/title/0005001b/10056000;
-        missing data there can cause crashes (e.g. SIGSEGV in PPCInterpreter)."""
-        if not mii_bytes or len(mii_bytes) != 96:
-            return
-        # Title 0005001b/10056000 = system Mii database (FFLRes/FFLStoreData)
-        content_rel = os.path.join("mlc01", "sys", "title", "0005001b", "10056000", "content")
-        ffl_store_file = "FFLStoreData"
-        targets = []
-        if data_path:
-            targets.append(os.path.join(data_path, content_rel, ffl_store_file))
-        if OS_INFO["os"] == "linux":
-            home = os.path.expanduser("~")
-            for base in [os.path.join(home, ".local/share/Cemu"), os.path.join(home, ".config/Cemu")]:
-                if os.path.isdir(base):
-                    targets.append(os.path.join(base, content_rel, ffl_store_file))
-        for path in targets:
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "wb") as f:
-                    f.write(mii_bytes)
-                if hasattr(self, "cemu_log"):
-                    self.cemu_log.append(f"[System] Mii data deployed: {path}")
-            except Exception as e:
-                if hasattr(self, "cemu_log"):
-                    self.cemu_log.append(f"[WARN] System Mii deploy failed {path}: {e}")
-
-    # Default Wii U Mii template (96 bytes): valid facial features, body; name/author/CRC are patched.
-    _WIIU_MII_TEMPLATE_HEX = "03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2"
-
-    def _build_wiiu_mii(self, mii_name, base_hex=None):
-        """Build a valid 96-byte Wii U Mii (FFLStoreData) with the given name.
-        Uses base_hex if provided and valid (192 hex chars); otherwise the default template.
-        Name and author are written at 0x1A and 0x48 (UTF-16BE, 20 bytes). CRC at 0x5E.
-        Returns (mii_bytes_96, account_name_hex) for MiiName= in account.dat (22 bytes UTF-16BE = 44 hex)."""
-        name_limited = (mii_name or "Player")[:10]
-        name_be_20 = name_limited.encode("utf-16-be").ljust(20, b"\x00")
-        account_name_hex = binascii.hexlify(name_limited.encode("utf-16-be").ljust(22, b"\x00")).decode("ascii")
-        raw = base_hex if base_hex and len(base_hex) >= 192 and all(c in "0123456789abcdefABCDEF" for c in base_hex[:192]) else None
-        if raw is None:
-            raw = self._WIIU_MII_TEMPLATE_HEX.ljust(192, "0")
-        buf = bytearray(binascii.unhexlify((raw[:192]).ljust(192, "0")))
-        if len(buf) < 96:
-            buf.extend(b"\x00" * (96 - len(buf)))
-        buf[0x1A:0x1A + 20] = name_be_20
-        buf[0x48:0x48 + 20] = name_be_20
-        crc = 0
-        for i in range(0x5E):
-            crc ^= buf[i] << 8
-            for _ in range(8):
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
-        buf[0x5E] = (crc >> 8) & 0xFF
-        buf[0x5F] = crc & 0xFF
-        return bytes(buf), account_name_hex
 
     def _force_write_file(self, path, content):
-        """Robustly overwrite a file, enforcing exact binary bytes to prevent Cemu parser crashes."""
+        """Robustly overwrite a file, attempting to fix permissions or replace the file if access is denied.
+        Falls back to sudo (Linux) or PowerShell (Windows) if standard Python file operations fail.
+        """
         try:
+            # Ensure directory exists
             os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+            # Try to fix permissions first if file exists
             if os.path.exists(path):
                 try: os.chmod(path, 0o666)
                 except: pass
-
-            success = False
+            
+            # Standard write attempt
             try:
-                # CRITICAL FIX: Use 'wb' to prevent Linux from destroying the \r\n line endings
-                with open(path, "wb") as f:
-                    f.write(content.encode("utf-8"))
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
                 try: os.chmod(path, 0o777)
                 except: pass
-                success = True
+                return True
             except (PermissionError, OSError):
-                # Fallback to elevated writes if permission denied
-                pw = self.cached_password or self._ask_sudo_password()
-                if pw and OS_INFO["os"] == "linux":
+                if OS_INFO["os"] == "windows":
+                    # Windows: Try PowerShell with Force flag
+                    import tempfile
+                    try:
+                        # Write content to temp file, then copy with PowerShell
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.tmp', delete=False, encoding='utf-8') as tf:
+                            tf.write(content)
+                            tf_path = tf.name
+                        win_path = path.replace("'", "''")
+                        win_tmp = tf_path.replace("'", "''")
+                        cmd = f"powershell -Command \"Copy-Item -Path '{win_tmp}' -Destination '{win_path}' -Force\""
+                        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                        os.unlink(tf_path)
+                        if result.returncode == 0:
+                            return True
+                        raise OSError(f"PowerShell write failed: {result.stderr}")
+                    except Exception as we:
+                        raise OSError(f"Windows write failed: {we}")
+                else:
+                    # Linux: Fallback to sudo
+                    pw = self.cached_password or self._ask_sudo_password()
+                    if not pw:
+                        raise PermissionError(f"Sudo password required to write to {path}")
+                    
                     cmd = f"sudo -S tee {shlex.quote(path)} > /dev/null"
-                    proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    proc.communicate(input=f"{pw}\n".encode("utf-8") + content.encode("utf-8"))
+                    proc = subprocess.Popen(shlex.split(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    stdout, stderr = proc.communicate(input=f"{pw}\n{content}")
+                    
                     if proc.returncode == 0:
                         subprocess.run(["sudo", "-S", "chmod", "777", path], input=pw + "\n", text=True, capture_output=True)
-                        success = True
-            return success
+                        return True
+                    else:
+                        raise OSError(f"Sudo write failed: {stderr}")
+            
+            return True
         except Exception as e:
-            if hasattr(self, "cemu_log"):
-                self.cemu_log.append(f"[ERROR] Force-write failed for {path}: {e}")
+            self.cemu_log.append(f"[ERROR] Force-write failed for {path}: {e}")
             return False
 
     def _force_delete_file(self, path):
@@ -4475,37 +3944,49 @@ try {{
         except: return False
 
     def patch_cemu_settings(self, url, is_official=False):
+        # Dynamically resolve localhost if needed
+        if "localhost" in url or "127.0.0.1" in url:
+            real_ip = self._get_local_ip()
+            if real_ip != "127.0.0.1":
+                url = url.replace("localhost", real_ip).replace("127.0.0.1", real_ip)
+                self.statusBar().showMessage(f"Redirected localhost -> {real_ip} for AppImage compatibility.", 3000)
+
         cemu_dir = self.cemu_dir_field.text().strip()
         p = os.path.join(cemu_dir, "settings.xml") if cemu_dir else OS_INFO.get("cemu_settings", "")
-
+        
         try:
-            # 1. Update settings.xml (Proxy & SSL Bypass)
+            # 1-3. settings.xml modifications (Optional: some forks/builds may not have this file)
             if p and os.path.exists(p):
                 with open(p, "r") as f: c = f.read()
-
+                
                 # Force Online & Global SSL Bypass
                 if "<OnlineEnabled>true</OnlineEnabled>" not in c:
                     if "<OnlineEnabled>false</OnlineEnabled>" in c:
                         c = c.replace("<OnlineEnabled>false</OnlineEnabled>", "<OnlineEnabled>true</OnlineEnabled>")
                     elif "</Account>" in c:
                         c = c.replace("</Account>", "    <OnlineEnabled>true</OnlineEnabled>\n    </Account>")
-
+                
+                # INJECT SSL BYPASS into Account block for latest Cemu compatibility
                 if "<Account>" in c and "<disablesslverification>1</disablesslverification>" not in c:
                     c = c.replace("<Account>", "<Account>\n        <disablesslverification>1</disablesslverification>")
-
+                
+                # Ensure disablesslverification is in settings.xml root too
                 if "<disablesslverification>1</disablesslverification>" not in c:
                     if "<disablesslverification>0</disablesslverification>" in c:
                         c = c.replace("<disablesslverification>0</disablesslverification>", "<disablesslverification>1</disablesslverification>")
                     elif "</content>" in c:
                         c = c.replace("</content>", "    <disablesslverification>1</disablesslverification>\n</content>")
-
+                
+                # Kill Legacy Cert Pointers
                 c = re.sub(r"<account_cert_path>.*?</account_cert_path>", "<account_cert_path></account_cert_path>", c)
 
+                # FORCE Account Selection to 80000001 (Decimal: 2147483649)
                 if "<PersistentId>" in c:
                     c = re.sub(r"<PersistentId>\d+</PersistentId>", "<PersistentId>2147483649</PersistentId>", c)
                 elif "<Account>" in c:
                     c = c.replace("<Account>", "<Account>\n        <PersistentId>2147483649</PersistentId>")
-
+                
+                # INJECT AccountId (Username) into settings.xml to force Network Link status
                 username = self.cemu_username.text().strip()
                 if username:
                     if "<AccountId>" in c:
@@ -4513,63 +3994,73 @@ try {{
                     elif "<Account>" in c:
                         c = c.replace("<Account>", f"<Account>\n        <AccountId>{username}</AccountId>")
 
-                # ActiveService: 0=Nintendo, 1=Pretendo (built-in endpoints), 2=Custom (needs network_services.xml)
-                # Use 1 (Pretendo) for local stack: mitmproxy intercepts Pretendo domains and routes locally.
-                # Using 2 (Custom) + deleting network_services.xml causes null pointer crashes (Signal 11 LWZX)
-                # because Cemu has no endpoint URLs and games get null network response objects.
-                active_svc = "1"  # Pretendo — proxy handles redirection to local stack
+                # Force ActiveService to 2 (Pretendo) to natively use Pretendo account types
                 if "<ActiveService>" in c:
-                    c = re.sub(r"<ActiveService>\d+</ActiveService>", f"<ActiveService>{active_svc}</ActiveService>", c)
+                    c = re.sub(r"<ActiveService>\d+</ActiveService>", "<ActiveService>2</ActiveService>", c)
                 elif "<Account>" in c:
-                    c = c.replace("<Account>", f"<Account>\n        <ActiveService>{active_svc}</ActiveService>")
+                    c = c.replace("<Account>", "<Account>\n        <ActiveService>2</ActiveService>")
 
+                # Update AccountService selection — single regex to avoid duplicate Service= attributes
                 if "<AccountService>" in c:
-                    c = re.sub(r'<SelectedService\s+PersistentId="\d+"(?:\s+Service="[^"]*")?(?:\s+/>|>)', f'<SelectedService PersistentId="2147483649" Service="{active_svc}"/>', c)
+                    c = re.sub(r'<SelectedService\s+PersistentId="\d+"(?:\s+Service="[^"]*")?(?:\s+/>|>)', '<SelectedService PersistentId="2147483649" Service="2"/>', c)
                 elif "</content>" in c:
-                    as_block = f'    <AccountService>\n        <SelectedService PersistentId="2147483649" Service="{active_svc}"/>\n    </AccountService>\n'
+                    as_block = '    <AccountService>\n        <SelectedService PersistentId="2147483649" Service="2"/>\n    </AccountService>\n'
                     c = c.replace("</content>", f"{as_block}</content>")
-
-                # CRITICAL FIX: Split Proxy URL into IP and Port for libcurl, or clear if official
+                
+                # Patch Proxy URL
                 if is_official:
-                    c = re.sub(r"<proxy_server>.*?</proxy_server>", "<proxy_server></proxy_server>", c)
-                    c = re.sub(r"<proxy_port>.*?</proxy_port>", "<proxy_port>0</proxy_port>", c)
+                   # Remove proxy for official
+                   c = re.sub(r"<proxy_server>.*?</proxy_server>", "<proxy_server></proxy_server>", c)
                 else:
-                    import urllib.parse
-                    parsed = urllib.parse.urlparse(url if "://" in url else "http://" + url)
-                    proxy_ip = parsed.hostname or "127.0.0.1"
-                    proxy_port = parsed.port or 8070
-
                     if "<proxy_server>" in c:
-                        c = re.sub(r"<proxy_server>.*?</proxy_server>", f"<proxy_server>{proxy_ip}</proxy_server>", c)
+                        c = re.sub(r"<proxy_server>.*?</proxy_server>", f"<proxy_server>{url}</proxy_server>", c)
                     elif "</content>" in c:
-                        c = c.replace("</content>", f"    <proxy_server>{proxy_ip}</proxy_server>\n</content>")
-
-                    if "<proxy_port>" in c:
-                        c = re.sub(r"<proxy_port>.*?</proxy_port>", f"<proxy_port>{proxy_port}</proxy_port>", c)
-                    elif "</content>" in c:
-                        c = c.replace("</content>", f"    <proxy_port>{proxy_port}</proxy_port>\n</content>")
-
+                        c = c.replace("</content>", f"    <proxy_server>{url}</proxy_server>\n</content>")
+                
                 self._force_write_file(p, c)
+            else:
+                self.statusBar().showMessage("settings.xml not found; pursuing network_services.xml bypass only.", 3000)
+            
+            # 4. Multi-Path network_services.xml injection (Full Service Redirect)
+            # Cemu 2.0+ Linux has split dirs: config (~/.config/Cemu) vs data (~/.local/share/Cemu).
+            # We MUST write network_services.xml to ALL possible paths to prevent stale files
+            # with explicit proxy URLs from causing mitmproxy redirect loops (Splatoon softlock).
+            services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas", "npts", "api", "ecs", "ias", "cas", "boss", "friends", "account", "clp", "shop", "news", "portal", "discovery"]
+            
+            url_nodes = "\n".join([f"        <{s}>{url}</{s}>" for s in services])
+            urls_block = f"    <urls>\n{url_nodes}\n    </urls>"
 
-            # 2. CRITICAL FIX: Delete any existing network_services.xml.
-            # Injecting local IPs into this file breaks mitmproxy routing completely.
+            ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n{urls_block}\n</content>'
+            
+            # Collect ALL directories that Cemu might read network_services.xml from
             ns_targets = set()
-            if cemu_dir: ns_targets.add(str(cemu_dir))
-            if p and os.path.dirname(p) != ".": ns_targets.add(str(os.path.dirname(p)))
+            if cemu_dir:
+                ns_targets.add(str(cemu_dir))
+            if p and os.path.dirname(p) != ".":
+                ns_targets.add(str(os.path.dirname(p)))
+            # Always include the OS-detected dirs (config + data split)
             for key in ["cemu_dir", "cemu_data"]:
                 val = OS_INFO.get(key, "")
-                if val: ns_targets.add(str(val))
-
+                if val:
+                    ns_targets.add(str(val))
+            
             for target_dir in ns_targets:
                 if target_dir and os.path.isdir(target_dir):
                     ns_xml = os.path.join(target_dir, "network_services.xml")
-                    self._force_delete_file(ns_xml)
+                    self._force_write_file(ns_xml, ns_content)
 
-            msg = "Cemu restored to Official Pretendo." if is_official else f"Wii U Patched & Connected!\n\nProxy configured: {url}\nSSL Verification Disabled."
-            self.statusBar().showMessage(msg.split('\n')[0], 5000)
-            QMessageBox.information(self, "Success", msg)
-        except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            if is_official:
+                # Remove network_services.xml for official to rely on Cemu's internal redirection
+                for target_dir in ns_targets:
+                    if target_dir and os.path.isdir(target_dir):
+                        ns_xml = os.path.join(target_dir, "network_services.xml")
+                        self._force_delete_file(ns_xml)
+                self.statusBar().showMessage("Cemu restored to Official Pretendo.", 5000)
+                return
+
+            self.statusBar().showMessage("Cemu Patch & Connect Complete!", 5000)
+            QMessageBox.information(self, "Success", f"Wii U Patched & Connected!\n\nAll services redirected to {url}\nSSL Verification Disabled.\nLocal services synced.")
+        except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def _sync_docker_services_to_port(self, target_url):
         """Patch Docker compose.yml mitmproxy port to match the Target Node URL and restart key services.
@@ -4595,7 +4086,7 @@ try {{
 
         # 2. Restart the critical service chain ONLY if needed
         #    mitmproxy-pretendo: the entry-point proxy that emulators connect to
-
+        
         if not compose_changed:
             self.cemu_log.append("[Docker Sync] Docker services are stable. No restart required.")
             return
@@ -4617,84 +4108,217 @@ try {{
         )
 
     def apply_cemu_patch_all(self):
-        # Safely read mode_pretendo to avoid silent AttributeErrors
-        mode_btn = getattr(self, "mode_pretendo", None)
-        use_official = bool(mode_btn.isChecked()) if mode_btn else False
+        use_official = self.mode_pretendo.isChecked()
         url = "https://api.pretendo.network" if use_official else self.patch_url_input.text().strip()
 
-        # region agent log
-        _agent_debug_log(
-            "H8",
-            "3D-Open-Dock-U.py:apply_cemu_patch_all",
-            "Patch & Connect (Cemu) invoked",
-            {"use_official": use_official, "url": url},
-        )
-        # endregion
+        if not use_official:
+            # Sync Docker services to the target port BEFORE patching the emulator
+            self._sync_docker_services_to_port(url)
 
-        try:
-            if not use_official:
-                # Sync Docker services to the target port BEFORE patching the emulator
-                self._sync_docker_services_to_port(url)
-
-            self.patch_cemu_settings(url, is_official=use_official)
-            self.generate_cemu_manual()
-            if not use_official:
-                self.create_local_account()
-
-            # Track in vault if local server
-            if not use_official and ("127.0.0.1" in url or "localhost" in url):
-                self._track_account_in_vault(self.cemu_username.text(), self.cemu_password.text(), self.cemu_miiname.text())
-        except Exception as e:
-            if hasattr(self, "cemu_log"):
-                self.cemu_log.append(f"[ERROR] Patch & Connect (Cemu) failed: {e}")
-            QMessageBox.critical(self, "Patch Error", f"Patch & Connect (Cemu) failed:\n{e}")
+        self.patch_cemu_settings(url, is_official=use_official)
+        self.generate_cemu_manual()
+        if not use_official:
+            self.create_local_account()
+        
+        # Track in vault if local server
+        if not use_official and ("127.0.0.1" in url or "localhost" in url):
+            self._track_account_in_vault(self.cemu_username.text(), self.cemu_password.text(), self.cemu_miiname.text())
 
     def generate_cemu_manual(self):
-        """Writes a strict binary identity to stop the Mario Kart 8 Signal 11 crash."""
-        username = self.cemu_username.text().strip() or "Banned"
-        home = os.path.expanduser("~")
-        base = os.path.join(home, ".local/share/Cemu")
+        username = self.cemu_username.text().strip()
+        password = self.cemu_password.text()
+        miiname = self.cemu_miiname.text().strip() or "Player"
+        data_path = self.cemu_dir_field.text().strip() or OS_INFO.get("cemu_data", "")
 
-        if not os.path.isdir(base):
-            os.makedirs(base, exist_ok=True)
+        if not username or not password:
+            QMessageBox.warning(self, "Error", "Username and password required.")
+            return
 
         try:
-            acc_dir = os.path.join(base, "mlc01/usr/save/system/act/80000001")
-            os.makedirs(acc_dir, exist_ok=True)
+            # 1. Identity Blobs (Multi-write to root and sys)
+            # Boot secure keys from config text file instead of script source
+            otp_hex = SEC_KEYS.get("BANNED_OTP_HEX", "0" * 2048)
+            otp = bytearray(safe_unhex(otp_hex, 1024))
+            
+            seeprom_hex = SEC_KEYS.get("BANNED_SEEPROM_HEX", "0" * 1024)
+            seeprom = bytearray(safe_unhex(seeprom_hex, 512))
+            
+            # Destination Sweep (Keys must be in both root and sys for different Cemu versions)
+            targets = [data_path]
+            # Ensure mlc01/sys/ is checked and used - critical for Linux AppImage / Flats
+            mlc_sys = os.path.join(data_path, "mlc01", "sys")
+            # If mlc01 exists, we MUST write to sys too
+            if os.path.isdir(os.path.join(data_path, "mlc01")):
+                targets.append(mlc_sys)
+            
+            for t in targets:
+                try:
+                    os.makedirs(t, exist_ok=True)
+                    with open(os.path.join(t, "otp.bin"), "wb") as f: f.write(otp)
+                    with open(os.path.join(t, "seeprom.bin"), "wb") as f: f.write(seeprom)
+                except Exception as ex:
+                    self.cemu_log.append(f"[WARN] Failed to write keys to {t}: {ex}")
+                
+            # FORCE Cemu to use the correct SSL device certificates matching the BannedPenta OTP
+            # By deploying these files, we resolve "Unable to decrypt private key" and "Unable to load certificate" errors.
+            self._ensure_console_certs(data_path)
+            # Deploy shared font for Mii name rendering (Fixes ??? tokens in Splatoon)
+            self._ensure_cemu_fonts(data_path)
 
-            # Binary Mii Template and PrincipalId
+            # 2. Account Generation (NEX-Compatible Authenticated Hash)
+            # Use same deterministic PID generation so UI syncs with Database exactly
+            pid = int(hashlib.sha256(username.lower().encode('utf-8')).hexdigest(), 16) % 1000000000 + 1000000000
+            pid_bytes = pid.to_bytes(4, byteorder='little')
+            
+            pwd_hash = hashlib.sha256(pid_bytes + b"\x02eCF" + password.encode('utf-8')).hexdigest()
+            
+            # Authentically link account to BannedPenta console IDs
+            uuid_hex = "e7e455936d2acbae339c189fb2c42990"
+            trans_id_hex = "2000004b2c42990"
+            
+            # Persistent Mii Hex (MiiName & Data sync)
+            # Always regenerate from the validated template to ensure CRC is correct
+            stored_mii = None
+            
+            # Force 10-char limit for Mii (Wii U Standard)
+            mii_name_limited = miiname[:10]
+            # MiiName field: UTF-16BE hex (STRICT Wii U BIG ENDIAN REQUIREMENT)
+            acct_name_bytes = mii_name_limited.encode('utf-16be').ljust(22, b'\x00')
+            account_name_hex = binascii.hexlify(acct_name_bytes).decode('ascii')
+            
+            if not stored_mii:
+                # Build MiiData using the same validated template as the server
+                # This template has valid facial features, body proportions, etc.
+                # Without a valid template, games show "???" for the Mii name.
+                base_mii_hex = "03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2"
+                mii_buf = bytearray(binascii.unhexlify(base_mii_hex.ljust(192, '0')))
+                
+                # Write name at offset 0x1A (26), 10 chars UTF-16LE = 20 bytes  
+                name_bytes_le = mii_name_limited.encode('utf-16le').ljust(20, b'\x00')
+                mii_buf[0x1A:0x1A+20] = name_bytes_le
+                # Write Author Name at offset 0x48 (72) - Crucial for Splatoon!
+                mii_buf[0x48:0x48+20] = name_bytes_le
+                
+                # CRC16-CCITT over first 0x5E (94) bytes, written at 0x5E (big endian)
+                crc = 0
+                for i in range(0x5E):
+                    crc ^= (mii_buf[i] << 8)
+                    for _ in range(8):
+                        if crc & 0x8000:
+                            crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+                        else:
+                            crc = (crc << 1) & 0xFFFF
+                mii_buf[0x5E] = (crc >> 8) & 0xFF
+                mii_buf[0x5F] = crc & 0xFF
+                
+                stored_mii = binascii.hexlify(mii_buf).decode('ascii')
+            elif len(str(stored_mii)) >= 92: # Patch name into existing if possible
+                s_mii = str(stored_mii)
+                name_bytes_le = mii_name_limited.encode('utf-16le').ljust(20, b'\x00')
+                name_hex_le = binascii.hexlify(name_bytes_le).decode('ascii')
+                # Replace name (offset 26 -> 46) and author (offset 72 -> 92)
+                # s_mii indices: 26*2=52, 46*2=92 | 72*2=144, 92*2=184
+                new_s_mii = s_mii[0:52] + name_hex_le + s_mii[92:144] + name_hex_le + s_mii[184:]
+                mii_buf = bytearray(binascii.unhexlify(new_s_mii))
+                # Ensure buffer is 96 bytes
+                if len(mii_buf) < 96:
+                    mii_buf.extend(b'\x00' * (96 - len(mii_buf)))
+                # Recalculate CRC
+                crc = 0
+                for i in range(0x5E):
+                    crc ^= (mii_buf[i] << 8)
+                    for _ in range(8):
+                        if crc & 0x8000:
+                            crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+                        else:
+                            crc = (crc << 1) & 0xFFFF
+                mii_buf[0x5E] = (crc >> 8) & 0xFF
+                mii_buf[0x5F] = crc & 0xFF
+                stored_mii = binascii.hexlify(mii_buf).decode('ascii')
+
+
             lines = [
                 "AccountInstance_20120705",
                 "PersistentId=80000001",
+                f"TransferableIdBase={trans_id_hex}",
+                f"Uuid={uuid_hex}",
+                "ParentalControlSlotNo=0",
+                f"MiiData={stored_mii}", 
+                f"MiiName={account_name_hex}",
+                "IsMiiUpdated=1",
                 f"AccountId={username}",
-                "MiiData=03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2",
-                "MiiName=50006c00610079006500720000000000000000000000",
-                "PrincipalId=3b9aca01",
-                "IsPnidLinked=1",
-                "Region=2",
-                "Language=1"
+                "BirthYear=2003", "BirthMonth=1", "BirthDay=1", "Gender=0",
+                "IsMailAddressValidated=1",
+                "EmailAddress=none@pretendo.network",
+                "Country=49", "SimpleAddressId=49010000",
+                "TimeZoneId=America/New_York",
+                "UtcOffset=ffffffff9ac22000",
+                f"PrincipalId={pid}",
+                "IsNnidLinked=1",
+                "IsPasswordCacheEnabled=1",
+                f"AccountPasswordCache={pwd_hash}",
+                "NnasType=1", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
+                "IsPersistentIdUploaded=1",
+                "IsConsoleAccountInfoUploaded=1",
+                "LastAuthenticationResult=0",
+                f"StickyAccountId={username}",
+                f"StickyPrincipalId={pid}",
+                "IsServerAccountDeleted=0",
+                "IsCommitted=1"
             ]
+            
+            # Destinations: BOTH usr/act (1.x) and accounts/ folder (2.x)
+            # We explicitly check and overwrite files in all standard Cemu locations to avoid "stale" files.
+            p_targets = []
+            cemu_candidates = [data_path]
+            if OS_INFO["os"] == "linux":
+                home = os.path.expanduser("~")
+                cemu_candidates.extend([os.path.join(home, ".local/share/Cemu"), os.path.join(home, ".config/Cemu")])
+            
+            for base in set(cemu_candidates):
+                if not base or not os.path.isdir(base): continue
+                p_targets.append(os.path.join(base, "mlc01/usr/save/system/act/80000001"))
+                p_targets.append(os.path.join(base, "accounts/80000001"))
 
-            with open(os.path.join(acc_dir, "account.dat"), "wb") as f:
-                f.write(("\r\n".join(lines) + "\r\n").encode("utf-8"))
+            for d in set(p_targets):
+                for fname in ["account.dat", "account.ini"]:
+                    fpath = os.path.join(d, fname)
+                    
+                    # Cemu is format-sensitive: .dat usually expects HEX PrincipalId, .ini expects DECIMAL.
+                    # CRITICAL: Both files MUST have the AccountInstance header to be recognized as emulated profiles.
+                    file_lines = ["AccountInstance_20120705"]
+                    
+                    for line in lines:
+                        if line == "AccountInstance_20120705": continue # Avoid duplication
+                        
+                        if line.startswith("PrincipalId=") or line.startswith("StickyPrincipalId="):
+                            key = line.split("=")[0]
+                            if fname.endswith(".ini"):
+                                file_lines.append(f"{key}={pid}")
+                            else:
+                                # Real Wii U .dat files use LOWERCASE hex for PIDs
+                                file_lines.append(f"{key}={pid:08x}")
+                        else:
+                            file_lines.append(line)
+                    
+                    if self._force_write_file(fpath, "\n".join(file_lines)):
+                        self.cemu_log.append(f"[System] Identity Updated: {fpath}")
 
-            self._ensure_mlc_save_dirs(base)
-            self.cemu_log.append(f"[System] Identity created for {username}.")
-
-        except Exception as e:
-            self.cemu_log.append(f"[Error] Manual patch failed: {e}")
+            self.statusBar().showMessage(f"Deep Identity Fix Applied for {username}", 5000)
+            QMessageBox.information(self, "Success", f"Wii U Identity Files Realigned!\n\nAuthentication Hash: OK\nPrincipalId: {pid:08x}")
+        except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def patch_citra(self, mode):
         # Determine mode if coming from the UI
         if mode == "ui_trigger":
-            mode = "custom"
+            mode = "pretendo" if self.mode_pretendo.isChecked() else "custom"
 
         # Trigger identity sync first for local modes
         if mode in ["custom", "pretendo"]: # pretendo in this context might be the UI choice
             self.cemu_log.append("[System] Syncing Identity with Local Database...")
             if mode == "custom" or (mode == "pretendo" and not "network" in "https://account.pretendo.cc"): # check if actually local
-                # Actually, the UI logic handle this better now
-                pass
+               # Actually, the UI logic handle this better now
+               pass 
 
         if mode == "custom":
             self.create_local_account()
@@ -4704,7 +4328,7 @@ try {{
             pass
         else:
             # Only inject if we are using the local mode or specifically asked
-            if False: # Public Pretendo toggle removed
+            if mode == "pretendo" and self.mode_pretendo.isChecked():
                 pass # it's official public
             else:
                 self.create_local_account()
@@ -4712,7 +4336,7 @@ try {{
         # Determine config path based on chosen directory
         citra_dir = self.citra_dir_field.text().strip()
         p = os.path.join(citra_dir, "config", "qt-config.ini") if citra_dir else OS_INFO.get("citra_config", "")
-
+        
         if not p or not os.path.exists(p):
             QMessageBox.warning(self, "Not Found", f"Citra configuration not found at:\n{p}")
             return
@@ -4726,10 +4350,9 @@ try {{
             found = False
             for line in lines:
                 if line.startswith("web_api_url="):
-                    new_lines.append(f"web_api_url={target_url}\n")
-                    found = True
-                else:
-                    new_lines.append(line)
+                   new_lines.append(f"web_api_url={target_url}\n")
+                   found = True
+                else: new_lines.append(line)
             if not found: new_lines.append(f"web_api_url={target_url}\n")
             with open(p, "w") as f: f.writelines(new_lines)
 
@@ -4742,7 +4365,7 @@ try {{
                 if not os.path.exists(seed_p):
                     with open(seed_p, "wb") as f: f.write(os.urandom(0x110))
                     self.setup_log.append("[System] Generated dummy LocalFriendCodeSeed for Citra.")
-
+                
                 # Generate a dummy SecureInfo_A if missing
                 info_p = os.path.join(sysdata, "SecureInfo_A")
                 if not os.path.exists(info_p):
@@ -4772,7 +4395,7 @@ try {{
         dlg.setDefaultSuffix("zip")
         dlg.setOption(QFileDialog.DontUseNativeDialog, True)
         dlg.setFilter(QDir.Files | QDir.Hidden | QDir.AllDirs | QDir.NoDotAndDotDot)
-
+        
         if not dlg.exec(): return
         path = dlg.selectedFiles()[0]
         try:
@@ -4789,15 +4412,25 @@ try {{
                 pid = int(hashlib.sha256(user.lower().encode('utf-8')).hexdigest(), 16) % 1000000000 + 1000000000
                 pid_bytes = pid.to_bytes(4, byteorder='little')
                 pwd_hash = hashlib.sha256(pid_bytes + b"\x02eCF" + passw.encode('utf-8')).hexdigest()
-
+                
                 # Authentically link account to BannedPenta console IDs
                 uuid_hex = "e7e455936d2acbae339c189fb2c42990"
                 trans_id_hex = "2000004b2c42990"
-
-                # Valid 96-byte Mii (same as Cemu path) for bundle account.dat
-                mii_bundle_hex = getattr(self, "_mii_data_hex", None) or ""
-                mii_bundle_bytes, account_name_hex = self._build_wiiu_mii(miiname, mii_bundle_hex if len(mii_bundle_hex) >= 192 else None)
-                cur_mii = binascii.hexlify(mii_bundle_bytes).decode("ascii")
+                
+                # MiiName for zip bundle (UTF-16BE hex for Wii U compatibility)
+                acct_name_bytes = miiname[:10].encode('utf-16be').ljust(22, b'\x00')
+                account_name_hex = binascii.hexlify(acct_name_bytes).decode('ascii')
+                
+                # Build default MiiData with name at offset 0x1A (char 52)
+                cur_mii = getattr(self, '_mii_data_hex', None)
+                if not cur_mii:
+                    m_name_bytes_be = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
+                    m_name_hex_be = binascii.hexlify(m_name_bytes_be).decode('ascii')
+                    cur_mii = ("03000000" + ("00" * 22) + m_name_hex_be).ljust(192, "0")
+                elif len(str(cur_mii)) >= 92:
+                    m_name_bytes_be = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
+                    m_name_hex_be = binascii.hexlify(m_name_bytes_be).decode('ascii')
+                    cur_mii = str(cur_mii)[0:52] + m_name_hex_be + str(cur_mii)[92:]
 
                 acct_lines = [
                     "AccountInstance_20120705",
@@ -4813,12 +4446,10 @@ try {{
                     "IsMailAddressValidated=1",
                     "EmailAddress=none@pretendo.network",
                     "Country=49", "SimpleAddressId=49010000",
-                    "Region=2", "Language=1",
                     "TimeZoneId=America/New_York",
                     "UtcOffset=ffffffff9ac22000",
                     f"PrincipalId={pid:08x}",
                     "IsNnidLinked=1",
-                    "IsPnidLinked=1",
                     "IsPasswordCacheEnabled=1",
                     f"AccountPasswordCache={pwd_hash}",
                     "NnasType=1", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
@@ -4828,7 +4459,7 @@ try {{
                     f"StickyAccountId={user}",
                     f"StickyPrincipalId={pid:08x}",
                     "IsServerAccountDeleted=0",
-                    "IsCommitted=1",
+                    "IsCommitted=1"
                 ]
                 z.writestr("Wii U/account.dat", "\n".join(acct_lines))
 
@@ -4837,7 +4468,7 @@ try {{
                 p_port = self._get_target_port()
                 z.writestr("3DS/local_server_url.txt", f"http://{local_ip}:{p_port}\n(Use this in Citra or Nimbus)")
                 z.writestr("3DS/mii_data.bin", safe_unhex(getattr(self, '_mii_data_hex', '01000100' + '0'*184)))
-
+                
                 si = bytearray(b'\x00' * 0x111)
                 si[0x100] = 1 # Region USA
                 serial_3ds = f"YW{random.randint(100000000, 999999999)}"
@@ -4852,7 +4483,7 @@ try {{
                 for i, b in enumerate(l_bits): lfcs[i] = b
                 z.writestr("3DS/LocalFriendCodeSeed_B", bytes(lfcs))
                 z.writestr("3DS/CTCert.bin", os.urandom(0x1A0))
-
+                
                 readme = (
                     "3D Open Dock U - Complete Console Bundle\n"
                     "========================================\n\n"
@@ -4884,7 +4515,10 @@ try {{
         if self.bypassing_close_prompt:
             self.save_settings()
             # Kill worker threads
-            self._stop_all_workers()
+            worker = self.worker
+            if worker is not None and worker.isRunning():
+                worker.terminate()
+                worker.wait(1000)
             event.accept()
             return
 
@@ -4895,17 +4529,17 @@ try {{
         msg.setInformativeText("You can keep the server running in the background or perform a complete shutdown.")
         msg.setIcon(QMessageBox.Question)
         msg.setStyleSheet(STYLESHEET)
-
+        
         keep_btn = msg.addButton("Keep Server Running", QMessageBox.ActionRole)
         stop_btn = msg.addButton("Full Shutdown", QMessageBox.DestructiveRole)
         cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
-
+        
         msg.exec()
-
+        
         if msg.clickedButton() == cancel_btn:
             event.ignore()
             return
-
+        
         if msg.clickedButton() == stop_btn:
             # Block the close event, show status, run blocking shutdown, then force-kill
             event.ignore()  # Temporarily ignore so we can run cleanup
@@ -4922,19 +4556,11 @@ try {{
 
         # "Keep Server Running" path — just save settings and close cleanly
         self.save_settings()
-        self._stop_all_workers()
-        event.accept()
-
-    def _stop_all_workers(self):
-        """Cleanly shut down all background threads."""
-        if getattr(self, 'status_worker', None):
-            self.status_worker.running = False
-            self.status_worker.wait(1000)
-
         worker = self.worker
         if worker is not None and worker.isRunning():
             worker.terminate()
-            worker.wait(100)
+            worker.wait(1000)
+        event.accept()
 
     def _grep_env_file(self, path, key):
         """Helper to safely extract a key from a local env file if it exists."""
@@ -4949,12 +4575,12 @@ try {{
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-
+    
     # ─── Single Instance Guard ───
     # Use a system-wide lock file to prevent multiple instances
     lock_path = os.path.join(QStandardPaths.writableLocation(QStandardPaths.TempLocation), "3d_open_dock_u.lock")
     lock_file = QLockFile(lock_path)
-
+    
     if not lock_file.tryLock(100):
         # Already running!
         warning = QMessageBox()
@@ -4963,21 +4589,21 @@ if __name__ == "__main__":
         warning.setInformativeText("Only one instance can be open at the same time to prevent data corruption and port conflicts.\n\nPlease check your taskbar or tray for the existing window.")
         warning.setIcon(QMessageBox.Warning)
         warning.setStandardButtons(QMessageBox.Ok)
-
+        
         # Apply the app's global dark styling to this popup if possible
         try:
-            # Since STYLESHEET is a global constant defined earlier in the file
-            warning.setStyleSheet(STYLESHEET)
+             # Since STYLESHEET is a global constant defined earlier in the file
+             warning.setStyleSheet(STYLESHEET)
         except: pass
-
+        
         warning.exec()
         sys.exit(1)
 
     app.setStyle("Fusion")
     win = PretendoManager()
-    win.showMaximized()
-
+    win.show()
+    
     # Pass the lock_file reference to the window so it persists for the lifetime of the app
     win._instance_lock = lock_file
-
+    
     sys.exit(app.exec())
