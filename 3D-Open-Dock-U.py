@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QRadioButton, QButtonGroup
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QSettings, QTimer, QDir, QLockFile, QStandardPaths
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPixmap, QIcon
 
 try:
     import requests
@@ -622,7 +622,7 @@ class PretendoManager(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(960, 720)
+        self.setMinimumSize(1350, 850)
         self.worker = None
         self.cached_password: Optional[str] = None
         self.server_running = False
@@ -640,10 +640,35 @@ class PretendoManager(QMainWindow):
         root = QVBoxLayout(central)
         
         # Header
-        title = QLabel(f'<span style="color:{RED_PRIMARY};">3D</span> <span style="color:white;">Open Dock</span> <span style="color:{CYAN_PRIMARY};">U</span>')
-        title.setStyleSheet("font-size: 36px; font-weight: bold;")
-        title.setAlignment(Qt.AlignCenter)
-        root.addWidget(title)
+        self.logo_label = QLabel()
+        # Search for logo in script directory or current directory
+        logo_filename = "logo.png"
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        logo_path = os.path.join(script_dir, logo_filename)
+        
+        if not os.path.exists(logo_path):
+            # Fallback to current working directory
+            logo_path = os.path.join(os.getcwd(), logo_filename)
+
+        if os.path.exists(logo_path):
+            pixmap = QPixmap(logo_path)
+            if not pixmap.isNull():
+                # Scale it down and enforce a strict maximum height to pull the white line UP
+                scaled_pixmap = pixmap.scaled(QSize(4800, 1200), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                scaled_pixmap.setDevicePixelRatio(2.0)  # Displays at max 800x110
+                self.logo_label.setPixmap(scaled_pixmap)
+                self.logo_label.setMaximumHeight(140)
+            else:
+                self.logo_label.setText(f'<span style="color:{RED_PRIMARY};">3D</span> <span style="color:white;">Open Dock</span> <span style="color:{CYAN_PRIMARY};">U</span>')
+                self.logo_label.setStyleSheet("font-size: 28px; font-weight: bold;")
+        else:
+            self.logo_label.setText(f'<span style="color:{RED_PRIMARY};">3D</span> <span style="color:white;">Open Dock</span> <span style="color:{CYAN_PRIMARY};">U</span>')
+            self.logo_label.setStyleSheet("font-size: 28px; font-weight: bold;")
+            
+        self.logo_label.setAlignment(Qt.AlignCenter)
+        self.logo_label.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.logo_label)
         
         sep = QFrame(objectName="separator")
         sep.setFrameShape(QFrame.HLine)
@@ -783,6 +808,7 @@ class PretendoManager(QMainWindow):
 
     def _get_local_ip(self):
         """Robust IP detection trying multiple targets to avoid false offline status."""
+        # Try probing for the outbound IP first (most reliable for multi-interface setups)
         for target in [("8.8.8.8", 80), ("1.1.1.1", 80), ("192.168.1.1", 80)]:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -790,8 +816,31 @@ class PretendoManager(QMainWindow):
                 s.connect(target)
                 ip = s.getsockname()[0]
                 s.close()
-                if ip != "127.0.0.1": return ip
+                if ip and not ip.startswith("127."): return ip
             except: continue
+        
+        # Fallback 1: Get the IP associated with the local hostname
+        try:
+            h_ip = socket.gethostbyname(socket.gethostname())
+            if h_ip and not h_ip.startswith("127."): return h_ip
+        except: pass
+        
+        # Fallback 2: Try to find any non-loopback interface IP (Linux/Darwin)
+        if OS_INFO["os"] != "windows":
+            try:
+                import fcntl
+                import struct
+                def get_interface_ip(ifname):
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    return socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack('256s', bytes(ifname[:15], 'utf-8')))[20:24])
+                
+                for iface in ['eth0', 'wlan0', 'en0', 'en1', 'docker0']:
+                    try:
+                        ip = get_interface_ip(iface)
+                        if ip and not ip.startswith("127."): return ip
+                    except: continue
+            except: pass
+
         return "127.0.0.1"
 
     def _build_dashboard_tab(self):
@@ -831,6 +880,9 @@ class PretendoManager(QMainWindow):
         btn_hl = QHBoxLayout()
         self.clear_server_log_btn = QPushButton("Clear Logs", clicked=lambda: self.server_log.clear())
         btn_hl.addWidget(self.clear_server_log_btn)
+        self.fix_ips_btn = QPushButton("Fix Server IPs", clicked=self.refresh_database_ips)
+        self.fix_ips_btn.setToolTip("Forces an update of all game server IPs in the database to the current local IP.")
+        btn_hl.addWidget(self.fix_ips_btn)
         glay.addLayout(btn_hl)
         
         self.check_result = QLabel("")
@@ -868,7 +920,7 @@ class PretendoManager(QMainWindow):
         self.deploy_stack_btn.setStyleSheet(f"background: {CYAN_DARK}; color: white; font-weight: bold;")
         dlay.addWidget(self.deploy_stack_btn)
 
-        # Sudo Password Field (persisted across sessions until Reset Sensitive Data)
+        # Sudo Password Field
         if OS_INFO["os"] == "linux":
             sudo_row = QHBoxLayout()
             sudo_row.addWidget(QLabel("Sudo Pass:"))
@@ -886,28 +938,7 @@ class PretendoManager(QMainWindow):
             sudo_row.addWidget(self.dash_sudo_eye)
             dlay.addLayout(sudo_row)
         elif OS_INFO["os"] == "windows":
-            self.server_sudo_pass = None  # Windows uses UAC elevation, no inline password
-            
-            # ─── WSL2 Status & Controls ───
-            wsl_group = QGroupBox("Windows Subsystem for Linux (WSL2)")
-            wsl_lay = QVBoxLayout(wsl_group)
-            
-            self.wsl_status_label = QLabel("WSL2: Detecting...")
-            self.wsl_status_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
-            wsl_lay.addWidget(self.wsl_status_label)
-            
-            wsl_btn_row = QHBoxLayout()
-            self.install_wsl_btn = QPushButton("Install WSL2 + Ubuntu", clicked=self._install_wsl2_action)
-            self.install_wsl_btn.setToolTip("Automatically installs WSL2 and Ubuntu distro (requires admin privileges and a restart).")
-            self.install_wsl_btn.setStyleSheet(f"background: #0366d6; color: white; font-weight: bold; border-radius: 6px; padding: 8px;")
-            wsl_btn_row.addWidget(self.install_wsl_btn)
-            
-            self.refresh_wsl_btn = QPushButton("Refresh WSL Status", clicked=self._refresh_wsl_status)
-            self.refresh_wsl_btn.setStyleSheet(f"border-color: {CYAN_PRIMARY}; padding: 8px;")
-            wsl_btn_row.addWidget(self.refresh_wsl_btn)
-            wsl_lay.addLayout(wsl_btn_row)
-            
-            dlay.addWidget(wsl_group)
+            self.server_sudo_pass = None
         else:
             self.server_sudo_pass = None
 
@@ -915,18 +946,13 @@ class PretendoManager(QMainWindow):
         if OS_INFO["os"] == "linux":
             row_sys.addWidget(QPushButton("Fix Perms", clicked=self.fix_docker_permissions))
             row_sys.addWidget(QPushButton("Reset Per-Session Sudo", clicked=lambda: setattr(self, 'cached_password', None) or (self.server_sudo_pass.clear() if self.server_sudo_pass else None)))
-        elif OS_INFO["os"] == "windows":
-            row_sys.addWidget(QPushButton("Open PowerShell", clicked=lambda: subprocess.Popen(["powershell", "-NoExit", "-Command", "Write-Host '3D Open Dock U - PowerShell Session'"], creationflags=0x00000010 if _is_windows() else 0)))
-            row_sys.addWidget(QPushButton("Open WSL Terminal", clicked=lambda: subprocess.Popen(["wsl"], creationflags=0x00000010 if _is_windows() else 0) if OS_INFO.get("has_wsl") else QMessageBox.warning(self, "WSL2", "WSL2 is not installed. Click 'Install WSL2 + Ubuntu' first.")))
         
         dlay.addLayout(row_sys)
-
         rv.addWidget(dep)
         
         splat = QGroupBox("Splatoon Fixes")
         slay = QVBoxLayout(splat)
         self.patch_rotations_btn = QPushButton("Patch Splatoon Rotations", clicked=self.apply_splatoon_rotation_patch)
-        self.patch_rotations_btn.setToolTip("Fixes stuck stage rotations (Saltspray Rig/Museum) by injecting a 100-phase schedule.")
         slay.addWidget(self.patch_rotations_btn)
         rv.addWidget(splat)
 
@@ -941,6 +967,7 @@ class PretendoManager(QMainWindow):
     def _build_emulator_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
+        layout.setSpacing(10)
         h_layout = QHBoxLayout()
 
         # LEFT PANE: Credentials & Identity Target
@@ -1035,11 +1062,11 @@ class PretendoManager(QMainWindow):
         nlay.addLayout(mode_row)
         
         pat_row = QHBoxLayout()
-        pat_btn = QPushButton("Patch \u0026 Connect (Cemu)", objectName="patchBtn")
+        pat_btn = QPushButton("Patch & Connect (Cemu)", objectName="patchBtn")
         pat_btn.setToolTip("Syncs Docker services to the target port, patches Cemu settings, generates identity files, and registers your account.")
         pat_btn.clicked.connect(lambda: self.apply_cemu_patch_all())
         pat_row.addWidget(pat_btn)
-        citra_btn = QPushButton("Patch \u0026 Connect (Citra)", objectName="patchBtn")
+        citra_btn = QPushButton("Patch & Connect (Citra)", objectName="patchBtn")
         citra_btn.setToolTip("Syncs Docker services to the target port, patches Citra config, generates identity files, and registers your account.")
         citra_btn.clicked.connect(lambda: self.patch_citra("ui_trigger"))
         pat_row.addWidget(citra_btn)
@@ -1405,13 +1432,24 @@ class PretendoManager(QMainWindow):
 
                 new_lines = []
                 current_service = None
+                current_section = None
                 changed = False
                 
                 for i, line in enumerate(lines):
                     stripped = line.strip()
+                    # Top-level section detection (e.g. volumes:, networks:)
+                    if not line.startswith(" ") and not line.startswith("\t") and stripped.endswith(":"):
+                        current_service = None
+                        current_section = None
+
+                    # Section detection (indented exactly 4 spaces)
+                    if line.startswith("    ") and not line.startswith("     ") and stripped.endswith(":"):
+                        current_section = stripped[:-1].lower()
+
                     # Service detection (indented exactly 2 spaces)
                     if line.startswith("  ") and not line.startswith("   ") and stripped.endswith(":") and not stripped.startswith("-"):
                         current_service = stripped[:-1].lower()
+                        current_section = None
 
                     # 1. mitmproxy-pretendo: update external port
                     if current_service == "mitmproxy-pretendo":
@@ -1426,12 +1464,28 @@ class PretendoManager(QMainWindow):
                         if "127.0.0.1:8070:8080" in line:
                             line = line.replace("127.0.0.1:8070:8080", "127.0.0.1:8088:8080")
                             changed = True
+
+                    # 2b. mario-kart-8: remove duplicate port range that conflicts with individual port entries
+                    if current_service == "mario-kart-8":
+                        if re.search(r'"?\d+-\d+:\d+-\d+/udp"?', stripped):
+                            changed = True
+                            continue  # Skip this line entirely
                     
-                    # 3. mongodb: pin version and add alias
+                    # 3. mongodb: pin version and add alias + healthcheck
                     if current_service == "mongodb":
                         if "image: mongo:latest" in line:
                             line = line.replace("mongo:latest", "mongo:4.4")
                             changed = True
+                        if stripped == "mongodb:" and "healthcheck:" not in "".join(lines[i:i+30]):
+                            new_lines.append(line)
+                            new_lines.append("    healthcheck:\n")
+                            new_lines.append("      test: [\"CMD\", \"mongo\", \"--quiet\", \"127.0.0.1:27017/test\", \"--eval\", \"'quit(db.runCommand({ ping: 1 }).ok ? 0 : 1)'\"]\n")
+                            new_lines.append("      interval: 10s\n")
+                            new_lines.append("      timeout: 10s\n")
+                            new_lines.append("      retries: 5\n")
+                            new_lines.append("      start_period: 40s\n")
+                            changed = True
+                            continue
                         if stripped == "internal:":
                             if "aliases:" not in "".join(lines[i:i+5]):
                                 new_lines.append(line)
@@ -1446,15 +1500,87 @@ class PretendoManager(QMainWindow):
                             line = line.replace("mongo-express:latest", "mongo-express:0.54.0")
                             changed = True
 
-                    # 5. postgres: Add Healthcheck (Fixes Smash connection refused)
+                    # 5. postgres: Add Healthcheck and Init Sequence
                     if current_service == "postgres" and stripped == "postgres:":
-                        if "healthcheck:" not in "".join(lines[i:i+20]):
+                        if "healthcheck:" not in "".join(lines[i:i+30]):
                             new_lines.append(line)
                             new_lines.append("    healthcheck:\n")
-                            new_lines.append("      test: [\"CMD-SHELL\", \"pg_isready -U postgres_pretendo -d postgres\"]\n")
-                            new_lines.append("      interval: 5s\n")
-                            new_lines.append("      timeout: 5s\n")
-                            new_lines.append("      retries: 5\n")
+                            # Robust healthcheck: check for pg_isready FIRST, then check if the actual game DBs exist
+                            # We use -v ON_ERROR_STOP=1 for psql to ensure it returns non-zero on command failure
+                            new_lines.append("      test: [\"CMD-SHELL\", \"pg_isready -h localhost -U postgres_pretendo -d postgres && psql -v ON_ERROR_STOP=1 -U postgres_pretendo -d postgres -t -c \\\"SELECT 1 FROM pg_database WHERE datname='mario_kart_8'\\\" | grep -q 1\"]\n")
+                            new_lines.append("      interval: 10s\n")
+                            new_lines.append("      timeout: 10s\n")
+                            new_lines.append("      retries: 24\n") # 4 minutes total wait time
+                            changed = True
+                            continue
+
+                    # 5b. Update dependencies to wait for health (and convert lists to maps to avoid mixed-type errors)
+                    if current_section == "depends_on" and line.startswith("      - ") and current_service in ["friends", "super-mario-maker", "mario-kart-8", "pikmin-3", "splatoon", "super-smash-bros-wiiu", "boss", "mongo-express"]:
+                        dep_name = stripped[2:].strip()
+                        # If we have any server dependency, or we are in a block that needs map conversion
+                        # For these specific services, we FORCE map syntax for everything in depends_on
+                        if dep_name == "postgres":
+                             new_lines.append("      postgres:\n")
+                             new_lines.append("        condition: service_healthy\n")
+                             changed = True
+                             continue
+                        elif dep_name == "mongodb":
+                             new_lines.append("      mongodb:\n")
+                             new_lines.append("        condition: service_healthy\n")
+                             changed = True
+                             continue
+                        else:
+                             new_lines.append(f"      {dep_name}:\n")
+                             new_lines.append("        condition: service_started\n")
+                             changed = True
+                             continue
+
+                    if current_service == "postgres" and stripped == "volumes:":
+                        if "postgres-init.sh" not in "".join(lines[i:i+20]):
+                             new_lines.append(line)
+                             new_lines.append("      - type: bind\n")
+                             new_lines.append("        source: ./scripts/run-in-container/postgres-init.sh\n")
+                             new_lines.append("        target: /docker-entrypoint-initdb.d/postgres-init.sh\n")
+                             new_lines.append("        read_only: true\n")
+                             changed = True
+                             continue
+
+                    # 6. Global Mii Font Integration for Pretendo Backend
+                    if current_service in ["account", "boss", "juxtaposition-ui", "miiverse-api", "website", "friends", "super-mario-maker", "mario-kart-8", "pikmin-3", "splatoon", "super-smash-bros-wiiu", "pokken-tournament", "minecraft-wiiu"]:
+                        # Append font volume immediately after the `volumes:` header if it exists
+                        if stripped == "volumes:":
+                            if "/usr/share/fonts/nintendo" not in "".join(lines[max(0, i):min(len(lines), i+15)]):
+                                new_lines.append(line)
+                                new_lines.append("      - type: bind\n")
+                                new_lines.append("        source: ./data/fonts\n")
+                                new_lines.append("        target: /usr/share/fonts/nintendo\n")
+                                new_lines.append("        read_only: true\n")
+                                changed = True
+                                continue
+                        # If service reaches 'networks:' and didn't have a volumes section, create it
+                        elif stripped == "networks:":
+                            if "volumes:" not in "".join(lines[max(0, i-25):i]) and "/usr/share/fonts/nintendo" not in "".join(lines[max(0, i-25):min(len(lines), i+5)]):
+                                new_lines.append("    volumes:\n")
+                                new_lines.append("      - type: bind\n")
+                                new_lines.append("        source: ./data/fonts\n")
+                                new_lines.append("        target: /usr/share/fonts/nintendo\n")
+                                new_lines.append("        read_only: true\n")
+                                new_lines.append(line)
+                                changed = True
+                                continue
+
+                    if current_section == "networks" and stripped == "internal:":
+                        # Automatically inject aliases for all services on the internal network to fix DNS resolution for gRPC
+                        has_alias = False
+                        for j in range(i + 1, min(i + 5, len(new_lines) + len(lines) - i)): # Approximate check
+                            if i+j-i < len(lines) and "aliases:" in lines[i+j-i]:
+                                has_alias = True
+                                break
+                        
+                        if not has_alias:
+                            new_lines.append(line)
+                            new_lines.append("        aliases:\n")
+                            new_lines.append(f"          - {current_service}\n")
                             changed = True
                             continue
 
@@ -1561,20 +1687,48 @@ class PretendoManager(QMainWindow):
                     pg_init = os.path.join(s_dir, "scripts", "run-in-container", "postgres-init.sh")
                     if os.path.exists(pg_init):
                         try:
+                            # Try to extract postgres password to avoid psql authentication failures
+                            pg_pass = ""
+                            pg_env_path = os.path.join(s_dir, "environment", "postgres.local.env")
+                            if os.path.exists(pg_env_path):
+                                with open(pg_env_path, "r") as fe:
+                                    for eline in fe:
+                                        if "POSTGRES_PASSWORD=" in eline:
+                                            pg_pass = eline.split("=", 1)[1].strip()
+                                            break
+                            
                             with open(pg_init, "r") as f: pg_lines = f.readlines()
                             new_pg = []
+                            has_pw_export = any("PGPASSWORD=" in l for l in pg_lines)
+                            
                             for pl in pg_lines:
+                                if pl.startswith("#!") and pg_pass:
+                                    new_pg.append(pl)
+                                    if not has_pw_export:
+                                        new_pg.append(f"export PGPASSWORD={shlex.quote(pg_pass)}\n")
+                                    continue
+                                
+                                if "export PGPASSWORD=" in pl and pg_pass:
+                                    # Force update existing password
+                                    pl = f"export PGPASSWORD={shlex.quote(pg_pass)}\n"
+                                    has_pw_export = True # Mark as handled
+                                
                                 if "databases=" in pl:
                                     # Properly append without duplicating and handling quotes
                                     current_dbs = re.search(r'databases="([^"]*)"', pl)
                                     if current_dbs:
                                         db_list = current_dbs.group(1).split()
-                                        if "super_smash_bros_wiiu" not in db_list:
-                                            db_list.append("super_smash_bros_wiiu")
-                                        if "pokken_tournament" not in db_list:
-                                            db_list.append("pokken_tournament")
+                                        required_dbs = ["friends", "super_mario_maker", "pikmin3", "splatoon", "super_smash_bros_wiiu", "pokken_tournament", "mario_kart_8", "website"]
+                                        for rdb in required_dbs:
+                                            if rdb not in db_list:
+                                                db_list.append(rdb)
                                         pl = f'databases="{" ".join(db_list)}"\n'
                                 new_pg.append(pl)
+                            
+                            if not has_pw_export and pg_pass and not any(l.startswith("#!") for l in pg_lines):
+                               # No shebang? Prepend it
+                               new_pg.insert(0, f"export PGPASSWORD={shlex.quote(pg_pass)}\n")
+                            
                             with open(pg_init, "w") as f: f.writelines(new_pg)
                         except: pass
                     
@@ -1741,17 +1895,16 @@ class PretendoManager(QMainWindow):
         if hasattr(self, 'ip_info'):
             self.ip_info.setText(f"Local Network IP: {current_ip}")
         
-        # 2. Automated Safeguard
+        # 2. Automated Safeguard (Softened)
         if not is_connected and self.last_connectivity_state:
-            if self.server_running or self.docker_service_running:
-                msg = "\n[ALARM] Connection Terminated! Triggering Secure Shutdown Protocol...\n"
-                self.server_log.append(msg)
-                self.setup_log.append(msg)
-                
-                if self.server_running: self.stop_server()
-                if self.docker_service_running: self.toggle_docker_service()
-                
-                self.statusBar().showMessage("NETWORK LOSS DETECTED - Safe Mode Active", 15000)
+            # We used to trigger an automatic shutdown here, but it was too sensitive for shaky connections.
+            # Now we just log an alarm and alert the user so they can decide what to do.
+            msg = "\n[ALARM] Connection Lost! Network IP reverted to Loopback (127.0.0.1).\n"
+            msg += "[INFO] Secure Shutdown Protocol is READY but not triggered automatically to avoid accidental downtime.\n"
+            self.server_log.append(f"<span style='color:{RED_LIGHT}; font-weight:bold;'>{msg}</span>")
+            self.setup_log.append(f"<span style='color:{RED_LIGHT};'>{msg}</span>")
+            
+            self.statusBar().showMessage("NETWORK LOSS DETECTED - Verify Connectivity", 15000)
         
         self.last_connectivity_state = is_connected
         self._detect_current_game()
@@ -2055,8 +2208,8 @@ class PretendoManager(QMainWindow):
                 if not pw: return # User cancelled
 
         ports = f"80 443 21 53 8080 {custom_port} 9231"
-        # Add timeout to fuser to prevent long hangs on busy sockets
-        fuser_cmd = " ; ".join([f"timeout 2 fuser -k -n tcp {p} || true" for p in ports.split()])
+        # Parallel cleanup: Kills all conflicting ports in a single subshell for speed
+        fuser_cmd = "(" + " & ".join([f"fuser -k -n tcp {p} 2>/dev/null" for p in ports.split()]) + " & wait) || true"
         
         # Helper to finalize and kickstart mongo replica
         def _on_start(code):
@@ -2067,46 +2220,132 @@ class PretendoManager(QMainWindow):
                 self.server_log.append("<b>[System] Skipping initialization tasks due to start failure.</b>")
                 return
             if s_dir:
+                self.server_log.append("[System] Running optimized database initialization...")
+                
+                # 1. Unified MongoDB Initialization Script (Combines 15+ exec calls into 1)
+                target_ip = self._get_local_ip()
+                mongo_init_js = f"""
+                // 1. Replica Set Init
+                try {{ rs.initiate(); }} catch(e) {{}}
+                
+                // Wait for Primary (max 10s)
+                for (let i = 0; i < 10; i++) {{
+                    if (rs.status().myState === 1) break;
+                    sleep(1000);
+                }}
+                
+                const acc_db = db.getSiblingDB("pretendo_account");
+                const gs_data = [
+                    {{ id: '1010EB00', name: 'Mario Kart 8', port: 6014, sub: 'Global' }},
+                    {{ id: '1010EC00', name: 'Mario Kart 8', port: 6014, sub: 'US' }},
+                    {{ id: '1010ED00', name: 'Mario Kart 8', port: 6014, sub: 'EU' }},
+                    {{ id: '1010EE00', name: 'Mario Kart 8', port: 6014, sub: 'JP' }},
+                    {{ id: '101DF400', name: 'Pokken Tournament', port: 60008, sub: 'Primary' }},
+                    {{ id: '101C5800', name: 'Pokken Tournament', port: 60008, sub: 'Alt' }},
+                    {{ id: '10162E00', name: 'Splatoon', port: 6006, sub: 'EU/US' }},
+                    {{ id: '10170000', name: 'Splatoon', port: 6006, sub: 'JP' }},
+                    {{ id: '1018DC00', name: 'Super Mario Maker', port: 6004, sub: 'EU' }},
+                    {{ id: '1018DD00', name: 'Super Mario Maker', port: 6004, sub: 'US' }},
+                    {{ id: '1018DE00', name: 'Super Mario Maker', port: 6004, sub: 'JP' }},
+                    {{ id: '10148E00', name: 'Super Smash Bros. Wii U', port: 6012, sub: 'EU' }},
+                    {{ id: '10148F00', name: 'Super Smash Bros. Wii U', port: 6012, sub: 'US' }},
+                    {{ id: '10149000', name: 'Super Smash Bros. Wii U', port: 6012, sub: 'JP' }},
+                    {{ id: '101D7500', name: 'Minecraft', port: 6008, sub: 'EU' }},
+                    {{ id: '101D7600', name: 'Minecraft', port: 6008, sub: 'US' }},
+                    {{ id: '101D7700', name: 'Minecraft', port: 6008, sub: 'JP' }},
+                    {{ id: '1012C100', name: 'Pikmin 3', port: 6010, sub: 'EU' }},
+                    {{ id: '1012C200', name: 'Pikmin 3', port: 6010, sub: 'US' }},
+                    {{ id: '1012C300', name: 'Pikmin 3', port: 6010, sub: 'JP' }},
+                    {{ id: '00003200', name: 'Friends', port: 6001, sub: 'Global' }}
+                ];
+                const modes = ['prod', 'test', 'dev'];
+                
+                gs_data.forEach(gs => {{
+                    modes.forEach(mode => {{
+                        acc_db.servers.updateOne(
+                            {{ game_server_id: gs.id, access_mode: mode }},
+                            {{ 
+                                $set: {{
+                                    ip: '{target_ip}',
+                                    port: gs.port,
+                                    service_name: gs.name + " (" + gs.sub + ")",
+                                    maintenance_mode: false,
+                                    client_id: gs.id // Fix error 1021 by setting client_id
+                                }},
+                                $setOnInsert: {{
+                                    service_type: 'nex',
+                                    game_server_id: gs.id,
+                                    title_ids: ['00050000'+gs.id, '00050000'+gs.id.toLowerCase(), '00050002'+gs.id, '0005000E'+gs.id],
+                                    access_mode: mode,
+                                    device: 1,
+                                    aes_key: '0'.repeat(64),
+                                    __v: 0
+                                }}
+                            }},
+                            {{ upsert: true }}
+                        );
+                    }});
+                }});
+                
+                // 2. Friend List Cross-Registration
+                acc_db.servers.updateMany(
+                    {{ game_server_id: '00003200', service_name: /Friend List/ }},
+                    {{ 
+                        $addToSet: {{ title_ids: {{ $each: [
+                            '1010EB00', '1010EC00', '1010ED00', '1010EE00', '101DF400', '101C5800',
+                            '10162E00', '10170000', '1018DC00', '1018DD00', '1018DE00',
+                            '10148E00', '10148F00', '10149000', '101D7500', '101D7600', '101D7700',
+                            '1012C100', '1012C200', '1012C300',
+                            '00050000101DF400', '00050000101df400', '0005000E101DF400', '0005000e101df400',
+                            '000500001010eb00', '000500001010ec00', '000500001010ed00', '000500001010ee00',
+                            '0005001010001C00'
+                        ] }} }}
+                    }}
+                );
+                """
                 setup_cmds = []
-                self.server_log.append("[System] Running post-boot database initialization...")
+                setup_cmds.append(f"docker compose exec -T mongodb mongo --quiet --eval {shlex.quote(mongo_init_js)} >/dev/null 2>&1 || true")
                 
-                # 1. MongoDB RS Init + wait for PRIMARY
-                setup_cmds.append("for i in {1..15}; do if docker compose exec -T mongodb mongo --eval 'rs.initiate()' >/dev/null 2>&1; then break; fi; sleep 2; done")
-                # Wait for replica set to elect PRIMARY (required before writes)
-                setup_cmds.append("sleep 3")
-                setup_cmds.append("for i in {1..15}; do if docker compose exec -T mongodb mongo --quiet --eval 'rs.status().myState' 2>/dev/null | grep -q '^1$'; then break; fi; sleep 2; done")
+                # 2.5 Auto-create missing NEX accounts for all PNIDs
+                # Without a nexaccount entry, the friends service Kerberos ticket validation silently fails
+                # causing "Lost friend server session" timeouts in Cemu
+                nex_sync_js = """
+                var pnids = db.getSiblingDB("pretendo_account").pnids.find({}, {pid:1});
+                pnids.forEach(function(p) {
+                    var existing = db.getSiblingDB("pretendo_account").nexaccounts.findOne({pid: p.pid});
+                    if (!existing) {
+                        var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+                        var pw = "";
+                        for (var i = 0; i < 16; i++) pw += chars.charAt(Math.floor(Math.random() * chars.length));
+                        db.getSiblingDB("pretendo_account").nexaccounts.insertOne({
+                            device_type: "wiiu",
+                            pid: p.pid,
+                            password: pw,
+                            owning_pid: p.pid,
+                            access_level: 0,
+                            server_access_level: "prod",
+                            __v: 0
+                        });
+                        print("[NEX-Sync] Created NEX account for PID " + p.pid);
+                    }
+                });
+                """
+                setup_cmds.append(f"docker compose exec -T mongodb mongo --quiet --eval {shlex.quote(nex_sync_js)} >/dev/null 2>&1 || true")
                 
-                # 2. Register Pokken Tournament server in account database (all access modes)
-                # The account service queries by BOTH game_server_id AND access_mode,
-                # so we must create entries for prod, test, and dev.
-                # We register both 101DF400 and 101C5800 as Pokken Game Server IDs.
-                for gs_id in ['101DF400', '101C5800']:
-                    for access_mode in ['prod', 'test', 'dev']:
-                        pokken_registration = f"""db.servers.updateOne(
-                            {{game_server_id: '{gs_id}', access_mode: '{access_mode}'}},
-                            {{$setOnInsert: {{
-                                ip: '10.49.173.98',
-                                port: 60008,
-                                service_name: 'Pokken Tournament ({"Primary" if gs_id == "101DF400" else "Alt"})',
-                                service_type: 'nex',
-                                game_server_id: '{gs_id}',
-                                title_ids: ['00050000101DF400', '00050000101df400', '0005000E101DF400', '0005000e101df400', '00050002101DF400', '00050002101df400'],
-                                access_mode: '{access_mode}',
-                                maintenance_mode: false,
-                                device: 1,
-                                aes_key: '{"0" * 64}',
-                                __v: 0
-                            }}}},
-                            {{upsert: true}}
-                        )"""
-                        setup_cmds.append(f"docker compose exec -T mongodb mongo pretendo_account --quiet --eval {shlex.quote(pokken_registration)} >/dev/null 2>&1 || true")
-                
-                # 2b. Add Pokken Tournament to Friend List (required for friend service authentication)
-                pokken_friend_update = """db.servers.updateMany(
-                    {game_server_id: '00003200', service_name: 'Friend List'},
-                    {$addToSet: {title_ids: {$each: ['00050000101DF400', '00050000101df400', '0005000E101DF400', '0005000e101df400']}}}
-                )"""
-                setup_cmds.append(f"docker compose exec -T mongodb mongo pretendo_account --quiet --eval {shlex.quote(pokken_friend_update)} >/dev/null 2>&1 || true")
+                # 2.6 Sync Friends Postgres (Populate profile tables from MongoDB accounts)
+                sync_pg_script = """
+PIDS=$(docker compose exec -T mongodb mongo pretendo_account --quiet --eval "db.pnids.find({}, {pid:1, username:1}).map(u => u.pid + ':' + u.username).join(',')" | tr -d '\\r')
+IFS=','
+for entry in $PIDS; do
+    PID=${entry%%:*}
+    NAME=${entry#*:}
+    if [ ! -z "$PID" ] && [ "$PID" != "null" ]; then
+        docker compose exec -T postgres psql -U postgres_pretendo -d friends -c "INSERT INTO wiiu.principal_basic_info (pid, username) VALUES ($PID, '$NAME') ON CONFLICT (pid) DO NOTHING;" >/dev/null 2>&1
+        docker compose exec -T postgres psql -U postgres_pretendo -d friends -c "INSERT INTO wiiu.network_account_info (pid, unknown1, unknown2) VALUES ($PID, 0, 0) ON CONFLICT (pid) DO NOTHING;" >/dev/null 2>&1
+    fi
+done
+"""
+                setup_cmds.append(f"bash -c {shlex.quote(sync_pg_script)}")
                 
                 # 3. Postgres Init (Force creation of game DBs)
                 pg_host_script = os.path.join(s_dir, "scripts/run-in-container/postgres-init.sh")
@@ -2121,20 +2360,72 @@ class PretendoManager(QMainWindow):
                 # Create a patch script that will be executed
                 patch_script = os.path.join(s_dir, "patch_account_titleid.sh")
                 patch_content = """#!/bin/bash
-# Patch account service to strip dashes from title IDs before parsing
+# Patch account service for Cemu compatibility and to disable local ban checks
 PROVIDER_FILE="repos/account/src/services/nnas/routes/provider.ts"
+OAUTH_FILE="repos/account/src/services/nnas/routes/oauth.ts"
+VERIFY_FILE="repos/account/src/middleware/console-status-verification.ts"
+PNID_FILE="repos/account/src/middleware/pnid.ts"
+NASC_FILE="repos/account/src/middleware/nasc.ts"
+
+REBUILD_NEEDED=0
 
 if [ -f "$PROVIDER_FILE" ]; then
-    # Check if patch is already applied
     if ! grep -q "titleID.replace(/-/g" "$PROVIDER_FILE"; then
         echo "Applying title ID dash-stripping patch..."
-        # Replace all occurrences of parseInt(titleID, 16) with parseInt(titleID.replace(/-/g, ''), 16)
-        sed -i.bak "s/parseInt(titleID, 16)/parseInt(titleID.replace(\\/-\\/g, ''), 16)/g" "$PROVIDER_FILE"
-        # Rebuild account service
-        docker compose build account >/dev/null 2>&1
-        echo "Patch applied and account service rebuilt"
-    else
-        echo "Title ID patch already applied"
+        # Use quadruple backslashes to correctly pass through the f-string/shell layers
+        sed -i "s/parseInt(titleID, 16)/parseInt(titleID.replace(\\\\/-\\\\/g, ''), 16)/g" "$PROVIDER_FILE"
+        REBUILD_NEEDED=1
+    fi
+fi
+
+# Ban Bypasses (Comment out access_level < 0 checks using Python)
+for f in "$OAUTH_FILE" "$VERIFY_FILE" "$PNID_FILE" "$NASC_FILE"; do
+    if [ -f "$f" ]; then
+        if grep -q "access_level < 0" "$f" && ! grep -q "BAN_BYPASS" "$f"; then
+            echo "Disabling ban check in $f..."
+            # Use Python-based patching for reliability
+            python3 -c "
+import re, sys
+with open('$f', 'r') as fh: content = fh.read()
+# Pattern: if (...access_level < 0...) { ... return; }  
+pattern = r'(\\t+)(if\\s*\\([^)]*access_level\\s*<\\s*0[^)]*\\)\\s*\\{[^}]*\\n(?:[^}]*\\n)*?\\1\\})'
+def replacer(m):
+    indent = m.group(1)
+    block = m.group(2)
+    return f'{indent}/* BAN_BYPASS - disabled for local private server */\\n{indent}/*\\n{indent}{block}\\n{indent}*/'
+result = re.sub(pattern, replacer, content)
+if result != content:
+    with open('$f', 'w') as fh: fh.write(result)
+    print(f'  Patched {\"$f\"}')
+" 2>/dev/null || echo "  Warning: Python fallback patch for $f may need manual review"
+            REBUILD_NEEDED=1
+        fi
+    fi
+done
+
+if [ $REBUILD_NEEDED -eq 1 ]; then
+    echo "Rebuilding account service..."
+    docker compose build --no-cache account >/dev/null 2>&1
+    echo "Account service patched and rebuilt."
+fi
+
+# Fix BOSS Hash Expectation for Local Placeholder Keys
+BOSS_CFG="repos/BOSS/src/config-manager.ts"
+if [ -f "$BOSS_CFG" ]; then
+    if grep -q "5202ce5099232c3d365e28379790a919" "$BOSS_CFG"; then
+        echo "Patching BOSS MD5 hash expectation for placeholder keys..."
+        sed -i "s/5202ce5099232c3d365e28379790a919/e43881072b6c26928f8351c9c2f1381b/g" "$BOSS_CFG"
+        sed -i "s/b4482fef177b0100090ce0dbeb8ce977/dcac47c7feace17a6aec0c171cc73f59/g" "$BOSS_CFG"
+        sed -i "s/86fbc2bb4cb703b2a4c6cc9961319926/b06e25c2acdb585197493b738e64cdaf/g" "$BOSS_CFG"
+        docker compose build --no-cache boss >/dev/null 2>&1
+    fi
+fi
+BOSS_GET="scripts/get-boss-keys.sh"
+if [ -f "$BOSS_GET" ]; then
+    if grep -q "5202ce5099232c3d365e28379790a919" "$BOSS_GET"; then
+        sed -i "s/5202ce5099232c3d365e28379790a919/e43881072b6c26928f8351c9c2f1381b/g" "$BOSS_GET"
+        sed -i "s/b4482fef177b0100090ce0dbeb8ce977/dcac47c7feace17a6aec0c171cc73f59/g" "$BOSS_GET"
+        sed -i "s/86fbc2bb4cb703b2a4c6cc9961319926/b06e25c2acdb585197493b738e64cdaf/g" "$BOSS_GET"
     fi
 fi
 """
@@ -2178,7 +2469,7 @@ fi
                 except Exception as e:
                     self.server_log.append(f"[System] Warning: Could not create Cemu fix script: {e}")
                 
-                setup_cmds.append("docker compose restart account friends splatoon super-mario-maker super-smash-bros-wiiu pokken-tournament")
+                setup_cmds.append("docker compose restart account friends splatoon super-mario-maker super-smash-bros-wiiu pokken-tournament mario-kart-8")
                 
                 inner_cmds = " ; ".join(setup_cmds)
                 if pw and OS_INFO["os"] == "linux":
@@ -2191,7 +2482,7 @@ fi
                         full_cmd = f'wsl bash -lc "cd {shlex.quote(wsl_cwd)} && {escaped}"'
                     else:
                         self.server_log.append("[System] WSL2 not available — using simplified post-boot init...")
-                        full_cmd = "docker compose exec -T mongodb mongo --eval \"rs.initiate()\" & timeout /t 8 & docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website super-smash-bros-wiiu pokken-tournament"
+                        full_cmd = "docker compose exec -T mongodb mongo --eval \"rs.initiate()\" & timeout /t 8 & docker compose restart account mongo-express friends splatoon super-mario-maker pikmin-3 wiiu-chat-authentication wiiu-chat-secure minecraft-wiiu miiverse-api juxtaposition-ui boss website super-smash-bros-wiiu pokken-tournament mario-kart-8"
                     self._run_command(full_cmd, self.server_log, s_dir, display_cmd="[Windows] Post-Boot Initialization", on_done=self._on_server_boot_finished)
                 else:
                     full_cmd = inner_cmds
@@ -2431,6 +2722,53 @@ fi
             self.setup_log.append("[System] Activating Docker services...")
             self._run_command("sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: self._check_docker_status())
 
+    def refresh_database_ips(self):
+        """Force update all game server IPs in the MongoDB database to the current detected IP."""
+        current_ip = self._get_local_ip()
+        if current_ip == "127.0.0.1":
+            QMessageBox.warning(self, "Connectivity Warning", "Could not detect a local network IP. Only 127.0.0.1 (localhost) will be used. This may prevent other devices from connecting.")
+        
+        # We'll use a CommandWorker to run a docker exec mongo command
+        # This script matches the logic in _apply_database_patches
+        mongo_script = f"""
+        const acc_db = db.getSiblingDB('pretendo_account');
+        const target_ip = '{current_ip}';
+        const gs_data = [
+            {{ id: '1010EB00', name: 'MARIO KART 8', port: 6014, sub: 'EU' }},
+            {{ id: '1010EC00', name: 'MARIO KART 8', port: 6014, sub: 'US' }},
+            {{ id: '1010ED00', name: 'MARIO KART 8', port: 6014, sub: 'JP' }},
+            {{ id: '1010EE00', name: 'MARIO KART 8', port: 6014, sub: 'ALL' }},
+            {{ id: '10162A00', name: 'Splatoon', port: 6006, sub: 'EU' }},
+            {{ id: '10162B00', name: 'Splatoon', port: 6006, sub: 'US' }},
+            {{ id: '10162C00', name: 'Splatoon', port: 6006, sub: 'JP' }},
+            {{ id: '10176900', name: 'Splatoon', port: 6006, sub: 'ALL' }},
+            {{ id: '1018DC00', name: 'Super Mario Maker', port: 6004, sub: 'EU' }},
+            {{ id: '1018DD00', name: 'Super Mario Maker', port: 6004, sub: 'US' }},
+            {{ id: '1018DE00', name: 'Super Mario Maker', port: 6004, sub: 'JP' }},
+            {{ id: '10145C00', name: 'Minecraft', port: 6008, sub: 'EU' }},
+            {{ id: '00003200', name: 'Friends', port: 6001, sub: 'Global' }}
+        ];
+        
+        gs_data.forEach(gs => {{
+            ['prod', 'test', 'dev'].forEach(mode => {{
+                acc_db.servers.updateOne(
+                    {{ game_server_id: gs.id, access_mode: mode }},
+                    {{ $set: {{ ip: target_ip, port: gs.port, maintenance_mode: false, client_id: gs.id }} }},
+                    {{ upsert: true }}
+                );
+            }});
+        }});
+        """
+        # Remove newlines and escape for shell
+        compact_script = ' '.join(mongo_script.split())
+        cmd = f"docker exec -i pretendo-network-mongodb-1 mongo --quiet --eval \"{compact_script}\""
+        
+        self.server_log.append(f"<b>[ACTION]</b> Refreshing Database IPs to {current_ip}...")
+        self.worker = CommandWorker(cmd, cwd=self.server_dir)
+        self.worker.output.connect(lambda s: self.server_log.append(s))
+        self.worker.finished.connect(lambda r: QMessageBox.information(self, "Success", f"Database IPs updated to {current_ip}.") if r == 0 else None)
+        self.worker.start()
+
     def automated_install_stack(self):
         """Combined multi-step workflow for deployment."""
         s_dir = self.server_dir_field.text().strip()
@@ -2666,14 +3004,23 @@ fi
         smash_aes_key = get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_AES_KEY", 
                                      get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_CONFIG_AES_KEY", gen_hex(64)))
         
+        mk8_kerberos_pw = get_existing("mario-kart-8.local.env", "PN_MK8_KERBEROS_PASSWORD", gen_password(32))
+        
         minecraft_kerberos_pw = get_existing("minecraft-wiiu.local.env", "PN_MINECRAFT_KERBEROS_PASSWORD", gen_password(32))
         pikmin3_kerberos_pw = get_existing("pikmin-3.local.env", "PN_PIKMIN3_KERBEROS_PASSWORD", gen_password(32))
         
         boss_api_key = get_existing("boss.local.env", "PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY", gen_password(32))
-        boss_wiiu_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY", gen_hex(32))
-        boss_wiiu_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY", gen_hex(32))
-        boss_3ds_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_AES_KEY", gen_hex(32))
+        
+        # Load known keys if available from SEC_KEYS
+        sk = SEC_KEYS
+        boss_wiiu_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY", sk.get("BOSS_WIIU_AES_KEY", gen_hex(32)))
+        boss_wiiu_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY", sk.get("BOSS_WIIU_HMAC_KEY", gen_hex(32)))
+        boss_3ds_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_AES_KEY", sk.get("BOSS_3DS_AES_KEY", gen_hex(32)))
         boss_3ds_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY", gen_hex(32))
+        
+        pokken_kerberos_pw = get_existing("pokken-tournament.local.env", "PN_POKKENTOURNAMENT_KERBEROS_PASSWORD", gen_password(32))
+        pokken_aes_key = get_existing("pokken-tournament.local.env", "PN_POKKENTOURNAMENT_CONFIG_AES_KEY", gen_hex(64))
+        mk8_aes_key = get_existing("mario-kart-8.local.env", "PN_MK8_CONFIG_AES_KEY", gen_hex(64))
         
         env_files = {}
 
@@ -2826,8 +3173,9 @@ fi
         ]
 
         # 12. Pokken Tournament
-        pokken_kerberos_pw = get_existing("pokken-tournament.local.env", "PN_POKKENTOURNAMENT_KERBEROS_PASSWORD", gen_password(32))
         env_files["pokken-tournament.local.env"] = [
+            f"PN_POKKENTOURNAMENT_KERBEROS_PASSWORD={pokken_kerberos_pw}",
+            f"PN_POKKENTOURNAMENT_CONFIG_AES_KEY={pokken_aes_key}",
             "PN_POKKENTOURNAMENT_AUTHENTICATION_SERVER_PORT=60008",
             f"PN_POKKENTOURNAMENT_SECURE_SERVER_HOST={server_ip}",
             "PN_POKKENTOURNAMENT_SECURE_SERVER_PORT=60009",
@@ -2844,7 +3192,31 @@ fi
             "PN_POKKENTOURNAMENT_S3_BUCKET=pokken-tournament",
         ]
 
-        # 13. MinIO
+        # 13. Mario Kart 8
+        env_files["mario-kart-8.local.env"] = [
+            f"PN_MK8_KERBEROS_PASSWORD={mk8_kerberos_pw}",
+            f"PN_MK8_CONFIG_AES_KEY={mk8_aes_key}",
+            "PN_MK8_AUTHENTICATION_SERVER_PORT=6014",
+            "PN_MK8_SECURE_SERVER_PORT=6015",
+            "PN_MK8_ACCOUNT_GRPC_HOST=account",
+            "PN_MK8_ACCOUNT_GRPC_PORT=5000",
+            f"PN_MK8_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            "PN_MK8_FRIENDS_GRPC_HOST=friends",
+            "PN_MK8_FRIENDS_GRPC_PORT=5001",
+            f"PN_MK8_FRIENDS_GRPC_API_KEY={friends_api_key}",
+            f"PN_MK8_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/mario_kart_8?sslmode=disable",
+            "PN_MK8_CONFIG_MONGODB_URI=mongodb://mongodb:27017/pretendo_mk8?replicaSet=rs",
+            "PN_MK8_CONFIG_MONGODB_HOST=mongodb",
+            "PN_MK8_CONFIG_MONGODB_PORT=27017",
+            f"PN_MK8_SECURE_SERVER_LOCATION={server_ip}",
+            f"PN_MK8_SECURE_SERVER_HOST={server_ip}",
+            "PN_MK8_S3_ENDPOINT=minio:9000",
+            "PN_MK8_S3_ACCESS_KEY=minio_pretendo",
+            f"PN_MK8_S3_ACCESS_SECRET={minio_secret}",
+            "PN_MK8_S3_BUCKET=mario-kart-8",
+        ]
+
+        # 14. MinIO
         env_files["minio.local.env"] = [
             f"MINIO_ROOT_PASSWORD={minio_secret}",
         ]
@@ -2933,18 +3305,19 @@ Server IP address: {server_ip}
         if not os.path.isdir(repos_dir):
             return
 
-        # 0. Clean the slate to remove old broken database patches
-        if shutil.which("git"):
-            for repo_name in ["splatoon", "friends", "pikmin-3", "minecraft-wiiu", "super-mario-maker", "juxtaposition-ui", "super-smash-bros-wiiu"]:
+        # 0. Clean the slate only if explicitly required or on major errors (Reduces start time by ~4-8s)
+        if shutil.which("git") and getattr(self, "force_clean_repos", False):
+            self.setup_log.append("[System] Force-cleaning submodules for compatibility...")
+            for repo_name in ["splatoon", "friends", "pikmin-3", "minecraft-wiiu", "super-mario-maker", "juxtaposition-ui", "super-smash-bros-wiiu", "mario-kart-8"]:
                 r_path = os.path.join(repos_dir, repo_name)
                 if os.path.isdir(r_path):
                     subprocess.run(["git", "checkout", "--", "."], cwd=r_path, capture_output=True)
 
-        # 1. Patch Dockerfiles (Vendor sync & Delve)
+        # 1. Patch Dockerfiles (Vendor sync & Delve) - Optimized: Scan all repos
         cnt = 0
-        for root, _, files in os.walk(repos_dir):
-            if "Dockerfile" in files:
-                fpath = os.path.join(root, "Dockerfile")
+        for rname in os.listdir(repos_dir):
+            fpath = os.path.join(repos_dir, rname, "Dockerfile")
+            if os.path.isfile(fpath):
                 try:
                     with open(fpath, "r") as f: content = f.read()
                     changed = False
@@ -2987,6 +3360,1091 @@ Server IP address: {server_ip}
                     with open(splat_init, "w") as f: f.write(s_content)
                     self.setup_log.append("[OK] Patched Splatoon gRPC resolver syntax.")
             except: pass
+
+        # 4. Silence godotenv warnings by creating empty .env files in each repo
+        env_cnt = 0
+        for rname in os.listdir(repos_dir):
+            r_path = os.path.join(repos_dir, rname)
+            if os.path.isdir(r_path):
+                env_path = os.path.join(r_path, ".env")
+                if not os.path.exists(env_path):
+                    try:
+                        with open(env_path, "w") as f:
+                            f.write("# Dummy env to silence godotenv warnings\n")
+                        env_cnt += 1
+                    except: pass
+        if env_cnt > 0:
+            self.setup_log.append(f"[OK] Created {env_cnt} dummy .env files for noise reduction.")
+
+        # 5. Friends server: Patch nex-go handleConnect to guard against empty CONNECT payloads
+        # This prevents "Failed to read NEX Buffer length. Not enough data to read uint32" error spam
+        # when Cemu sends CONNECT packets without a valid Kerberos ticket to the secure endpoint.
+        friends_dir = os.path.join(repos_dir, "friends")
+        if os.path.isdir(friends_dir):
+            # The fix goes into the vendored nex-go after `go mod vendor` runs during Docker build.
+            # We patch the Dockerfile to insert a sed command after vendor step.
+            friends_dockerfile = os.path.join(friends_dir, "Dockerfile")
+            if os.path.isfile(friends_dockerfile):
+                try:
+                    with open(friends_dockerfile, "r") as f:
+                        df_content = f.read()
+                    patch_marker = "# PAYLOAD_GUARD_PATCH"
+                    if patch_marker not in df_content and "go mod vendor" in df_content:
+                        # Insert a sed after `go mod vendor` to add payload length check
+                        # The guard checks if payload is too small before attempting Kerberos read
+                        sed_patch = (
+                            f'\n{patch_marker}\n'
+                            'RUN PRUDP_FILE=$(find vendor -path "*/nex-go/v2/prudp_endpoint.go" | head -1) && \\\n'
+                            '    if [ -n "$PRUDP_FILE" ]; then \\\n'
+                            '    sed -i \'s/if pep.IsSecureEndPoint {/if pep.IsSecureEndPoint {\\n\\t\\tif len(packet.Payload()) < 8 {\\n\\t\\t\\treturn\\n\\t\\t}/\' "$PRUDP_FILE"; \\\n'
+                            '    echo "Patched $PRUDP_FILE with empty-payload guard"; \\\n'
+                            '    fi\n'
+                        )
+                        df_content = df_content.replace(
+                            "RUN go mod vendor",
+                            "RUN go mod vendor" + sed_patch
+                        )
+                        with open(friends_dockerfile, "w") as f:
+                            f.write(df_content)
+                        self.setup_log.append("[OK] Patched friends Dockerfile with empty-payload guard for handleConnect.")
+                except Exception as e:
+                    self.setup_log.append(f"[WARN] Failed to patch friends Dockerfile: {e}")
+
+        # 6. Mario Kart 8 deep patches for nex-go v1.0.41 / nex-protocols-go v1.0.58 compatibility
+        self._patch_mario_kart_8(s_dir)
+
+    def _patch_mario_kart_8(self, s_dir):
+        """Patch Mario Kart 8 source files and Dockerfile for nex library v1 compatibility."""
+        mk8_dir = os.path.join(s_dir, "repos", "mario-kart-8")
+        if not os.path.isdir(mk8_dir):
+            return
+        self.setup_log.append("[System] Patching Mario Kart 8 for nex-go v1.0.41 compatibility...")
+
+        # --- Cleanup original files that cause conflicts or panics ---
+        for sub in ["mk8-authentication", "mk8-secure"]:
+            for f in ["init.go", "config.go"]:
+                p = os.path.join(mk8_dir, sub, f)
+                if os.path.isfile(p):
+                    try: os.remove(p)
+                    except: pass
+
+        # Delete auth database.go so we can replace it with environment-aware version
+        auth_db = os.path.join(mk8_dir, "mk8-authentication", "database.go")
+        if os.path.isfile(auth_db):
+            try: os.remove(auth_db)
+            except: pass
+
+        # --- Dockerfile ---
+        mk8_dockerfile = os.path.join(mk8_dir, "Dockerfile")
+        try:
+            with open(mk8_dockerfile, "w") as f:
+                f.write('''# syntax=docker/dockerfile:1
+FROM golang:1.23-alpine AS build
+
+WORKDIR /app
+COPY . .
+
+# Build authentication using older V1 libraries for compatibility
+WORKDIR /app/mk8-authentication
+RUN if [ ! -f go.mod ]; then \\
+    go mod init github.com/PretendoNetwork/mk8-authentication && \\
+    go mod edit -require github.com/PretendoNetwork/nex-go@v1.0.41 && \\
+    go mod edit -require github.com/PretendoNetwork/nex-protocols-go@v1.0.58 && \\
+    go mod edit -require github.com/PretendoNetwork/nex-protocols-common-go@v1.0.30; \\
+    fi
+RUN go mod tidy
+RUN CGO_ENABLED=0 go build -o /app/bin/mk8-authentication .
+
+# Build secure using older V1 libraries for compatibility
+WORKDIR /app/mk8-secure
+RUN if [ ! -f go.mod ]; then \
+    go mod init github.com/PretendoNetwork/mk8-secure && \
+    go mod edit -require github.com/PretendoNetwork/nex-go@v1.0.41 && \
+    go mod edit -require github.com/PretendoNetwork/nex-protocols-go@v1.0.58 && \
+    go mod edit -require github.com/PretendoNetwork/nex-protocols-common-go@v1.0.30; \
+    fi
+RUN go mod tidy
+RUN CGO_ENABLED=0 go build -o /app/bin/mk8-secure .
+
+# Final stage
+FROM alpine:3.20
+WORKDIR /app
+RUN apk add --no-cache libc6-compat ca-certificates
+COPY --from=build /app/bin/mk8-authentication /app/mk8-authentication
+COPY --from=build /app/bin/mk8-secure /app/mk8-secure
+COPY start.sh /app/start.sh
+RUN chmod +x /app/mk8-authentication /app/mk8-secure /app/start.sh
+
+EXPOSE 6014/udp 6015/udp
+CMD ["./start.sh"]
+''')
+            self.setup_log.append("[OK] Wrote Mario Kart 8 Dockerfile.")
+        except Exception as e:
+            self.setup_log.append(f"[ERROR] Failed to write MK8 Dockerfile: {e}")
+
+        # --- mk8-authentication patches ---
+        auth_dir = os.path.join(mk8_dir, "mk8-authentication")
+        if os.path.isdir(auth_dir):
+            # main.go
+            self._write_file(os.path.join(auth_dir, "main.go"), r'''package main
+
+import (
+	"fmt"
+	"os"
+
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+var nexServer *nex.Server
+
+func main() {
+	port := os.Getenv("PN_MK8_AUTHENTICATION_SERVER_PORT")
+	if port == "" {
+		port = "6014"
+	}
+	nexServer = nex.NewServer()
+	nexServer.SetPRUDPVersion(1)
+	nexServer.SetDefaultNEXVersion(&nex.NEXVersion{
+		Major: 3,
+		Minor: 5,
+		Patch: 0,
+	})
+	nexServer.SetKerberosKeySize(32)
+	nexServer.SetAccessKey("25dbf96a")
+
+	nexServer.On("Data", func(packet *nex.PacketV1) {
+		request := packet.RMCRequest()
+
+		fmt.Println("==MK8 - Auth==")
+		fmt.Printf("Protocol ID: %#v\n", request.ProtocolID())
+		fmt.Printf("Method ID: %#v\n", request.MethodID())
+		fmt.Println("===============")
+	})
+
+	nexServer.On("RMCRequest", func(client *nex.Client, request *nex.RMCRequest) {
+		if request.ProtocolID() == 0xA {
+			if request.MethodID() == 1 {
+				// Login
+			} else if request.MethodID() == 2 {
+				// LoginEx
+				params := nex.NewStreamIn(request.Parameters(), nexServer)
+				userName, _ := params.ReadString()
+				loginEx(nil, client, request.CallID(), userName, nil)
+			} else if request.MethodID() == 3 {
+				// RequestTicket
+				params := nex.NewStreamIn(request.Parameters(), nexServer)
+				userPID, _ := params.ReadUInt32LE()
+				serverPID, _ := params.ReadUInt32LE()
+				requestTicket(nil, client, request.CallID(), userPID, serverPID)
+			}
+		}
+	})
+
+	nexServer.Listen(":" + port)
+}
+
+func init() {
+	connectMongo()
+}
+''')
+            # database.go
+            self._write_file(os.path.join(auth_dir, "database.go"), r'''package main
+
+import (
+	"context"
+	"os"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+var mongoClient *mongo.Client
+var mongoContext context.Context
+var mongoDatabase *mongo.Database
+var mongoCollection *mongo.Collection
+
+func connectMongo() {
+	host := os.Getenv("PN_MK8_CONFIG_MONGODB_HOST")
+	if host == "" {
+		host = "mongodb"
+	}
+	port := os.Getenv("PN_MK8_CONFIG_MONGODB_PORT")
+	if port == "" {
+		port = "27017"
+	}
+
+	mongoClient, _ = mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://"+host+":"+port+"/"))
+	mongoDatabase = mongoClient.Database("pretendo_account")
+	mongoCollection = mongoDatabase.Collection("nexaccounts")
+}
+
+func getNEXAccountByPID(pid uint32) bson.M {
+	var result bson.M
+
+	err := mongoCollection.FindOne(context.TODO(), bson.D{{Key: "pid", Value: pid}}, options.FindOne()).Decode(&result)
+
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil
+		}
+
+		return nil
+	}
+
+	return result
+}
+''')
+            # login_ex.go
+            local_ip = self._get_local_ip()
+            self._write_file(os.path.join(auth_dir, "login_ex.go"), r'''package main
+
+import (
+	"fmt"
+	"strconv"
+
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func loginEx(err error, client *nex.Client, callID uint32, username string, authenticationInfo interface{}) {
+	// TODO: Verify auth info
+
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	userPID, _ := strconv.Atoi(username)
+
+	serverPID := 1 // Quazal Rendez-Vous
+
+	encryptedTicket, errorCode := generateKerberosTicket(uint32(userPID), uint32(serverPID), nexServer.KerberosKeySize())
+
+	if errorCode != 0 {
+		fmt.Println(errorCode)
+		return
+	}
+
+	// Build the response body
+	stationURL := "prudps:/address={local_ip};port=6015;CID=1;PID=2;sid=1;stream=10;type=2"
+	serverName := "3D Open Dock U - MK8"
+
+	rvConnectionData := nex.NewRVConnectionData()
+	rvConnectionData.SetStationURL(stationURL)
+	rvConnectionData.SetSpecialProtocols([]byte{})
+	rvConnectionData.SetStationURLSpecialProtocols("")
+	serverTime := nex.NewDateTime(0)
+	rvConnectionData.SetTime(serverTime)
+
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+
+	rmcResponseStream.WriteUInt32LE(0x10001) // success
+	rmcResponseStream.WriteUInt32LE(uint32(userPID))
+	rmcResponseStream.WriteBuffer(encryptedTicket)
+	rmcResponseStream.WriteStructure(rvConnectionData)
+	rmcResponseStream.WriteString(serverName)
+
+	rmcResponseBody := rmcResponseStream.Bytes()
+
+	// Build response packet
+	rmcResponse := nex.NewRMCResponse(0xA, callID)
+	rmcResponse.SetSuccess(1, rmcResponseBody)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+'''.replace("{local_ip}", local_ip))
+            # request_ticket.go
+            self._write_file(os.path.join(auth_dir, "request_ticket.go"), r'''package main
+
+import (
+	"fmt"
+
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func requestTicket(err error, client *nex.Client, callID uint32, userPID uint32, serverPID uint32) {
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	encryptedTicket, errorCode := generateKerberosTicket(userPID, serverPID, nexServer.KerberosKeySize())
+
+	if errorCode != 0 {
+		fmt.Println(errorCode)
+		return
+	}
+
+	// Build the response body
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+
+	rmcResponseStream.WriteUInt32LE(0x10001) // success
+	rmcResponseStream.WriteBuffer(encryptedTicket)
+
+	rmcResponseBody := rmcResponseStream.Bytes()
+
+	// Build response packet
+	rmcResponse := nex.NewRMCResponse(0xA, callID)
+	rmcResponse.SetSuccess(2, rmcResponseBody)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+''')
+            # kerberos.go - fix NewKerberosEncryption to handle error return
+            self._write_file(os.path.join(auth_dir, "kerberos.go"), r'''package main
+
+import (
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func generateKerberosTicket(userPID uint32, serverPID uint32, keySize int) ([]byte, int) {
+	user := getNEXAccountByPID(userPID)
+	if user == nil {
+		return []byte{}, 0x80030064 // RendezVous::InvalidUsername
+	}
+
+	userPassword := user["password"].(string)
+	serverPassword := "password"
+
+	// Create session key and ticket keys
+	sessionKey := make([]byte, keySize)
+
+	ticketInfoKey := make([]byte, 16)                   // key for encrypting the internal ticket info. Only used by server. TODO: Make this random!
+	userKey := deriveKey(userPID, []byte(userPassword)) // Key for encrypting entire ticket. Used by client and server
+	serverKey := deriveKey(serverPID, []byte(serverPassword))
+	finalKey := nex.MD5Hash(append(serverKey, ticketInfoKey...))
+
+	//rand.Read(sessionKey) // Create a random session key
+
+	//fmt.Println("Using Session Key: " + hex.EncodeToString(sessionKey))
+
+	////////////////////////////////
+	// Build internal ticket info //
+	////////////////////////////////
+
+	expiration := nex.NewDateTime(0)
+	ticketInfoStream := nex.NewStreamOut(nexServer)
+
+	ticketInfoStream.WriteUInt64LE(expiration.Now())
+	ticketInfoStream.WriteUInt32LE(userPID)
+	ticketInfoStream.Grow(int64(keySize))
+	ticketInfoStream.WriteBytesNext(sessionKey)
+
+	// Encrypt internal ticket info
+
+	ticketInfoEncryption, _ := nex.NewKerberosEncryption(nex.MD5Hash(finalKey))
+	encryptedTicketInfo := ticketInfoEncryption.Encrypt(ticketInfoStream.Bytes())
+
+	///////////////////////////////////
+	// Build ticket data New Version //
+	///////////////////////////////////
+
+	ticketDataStream := nex.NewStreamOut(nexServer)
+
+	ticketDataStream.WriteBuffer(ticketInfoKey)
+	ticketDataStream.WriteBuffer(encryptedTicketInfo)
+
+	///////////////////////////
+	// Build Kerberos Ticket //
+	///////////////////////////
+
+	ticketStream := nex.NewStreamOut(nexServer)
+
+	// Write session key
+	ticketStream.Grow(int64(keySize))
+	ticketStream.WriteBytesNext(sessionKey)
+	ticketStream.WriteUInt32LE(serverPID)
+	ticketStream.WriteBuffer(ticketDataStream.Bytes())
+
+	// Encrypt the ticket
+	ticketEncryption, _ := nex.NewKerberosEncryption(userKey)
+	encryptedTicket := ticketEncryption.Encrypt(ticketStream.Bytes())
+
+	return encryptedTicket, 0
+}
+
+func deriveKey(pid uint32, password []byte) []byte {
+	for i := 0; i < 65000+int(pid)%1024; i++ {
+		password = nex.MD5Hash(password)
+	}
+
+	return password
+}
+''')
+            self.setup_log.append("[OK] Patched mk8-authentication Go sources.")
+
+        # --- mk8-secure patches ---
+        sec_dir = os.path.join(mk8_dir, "mk8-secure")
+        if os.path.isdir(sec_dir):
+            # protocols.go - local constants to avoid library version issues
+            self._write_file(os.path.join(sec_dir, "protocols.go"), r'''package main
+
+const (
+	NatTraversalProtocolID                      = 0x0A
+	SecureProtocolID                            = 0x0B
+	MatchMakingExtProtocolID                    = 0x12
+	MatchMakingProtocolID                       = 0x15
+	RankingProtocolID                           = 0x80
+	MatchmakeExtensionProtocolID               = 0x6D
+)
+
+const (
+	NatTraversalMethodInitiateProbe              = 1
+	NatTraversalMethodRequestProbeInitiationExt  = 2
+	NatTraversalMethodReportNatProperties        = 3
+
+	SecureMethodRegister                         = 1
+	SecureMethodReplaceURL                      = 2
+	SecureMethodSendReport                       = 3
+
+	MatchMakingMethodGetSessionURLs             = 5
+	MatchMakingMethodUpdateSessionHostV1        = 16
+
+	MatchMakingExtMethodEndParticipation        = 1
+
+	MatchmakeExtensionMethodAutoMatchmakeWithSearchCriteria_Postpone = 11
+
+	RankingMethodUploadCommonData                = 1
+)
+''')
+            # main.go
+            self._write_file(os.path.join(sec_dir, "main.go"), r'''package main
+
+import (
+	"fmt"
+	"os"
+
+	nex "github.com/PretendoNetwork/nex-go"
+	match_making_types "github.com/PretendoNetwork/nex-protocols-go/match-making/types"
+)
+
+type MatchmakingData struct {
+	matchmakeSession *match_making_types.MatchmakeSession
+	clients          []*nex.Client
+}
+
+type ServerConfig struct {
+	ServerPort            string
+	AccessKey             string
+	NexVersion            int
+	DatabaseIP            string
+	DatabasePort          string
+	DatabaseUseAuth       bool
+	DatabaseUsername      string
+	DatabasePassword      string
+	AccountDatabase       string
+	PNIDCollection        string
+	NexAccountsCollection string
+	MK8Database           string
+	RoomsCollection       string
+	SessionsCollection    string
+	UsersCollection       string
+	RegionsCollection     string
+	TournamentsCollection string
+}
+
+var nexServer *nex.Server
+var secureServer interface{}
+var MatchmakingState []*MatchmakingData
+var config *ServerConfig
+
+func main() {
+	MatchmakingState = append(MatchmakingState, nil)
+
+	// Initialize config from environment variables
+	config = &ServerConfig{
+		ServerPort: os.Getenv("PN_MK8_SECURE_SERVER_PORT"),
+		AccessKey:  os.Getenv("PN_MK8_SECURE_SERVER_ACCESS_KEY"),
+		NexVersion: 30500,
+
+		DatabaseIP:       os.Getenv("PN_MK8_CONFIG_MONGODB_HOST"),
+		DatabasePort:     os.Getenv("PN_MK8_CONFIG_MONGODB_PORT"),
+		DatabaseUsername: os.Getenv("PN_MK8_CONFIG_MONGODB_USERNAME"),
+		DatabasePassword: os.Getenv("PN_MK8_CONFIG_MONGODB_PASSWORD"),
+		DatabaseUseAuth: os.Getenv("PN_MK8_CONFIG_MONGODB_USERNAME") != "",
+
+		AccountDatabase:       "pretendo_account",
+		PNIDCollection:        "users",
+		NexAccountsCollection: "servers",
+
+		MK8Database:           "pretendo_mk8",
+		RegionsCollection:     "regions",
+		UsersCollection:       "users",
+		SessionsCollection:    "sessions",
+		RoomsCollection:       "rooms",
+		TournamentsCollection: "tournaments",
+	}
+
+	if config.ServerPort == "" {
+		config.ServerPort = "6015"
+	}
+	if config.AccessKey == "" {
+		config.AccessKey = "25dbf96a"
+	}
+	if config.DatabaseIP == "" {
+		config.DatabaseIP = "mongodb"
+	}
+	if config.DatabasePort == "" {
+		config.DatabasePort = "27017"
+	}
+
+	connectMongo()
+
+	nexServer = nex.NewServer()
+	nexServer.SetPRUDPVersion(1)
+	nexServer.SetDefaultNEXVersion(&nex.NEXVersion{
+		Major: 3,
+		Minor: 5,
+		Patch: 0,
+	})
+	nexServer.SetKerberosKeySize(32)
+	nexServer.SetAccessKey(config.AccessKey)
+
+	nexServer.On("Data", func(packet *nex.PacketV1) {
+		request := packet.RMCRequest()
+
+		fmt.Println("==MK8 - Secure==")
+		fmt.Printf("Protocol ID: %#v\n", request.ProtocolID())
+		fmt.Printf("Method ID: %#v\n", request.MethodID())
+		fmt.Println("=================")
+
+		if packet.Type() == nex.DataPacket && request.ProtocolID() == 0 {
+			// This might be the secure connection check
+			connect(packet)
+		}
+	})
+
+	nexServer.On("RMCRequest", func(client *nex.Client, request *nex.RMCRequest) {
+		params := nex.NewStreamIn(request.Parameters(), nexServer)
+		if request.ProtocolID() == SecureProtocolID {
+			if request.MethodID() == SecureMethodRegister {
+				count, _ := params.ReadUInt32LE()
+				urls := make([]*nex.StationURL, count)
+				for i := 0; i < int(count); i++ {
+					urlStr, _ := params.ReadString()
+					urls[i] = nex.NewStationURL(urlStr)
+				}
+				register(nil, client, request.CallID(), urls)
+			}
+		} else if request.ProtocolID() == NatTraversalProtocolID {
+			if request.MethodID() == NatTraversalMethodReportNatProperties {
+				natm, _ := params.ReadUInt32LE()
+				natf, _ := params.ReadUInt32LE()
+				rtt, _ := params.ReadUInt32LE()
+				reportNatProperties(nil, client, request.CallID(), natm, natf, rtt)
+			}
+		}
+	})
+
+	// Protocol handlers initialization (must be handled by the library or manual registration)
+	// secureServer = nexproto.NewSecureProtocol(nexServer)
+	// ... (The rest is in mk8-secure handlers)
+
+	nexServer.Listen(":" + config.ServerPort)
+}
+''')
+            # connect.go - fix NewKerberosEncryption and ReadUInt32LE error returns
+            self._write_file(os.path.join(sec_dir, "connect.go"), r'''package main
+
+import (
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func connect(packet *nex.PacketV1) {
+	payload := packet.Payload()
+
+	stream := nex.NewStreamIn(payload, nexServer)
+
+	_, _ = stream.ReadBuffer()
+	checkData, _ := stream.ReadBuffer()
+
+	sessionKey := make([]byte, nexServer.KerberosKeySize())
+
+	kerberos, _ := nex.NewKerberosEncryption(sessionKey)
+
+	checkDataDecrypted := kerberos.Decrypt(checkData)
+	checkDataStream := nex.NewStreamIn(checkDataDecrypted, nexServer)
+
+	userPID, _ := checkDataStream.ReadUInt32LE() // User PID
+	packet.Sender().SetPID(userPID)
+	_, _ = checkDataStream.ReadUInt32LE() //CID of secure server station url
+	responseCheck, _ := checkDataStream.ReadUInt32LE()
+
+	responseValueStream := nex.NewStreamOut(nexServer)
+	responseValueStream.WriteUInt32LE(responseCheck + 1)
+
+	responseValueBufferStream := nex.NewStreamOut(nexServer)
+	responseValueBufferStream.WriteBuffer(responseValueStream.Bytes())
+
+	nexServer.AcknowledgePacket(packet, responseValueBufferStream.Bytes())
+
+	packet.Sender().UpdateRC4Key(sessionKey)
+	packet.Sender().SetSessionKey(sessionKey)
+
+	if !doesUserExist(userPID) {
+		addNewUser(userPID)
+	}
+}
+''')
+            # register.go - fix SetAddress/SetPort/SetNatm/SetType types
+            self._write_file(os.path.join(sec_dir, "register.go"), r'''package main
+
+import (
+	"strconv"
+
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func register(err error, client *nex.Client, callID uint32, stationUrls []*nex.StationURL) {
+	localStation := stationUrls[0]
+	localStationURL := localStation.EncodeToString()
+	connectionId := uint32(0) // secureServer.ConnectionIDCounter.Increment()
+	client.SetConnectionID(connectionId)
+	// client.SetLocalStationUrl(localStationURL)
+
+	address := client.Address().IP.String()
+	port := uint32(client.Address().Port)
+	portStr := strconv.Itoa(client.Address().Port)
+	natm := uint32(0)
+	type_ := uint32(3)
+
+	localStation.SetAddress(address)
+	localStation.SetPort(port)
+	localStation.SetNatm(natm)
+	localStation.SetType(type_)
+
+	globalStationURL := localStation.EncodeToString()
+
+	if !doesSessionExist(client.PID()) {
+		addPlayerSession(client.PID(), []string{localStationURL, globalStationURL}, address, portStr)
+	} else {
+		updatePlayerSessionAll(client.PID(), []string{localStationURL, globalStationURL}, address, portStr)
+	}
+
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+
+	rmcResponseStream.WriteUInt32LE(0x10001) // Success
+	rmcResponseStream.WriteUInt32LE(connectionId)
+	rmcResponseStream.WriteString(globalStationURL)
+
+	rmcResponseBody := rmcResponseStream.Bytes()
+
+	// Build response packet
+	rmcResponse := nex.NewRMCResponse(SecureProtocolID, callID)
+	rmcResponse.SetSuccess(SecureMethodRegister, rmcResponseBody)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+''')
+            # report_nat_properties.go
+            self._write_file(os.path.join(sec_dir, "report_nat_properties.go"), r'''package main
+
+import (
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func reportNatProperties(err error, client *nex.Client, callID uint32, natm uint32, natf uint32, rtt uint32) {
+	stationUrlsStrings := getPlayerUrls(client.PID())
+	stationUrls := make([]nex.StationURL, len(stationUrlsStrings))
+	pid := client.PID()
+	rvcid := client.ConnectionID()
+
+	for i := 0; i < len(stationUrlsStrings); i++ {
+		stationUrls[i] = *nex.NewStationURL(stationUrlsStrings[i])
+		if stationUrls[i].Type() == uint32(3) {
+			stationUrls[i].SetNatm(natm)
+		}
+		stationUrls[i].SetPID(pid)
+		stationUrls[i].SetRVCID(rvcid)
+		updatePlayerSessionUrl(client.PID(), stationUrlsStrings[i], stationUrls[i].EncodeToString())
+	}
+
+	rmcResponse := nex.NewRMCResponse(NatTraversalProtocolID, callID)
+	rmcResponse.SetSuccess(NatTraversalMethodReportNatProperties, nil)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+''')
+            # request_probe_initiation_ext.go
+            self._write_file(os.path.join(sec_dir, "request_probe_initiation_ext.go"), r'''package main
+
+import (
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func requestProbeInitiationExt(err error, client *nex.Client, callID uint32, targetList []string, stationToProbe string) {
+	rmcResponse := nex.NewRMCResponse(NatTraversalProtocolID, callID)
+	rmcResponse.SetSuccess(NatTraversalMethodRequestProbeInitiationExt, nil)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+
+	rmcMessage := nex.RMCRequest{}
+	rmcMessage.SetProtocolID(NatTraversalProtocolID)
+	rmcMessage.SetCallID(0xffff0000 + callID)
+	rmcMessage.SetMethodID(NatTraversalMethodInitiateProbe)
+	rmcRequestStream := nex.NewStreamOut(nexServer)
+	rmcRequestStream.WriteString(stationToProbe)
+	rmcRequestBody := rmcRequestStream.Bytes()
+	rmcMessage.SetParameters(rmcRequestBody)
+	rmcMessageBytes := rmcMessage.Bytes()
+
+	for _, target := range targetList {
+		targetUrl := nex.NewStationURL(target)
+		targetClient := nexServer.FindClientFromPID(targetUrl.PID())
+		if targetClient != nil {
+			messagePacket, _ := nex.NewPacketV1(targetClient, nil)
+			messagePacket.SetVersion(1)
+			messagePacket.SetSource(0xA1)
+			messagePacket.SetDestination(0xAF)
+			messagePacket.SetType(nex.DataPacket)
+			messagePacket.SetPayload(rmcMessageBytes)
+
+			messagePacket.AddFlag(nex.FlagNeedsAck)
+			messagePacket.AddFlag(nex.FlagReliable)
+
+			nexServer.Send(messagePacket)
+		}
+	}
+}
+''')
+            # upload_common_data.go
+            self._write_file(os.path.join(sec_dir, "upload_common_data.go"), r'''package main
+
+import (
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func uploadCommonData(err error, client *nex.Client, callID uint32, commonData []byte, uniqueID uint64) {
+	rmcResponse := nex.NewRMCResponse(RankingProtocolID, callID)
+	rmcResponse.SetSuccess(RankingMethodUploadCommonData, nil)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+''')
+            # get_session_urls.go
+            self._write_file(os.path.join(sec_dir, "get_session_urls.go"), r'''package main
+
+import (
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func getSessionURLs(err error, client *nex.Client, callID uint32, gatheringId uint32) {
+	var stationUrlStrings []string
+
+	hostpid, _, _, _, _ := getRoomInfo(gatheringId)
+
+	stationUrlStrings = getPlayerUrls(hostpid)
+
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteListString(stationUrlStrings)
+
+	rmcResponseBody := rmcResponseStream.Bytes()
+
+	// Build response packet
+	rmcResponse := nex.NewRMCResponse(MatchMakingProtocolID, callID)
+	rmcResponse.SetSuccess(MatchMakingMethodGetSessionURLs, rmcResponseBody)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+''')
+            # auto_matchmake_with_search_criteria_postpone.go
+            self._write_file(os.path.join(sec_dir, "auto_matchmake_with_search_criteria_postpone.go"), r'''package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"math"
+	"strconv"
+
+	nex "github.com/PretendoNetwork/nex-go"
+	match_making_types "github.com/PretendoNetwork/nex-protocols-go/match-making/types"
+)
+
+var regionList = []string{"Worldwide", "Japan", "United States", "Europe", "Korea", "China", "Taiwan"}
+var gameModes = []string{"VS Race", "Battle"}
+var ccList = []string{"Unk", "200cc", "50cc", "100cc", "150cc", "Mirror", "BattleCC"}
+var itemModes = []string{"Unk1", "Unk2", "Unk3", "Unk4", "Unk5", "Normal", "Unk7", "All Items", "Shells Only", "Bananas Only", "Mushrooms Only", "Bob-ombs Only", "No Items", "No Items or Coins", "Frantic"}
+var vehicleModes = []string{"All Vehicles", "Karts Only", "Bikes Only"}
+var controllerModes = []string{"Unk", "Tilt Only", "All Controls"}
+var dlcModes = []string{"No DLC", "DLC Pack 1 Only", "DLC Pack 2 Only", "Both DLC Packs"}
+
+func autoMatchmakeWithSearchCriteria_Postpone(err error, client *nex.Client, callID uint32, searchCriteria []*match_making_types.MatchmakeSessionSearchCriteria, matchmakeSession *match_making_types.MatchmakeSession, message string) {
+
+	gameConfig := matchmakeSession.Attributes[2]
+	fmt.Println(strconv.FormatUint(uint64(gameConfig), 2))
+	fmt.Println("===== MATCHMAKE SESSION JOIN =====")
+	fmt.Println("REGION: " + regionList[matchmakeSession.Attributes[3]])
+	fmt.Println("GAME MODE: " + gameModes[matchmakeSession.GameMode])
+	fmt.Println("CC: " + ccList[gameConfig%0b111])
+	gameConfig = gameConfig >> 12
+	fmt.Println("DLC MODE: " + dlcModes[matchmakeSession.Attributes[5]&0xF])
+	fmt.Println("ITEM MODE: " + itemModes[gameConfig%0b1111])
+	gameConfig = gameConfig >> 8
+	fmt.Println("VEHICLE MODE: " + vehicleModes[gameConfig%0b11])
+	gameConfig = gameConfig >> 4
+	fmt.Println("CONTROLLER MODE: " + controllerModes[gameConfig%0b11])
+	fmt.Println("HAVE GUEST PLAYER: " + strconv.FormatBool(searchCriteria[0].VacantParticipants > 1))
+
+	gid := findRoom(matchmakeSession.GameMode, true, matchmakeSession.Attributes[3], matchmakeSession.Attributes[2], uint32(searchCriteria[0].VacantParticipants), matchmakeSession.Attributes[5]&0xF)
+	if gid == math.MaxUint32 {
+		gid = newRoom(client.PID(), matchmakeSession.GameMode, true, matchmakeSession.Attributes[3], matchmakeSession.Attributes[2], uint32(searchCriteria[0].VacantParticipants), matchmakeSession.Attributes[5]&0xF)
+	}
+
+	addPlayerToRoom(gid, client.PID(), uint32(searchCriteria[0].VacantParticipants))
+
+	hostpid, gamemode, region, gconfig, dlcmode := getRoomInfo(gid)
+	sessionKey := "00000000000000000000000000000000"
+
+	matchmakeSession.Gathering.ID = gid
+	matchmakeSession.Gathering.OwnerPID = hostpid
+	matchmakeSession.Gathering.HostPID = hostpid
+	matchmakeSession.Gathering.MinimumParticipants = 1
+	matchmakeSession.SessionKey = []byte(sessionKey)
+	matchmakeSession.GameMode = gamemode
+	matchmakeSession.Attributes[3] = region
+	matchmakeSession.Attributes[2] = gconfig
+	matchmakeSession.Attributes[5] = dlcmode
+
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteString("MatchmakeSession")
+	lengthStream := nex.NewStreamOut(nexServer)
+	lengthStream.WriteStructure(matchmakeSession.Gathering)
+	lengthStream.WriteStructure(matchmakeSession)
+	matchmakeSessionLength := uint32(len(lengthStream.Bytes()))
+	rmcResponseStream.WriteUInt32LE(matchmakeSessionLength + 4)
+	rmcResponseStream.WriteUInt32LE(matchmakeSessionLength)
+	rmcResponseStream.WriteStructure(matchmakeSession.Gathering)
+	rmcResponseStream.WriteStructure(matchmakeSession)
+
+	rmcResponseBody := rmcResponseStream.Bytes()
+
+	rmcResponse := nex.NewRMCResponse(MatchmakeExtensionProtocolID, callID)
+	rmcResponse.SetSuccess(MatchmakeExtensionMethodAutoMatchmakeWithSearchCriteria_Postpone, rmcResponseBody)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+
+func endParticipation(err error, client *nex.Client, callID uint32, idGathering uint32, strMessage string) {
+	removePlayerFromRoom(idGathering, client.PID())
+
+	returnval := []byte{0x1}
+
+	rmcResponse := nex.NewRMCResponse(MatchMakingExtProtocolID, callID)
+	rmcResponse.SetSuccess(MatchMakingExtMethodEndParticipation, returnval)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+
+func sendReport(err error, client *nex.Client, callID uint32, reportID uint32, reportData []byte) {
+	fmt.Println("Report ID: " + strconv.Itoa(int(reportID)))
+	fmt.Println("Report Data: " + hex.EncodeToString(reportData))
+
+	rmcResponse := nex.NewRMCResponse(SecureProtocolID, callID)
+	rmcResponse.SetSuccess(SecureMethodSendReport, nil)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+
+func updateSessionHostV1(err error, client *nex.Client, callID uint32, gid uint32) {
+
+	updateRoomHost(gid, client.PID())
+
+	rmcResponse := nex.NewRMCResponse(MatchMakingProtocolID, callID)
+	rmcResponse.SetSuccess(MatchMakingMethodUpdateSessionHostV1, nil)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+''')
+            # replace_url.go
+            self._write_file(os.path.join(sec_dir, "replace_url.go"), r'''package main
+
+import (
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+func replaceURL(err error, client *nex.Client, callID uint32, oldStation *nex.StationURL, newStation *nex.StationURL) {
+	updatePlayerSessionUrl(client.PID(), oldStation.EncodeToString(), newStation.EncodeToString())
+
+	rmcResponse := nex.NewRMCResponse(SecureProtocolID, callID)
+	rmcResponse.SetSuccess(SecureMethodReplaceURL, nil)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	nexServer.Send(responsePacket)
+}
+''')
+
+            self.setup_log.append("[OK] Patched mk8-secure Go sources.")
+
+        # Remove any stale go.mod/go.sum from previous failed builds
+        for sub in ["mk8-authentication", "mk8-secure"]:
+            for stale in ["go.mod", "go.sum"]:
+                p = os.path.join(mk8_dir, sub, stale)
+                if os.path.isfile(p):
+                    try: os.remove(p)
+                    except: pass
+
+        self.setup_log.append("[OK] Mario Kart 8 patches applied successfully.")
+
+    def _write_file(self, path, content):
+        """Helper to write a file, creating parent dirs as needed."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", newline="\n") as f:
+            f.write(content)
 
     def _patch_splatoon_schedules(self, s_dir):
         """Modify Nginx config to pull live Splatoon rotation schedules from the public Pretendo CDN, fixing online hangs."""
@@ -3536,29 +4994,34 @@ Server IP address: {server_ip}
 
     def create_local_account(self):
         """Execute a node.js script inside the container to inject an account."""
-        username = self.cemu_username.text().strip()
-        password = self.cemu_password.text()
-        miiname = self.cemu_miiname.text().strip() or "Player"
-        
-        if not username or not password or not username.isalnum():
-            QMessageBox.warning(self, "Input Error", "Please provide a valid alphanumeric Username and a Password.")
-            return
+        try:
+            username = self.cemu_username.text().strip()
+            password = self.cemu_password.text()
+            miiname = self.cemu_miiname.text().strip() or "Player"
             
-        if not self.server_running:
-            QMessageBox.warning(self, "Network Error", "The Pretendo Server must be RUNNING (ONLINE) to create an account in the database.")
-            return
-        pid = int(hashlib.sha256(username.lower().encode('utf-8')).hexdigest(), 16) % 1000000000 + 1000000000
-        local_ip = self._get_local_ip()
-        s_dir = self.server_dir_field.text().strip()
-        
-        # Pull AES keys from host env files to sync into the container's database
-        friends_aes = self._grep_env_file(os.path.join(s_dir, "environment", "friends.local.env"), "PN_FRIENDS_CONFIG_AES_KEY") or ""
-        splatoon_aes = self._grep_env_file(os.path.join(s_dir, "environment", "splatoon.local.env"), "PN_SPLATOON_CONFIG_AES_KEY") or ""
-        smm_aes = self._grep_env_file(os.path.join(s_dir, "environment", "super-mario-maker.local.env"), "PN_SMM_CONFIG_AES_KEY") or ""
-        miiverse_aes = self._grep_env_file(os.path.join(s_dir, "environment", "miiverse-api.local.env"), "PN_MIIVERSE_API_CONFIG_AES_KEY") or ""
-        smash_aes = self._grep_env_file(os.path.join(s_dir, "environment", "super-smash-bros-wiiu.local.env"), "PN_SSBWIIU_AES_KEY") or ""
-        
-        js_script = f"""
+            if not username or not password or not username.isalnum():
+                QMessageBox.warning(self, "Input Error", "Please provide a valid alphanumeric Username and a Password.")
+                return
+                
+            if not self.server_running:
+                QMessageBox.warning(self, "Network Error", "The Pretendo Server must be RUNNING (ONLINE) to create an account in the database.")
+                return
+            # Match PID to 1337 (0x0539) from the FakeOnlineFiles reference
+            pid = 1337
+            local_ip = self._get_local_ip()
+            s_dir = self.server_dir_field.text().strip()
+            
+            # Pull AES keys from host env files to sync into the container's database
+            friends_aes = self._grep_env_file(os.path.join(s_dir, "environment", "friends.local.env"), "PN_FRIENDS_CONFIG_AES_KEY") or ""
+            splatoon_aes = self._grep_env_file(os.path.join(s_dir, "environment", "splatoon.local.env"), "PN_SPLATOON_CONFIG_AES_KEY") or ""
+            smm_aes = self._grep_env_file(os.path.join(s_dir, "environment", "super-mario-maker.local.env"), "PN_SMM_CONFIG_AES_KEY") or ""
+            miiverse_aes = self._grep_env_file(os.path.join(s_dir, "environment", "miiverse-api.local.env"), "PN_MIIVERSE_API_CONFIG_AES_KEY") or ""
+            smash_aes = self._grep_env_file(os.path.join(s_dir, "environment", "super-smash-bros-wiiu.local.env"), "PN_SSBWIIU_AES_KEY") or ""
+            mk8_aes = self._grep_env_file(os.path.join(s_dir, "environment", "mario-kart-8.local.env"), "PN_MK8_CONFIG_AES_KEY") or ""
+            minecraft_aes = self._grep_env_file(os.path.join(s_dir, "environment", "minecraft-wiiu.local.env"), "PN_MINECRAFT_CONFIG_AES_KEY") or ""
+            pokken_aes = self._grep_env_file(os.path.join(s_dir, "environment", "pokken-tournament.local.env"), "PN_POKKENTOURNAMENT_CONFIG_AES_KEY") or ""
+            
+            js_script = f"""
 const {{ connect }} = require("./dist/database");
 const {{ PNID }} = require("./dist/models/pnid");
 const {{ NEXAccount }} = require("./dist/models/nex-account");
@@ -3646,7 +5109,7 @@ try {{
                 email_token: crypto.randomBytes(32).toString('hex')
             }},
             flags: {{ active: true, is_admin: true, is_dev: true }},
-            access_level: 2
+            access_level: 0
         }});
 
         await user.save();
@@ -3676,21 +5139,28 @@ try {{
 
     // --- Server Synchronization (Splatoon, SMM, Friends, Miiverse) ---
     async function upsertNexServer(name, gid, titles, port, aes, cid) {{
+        // Normalize titles to include both uppercase and lowercase variants for robust matching
+        const normalizedTitles = [...new Set([...titles, ...titles.map(t => t.toLowerCase())])];
+        
         for (const mode of ["prod", "test", "dev"]) {{
             const query = gid ? {{ game_server_id: gid, access_mode: mode }} : {{ client_id: cid, access_mode: mode }};
             await Server.findOneAndUpdate(
                 query,
                 {{
-                    service_name: name,
-                    service_type: gid ? "nex" : "service",
-                    title_ids: titles,
-                    ip: local_ip,
-                    port: port || 80,
-                    maintenance_mode: false,
-                    device: 1,
-                    aes_key: (aes && aes.length === 64) ? aes : "0".repeat(64),
-                    client_id: cid,
-                    access_mode: mode
+                    $set: {{
+                        service_name: name,
+                        service_type: gid ? "nex" : "service",
+                        ip: local_ip,
+                        port: port || 80,
+                        maintenance_mode: false,
+                        device: 1,
+                        aes_key: (aes && aes.length === 64) ? aes : "0".repeat(64),
+                        client_id: cid,
+                        access_mode: mode
+                    }},
+                    $addToSet: {{
+                        title_ids: {{ $each: normalizedTitles }}
+                    }}
                 }},
                 {{ upsert: true }}
             );
@@ -3700,10 +5170,17 @@ try {{
     console.log("[Notice] Patching Game Server Definitions...");
     await upsertNexServer("Splatoon", "10162B00", ["0005000010176A00", "0005000010176900", "0005000010162B00"], 6006, "{splatoon_aes}");
     await upsertNexServer("Super Mario Maker", "1018DB00", ["000500001018DB00", "000500001018DC00", "000500001018DD00"], 6004, "{smm_aes}");
-    await upsertNexServer("Friend List", "00003200", ["0005001010001C00", "000500301001500A", "000500301001510A", "000500301001520A"], 6000, "{friends_aes}");
+    await upsertNexServer("Mario Kart 8", "1010EB00", ["000500001010EB00"], 6014, "{mk8_aes}");
+    await upsertNexServer("Mario Kart 8", "1010EC00", ["000500001010EC00"], 6014, "{mk8_aes}");
+    await upsertNexServer("Mario Kart 8", "1010ED00", ["000500001010ED00"], 6014, "{mk8_aes}");
+    await upsertNexServer("Mario Kart 8", "1010EE00", ["000500001010EE00"], 6014, "{mk8_aes}");
+    await upsertNexServer("Friend List", "00003200", ["0005001010001C00", "000500301001500A", "000500301001510A", "000500301001520A", "00050000101DF400", "000500001010EB00", "000500001010EC00", "000500001010ED00", "000500001010EE00"], 6000, "{friends_aes}");
     await upsertNexServer("Miiverse", null, ["000500301001600A", "000500301001610A", "000500301001620A"], 80, "{miiverse_aes}", "87cd32617f1985439ea608c2746e4610");
-    await upsertNexServer("Pikmin 3", "10113F00", ["0005000010113F00", "0005000010114000", "0005000010114100"], 6010, "");
-    await upsertNexServer("Super Smash Bros. Wii U", "10110E00", ["0005000010110E00", "0005000010144F00", "000500001010ED00"], 6012, "{smash_aes}");
+    await upsertNexServer("Minecraft: Wii U Edition", "101D9D00", ["0005000E101D9D00", "0005000E101DBE00", "00050000101D7500"], 6008, "{minecraft_aes}");
+    await upsertNexServer("Pokkén Tournament", "101DF400", ["00050000101DF400", "0005000E101DF400", "00050002101DF400"], 60008, "{pokken_aes}");
+    await upsertNexServer("Pikmin 3", "1012BC00", ["000500001012BC00", "000500001012BD00", "000500001012BE00"], 6010, "");
+    await upsertNexServer("Super Smash Bros. for Wii U", "10144F00", ["0005000010144F00", "0005000010145000", "0005000010110E00"], 6012, "{smash_aes}");
+    await upsertNexServer("Wii U Chat", "1005A000", ["000500101005A000", "000500101005A100", "000500101005A200"], 6002, "");
 
     // --- Miiverse Discovery Patch (Fixes 400 error) ---
     try {{
@@ -3730,7 +5207,7 @@ try {{
     if (username.toLowerCase() === "bannedpenta") {{
         console.log("[Notice] Creating alias for 'BanndPenta' typo...");
         const altUsername = "BanndPenta";
-        const altPid = 1617601004; 
+        const altPid = 1337; // Force same static PID as the main account for consistency
         let altUser = await PNID.findOne({{ usernameLower: altUsername.toLowerCase() }});
         if (!altUser) {{
             altUser = new PNID(user.toObject());
@@ -3740,11 +5217,14 @@ try {{
             altUser.pid = altPid;
             await altUser.save();
             
-            let altNex = new NEXAccount(nex.toObject());
-            altNex._id = new mongoose.Types.ObjectId();
-            altNex.pid = altPid;
-            altNex.owning_pid = altPid;
-            await altNex.save();
+            let altNex = await NEXAccount.findOne({{ owning_pid: altPid }});
+            if (!altNex) {{
+                altNex = new NEXAccount(nex.toObject());
+                altNex._id = new mongoose.Types.ObjectId();
+                altNex.pid = altPid;
+                altNex.owning_pid = altPid;
+                await altNex.save();
+            }}
             console.log("[Success] Alias 'BanndPenta' created with PID " + altPid);
         }}
     }}
@@ -3757,23 +5237,26 @@ try {{
 }}
 }})();
 """
-        s_dir = self.server_dir_field.text().strip()
-        # Use docker compose exec -T for robust service targeting and project name handling
-        cmd = f"docker compose exec -T account node -e {shlex.quote(js_script)}"
-        
-        pw = self.cached_password or (self.server_sudo_pass.text() if hasattr(self, 'server_sudo_pass') else None)
-        if pw and OS_INFO["os"] == "linux":
-            # Direct sudo execution for reliable docker access
-            cmd = f"sudo -S {cmd}"
-        
-        self.cemu_log.append("[System] Injecting Account into Local Service Layer...")
-        
-        def _on_reg_done(code):
-            if code == 0:
-                self._track_account_in_vault(username, password, miiname)
-                QMessageBox.information(self, "Registration", f"Account '{username}' Registration task completed!\n\nAdded to Credentials Vault as: Account:{username}")
-
-        self._run_command(cmd, self.cemu_log, cwd=s_dir, stdin_data=pw, on_done=_on_reg_done)
+            s_dir = self.server_dir_field.text().strip()
+            # Use docker compose exec -T for robust service targeting and project name handling
+            cmd = f"docker compose exec -T account node -e {shlex.quote(js_script)}"
+            
+            pw = self.cached_password or (self.server_sudo_pass.text() if hasattr(self, 'server_sudo_pass') else None)
+            if pw and OS_INFO["os"] == "linux":
+                # Direct sudo execution for reliable docker access
+                cmd = f"sudo -S {cmd}"
+            
+            self.cemu_log.append("[System] Injecting Account into Local Service Layer...")
+            
+            def _on_reg_done(code):
+                if code == 0:
+                    self._track_account_in_vault(username, password, miiname)
+                    QMessageBox.information(self, "Registration", f"Account '{username}' Registration task completed!\n\nAdded to Credentials Vault as: Account:{username}")
+    
+            self._run_command(cmd, self.cemu_log, cwd=s_dir, stdin_data=pw, on_done=_on_reg_done)
+        except Exception as e:
+            self.cemu_log.append(f"<b style='color:red;'>[ERROR]</b> Local account injection failed: {e}")
+            QMessageBox.critical(self, "Injection Error", f"Failed to inject local account into Database:\n\n{e}")
 
     def _track_account_in_vault(self, username, password, miiname):
         """Automatically create a metadata-only vault entry for newly created/patched accounts."""
@@ -3795,22 +5278,26 @@ try {{
         except: pass
 
     def _ensure_console_certs(self, data_path):
-        """Deploy essential ccerts and scerts matching BannedPenta OTP to resolve decryption errors."""
+        """Deploy essential ccerts and scerts matching BannedPenta OTP to resolve decryption errors.
+        Deploys to all regions (USA, EUR, JPN) to ensure Cemu can find them.
+        """
         try:
-            # Base content path: mlc01/sys/title/0005001b/10054000/content/
-            base_content = os.path.join(str(data_path), "mlc01", "sys", "title", "0005001b", "10054000", "content")
+            # Region-specific title IDs for 0005001b
+            regions = ["10054000", "10054100", "10054200"]
             
             # Decompress cert data
             raw_json = zlib.decompress(base64.b64decode(CONSOLE_CERTS_PACKED)).decode()
             certs_dict = json.loads(raw_json)
             
-            for rel_file, b64_data in certs_dict.items():
-                target_f = os.path.join(base_content, rel_file)
-                os.makedirs(os.path.dirname(target_f), exist_ok=True)
-                with open(target_f, "wb") as f:
-                    f.write(base64.b64decode(b64_data))
+            for region_id in regions:
+                base_content = os.path.join(str(data_path), "mlc01", "sys", "title", "0005001b", region_id, "content")
+                for rel_file, b64_data in certs_dict.items():
+                    target_f = os.path.join(base_content, rel_file)
+                    os.makedirs(os.path.dirname(target_f), exist_ok=True)
+                    with open(target_f, "wb") as f:
+                        f.write(base64.b64decode(b64_data))
             
-            self.cemu_log.append("[System] Console Certificates (ccerts & scerts) Synchronized.")
+            self.cemu_log.append("[System] Console Certificates (ccerts & scerts) Synchronized across regions.")
         except Exception as e:
             self.cemu_log.append(f"[ERROR] Failed to deploy console certs: {e}")
 
@@ -3848,6 +5335,17 @@ try {{
                             with open(target_f, "wb") as f:
                                 f.write(font_data)
                             self.cemu_log.append(f"[OK] Installed {font_name} in {region_id}")
+            
+            # Sync to Pretendo Docker Network
+            s_dir = self.server_dir_field.text().strip()
+            if s_dir and os.path.exists(s_dir):
+                docker_font_dir = os.path.join(s_dir, "data", "fonts")
+                docker_font_path = os.path.join(docker_font_dir, "CafeStd.ttf")
+                if not os.path.exists(docker_font_path) and font_data:
+                    os.makedirs(docker_font_dir, exist_ok=True)
+                    with open(docker_font_path, "wb") as f:
+                        f.write(font_data)
+                    self.cemu_log.append("[System] Mii font mapped to Pretendo Docker Network (/data/fonts).")
             
             if font_data:
                 self.cemu_log.append("[System] Shared Fonts synchronized across all regions.")
@@ -3943,6 +5441,71 @@ try {{
                     return False
         except: return False
 
+    def _patch_account_ban_bypass(self):
+        """Patch the account service source to disable ban checks and reset DB access levels."""
+        s_dir = self.server_dir_field.text().strip()
+        if not os.path.isdir(s_dir):
+            return
+
+        self.cemu_log.append("[Anti-Ban] Checking account service ban checks...")
+        repos_dir = os.path.join(s_dir, "repos", "account", "src")
+        if not os.path.isdir(repos_dir):
+            self.cemu_log.append("[Anti-Ban] Account service source not found — skipping.")
+            return
+
+        # Files that contain access_level < 0 ban checks
+        ban_files = [
+            os.path.join(repos_dir, "services", "nnas", "routes", "oauth.ts"),
+            os.path.join(repos_dir, "middleware", "console-status-verification.ts"),
+            os.path.join(repos_dir, "middleware", "pnid.ts"),
+            os.path.join(repos_dir, "middleware", "nasc.ts"),
+        ]
+
+        rebuild_needed = False
+        for fpath in ban_files:
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                with open(fpath, "r") as f:
+                    content = f.read()
+                # Skip if already fully commented out or if pattern is gone
+                if "access_level < 0" in content and "BAN_BYPASS" not in content:
+                    # Robust regex to comment out the entire if-block (supports tabs or spaces)
+                    content = re.sub(
+                        r'([ \t]+)(if\s*\([^)]*access_level\s*<\s*0\)\s*\{.*?\n(?:.*?\n)*?\1\})',
+                        r'\1/* BAN_BYPASS - disabled for local stack\n\1\2\n\1*/',
+                        content,
+                        flags=re.DOTALL
+                    )
+                    with open(fpath, "w") as f:
+                        f.write(content)
+                    self.cemu_log.append(f"[Anti-Ban] Disabled ban check in {os.path.basename(fpath)}")
+                    rebuild_needed = True
+            except Exception as e:
+                self.cemu_log.append(f"[Anti-Ban] Warning: Could not patch {os.path.basename(fpath)}: {e}")
+
+        # Compile a single optimized sequence of commands to minimize Docker process overhead
+        pw = self._get_effective_sudo_password()
+        cmd_parts = []
+        
+        if rebuild_needed:
+            self.cemu_log.append("[Anti-Ban] Rebuilding account service with ban bypasses (Cached)...")
+            build_cmd = "docker compose build account && docker compose up -d --force-recreate account"
+            if pw and OS_INFO["os"] == "linux": build_cmd = f"sudo -S {build_cmd}"
+            cmd_parts.append(build_cmd)
+
+        # Reset any existing ban flags in database
+        reset_mongo = 'db.devices.updateMany({access_level: {$lt: 0}}, {$set: {access_level: 0}}); db.pnids.updateMany({access_level: {$lt: 0}}, {$set: {access_level: 0}})'
+        reset_cmd = f'docker compose exec -T mongodb mongo pretendo_account --quiet --eval {shlex.quote(reset_mongo)}'
+        if pw and OS_INFO["os"] == "linux": reset_cmd = f"sudo -S {reset_cmd}"
+        cmd_parts.append(reset_cmd)
+        
+        # Combine all into one sequential execution string
+        final_cmd = " && ".join(cmd_parts)
+        self._run_command(final_cmd, self.cemu_log, cwd=s_dir,
+                          stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
+                          display_cmd="[Anti-Ban] Syncing local permission layers...")
+
     def patch_cemu_settings(self, url, is_official=False):
         # Dynamically resolve localhost if needed
         if "localhost" in url or "127.0.0.1" in url:
@@ -3952,12 +5515,32 @@ try {{
                 self.statusBar().showMessage(f"Redirected localhost -> {real_ip} for AppImage compatibility.", 3000)
 
         cemu_dir = self.cemu_dir_field.text().strip()
-        p = os.path.join(cemu_dir, "settings.xml") if cemu_dir else OS_INFO.get("cemu_settings", "")
         
+        # Collect ALL directories that might contain Cemu configuration
+        config_targets = set()
+        if cemu_dir: config_targets.add(cemu_dir)
+        
+        # Always include detect system paths
+        for key in ["cemu_dir", "cemu_data"]:
+            val = OS_INFO.get(key, "")
+            if val: config_targets.add(val)
+            
+        settings_files = []
+        for d in config_targets:
+            if d and os.path.isdir(d):
+                sf = os.path.join(d, "settings.xml")
+                if os.path.exists(sf): settings_files.append(sf)
+        
+        # Fallback to detected settings path if none found in targets
+        if not settings_files:
+            ds = OS_INFO.get("cemu_settings", "")
+            if ds and os.path.exists(ds): settings_files.append(ds)
+
         try:
             # 1-3. settings.xml modifications (Optional: some forks/builds may not have this file)
-            if p and os.path.exists(p):
-                with open(p, "r") as f: c = f.read()
+            if settings_files:
+                for p in settings_files:
+                    with open(p, "r") as f: c = f.read()
                 
                 # Force Online & Global SSL Bypass
                 if "<OnlineEnabled>true</OnlineEnabled>" not in c:
@@ -4018,16 +5601,44 @@ try {{
                         c = c.replace("</content>", f"    <proxy_server>{url}</proxy_server>\n</content>")
                 
                 self._force_write_file(p, c)
+                self.cemu_log.append(f"[System] Patched Cemu settings: {p}")
             else:
-                self.statusBar().showMessage("settings.xml not found; pursuing network_services.xml bypass only.", 3000)
+                self.cemu_log.append("[WARN] No settings.xml found to patch; Cemu might connect incorrectly.")
             
             # 4. Multi-Path network_services.xml injection (Full Service Redirect)
-            # Cemu 2.0+ Linux has split dirs: config (~/.config/Cemu) vs data (~/.local/share/Cemu).
-            # We MUST write network_services.xml to ALL possible paths to prevent stale files
-            # with explicit proxy URLs from causing mitmproxy redirect loops (Splatoon softlock).
-            services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas", "npts", "api", "ecs", "ias", "cas", "boss", "friends", "account", "clp", "shop", "news", "portal", "discovery"]
+            # Use hostnames instead of IP:Port in network_services.xml to ensure correct Host headers
+            # The proxy_server setting in settings.xml will handle the actual redirection
+            host_map = {
+                "act": "account.pretendo.cc",
+                "account": "account.pretendo.cc",
+                "api": "api.pretendo.cc",
+                "friends": "friends.pretendo.cc",
+                "boss": "boss.pretendo.cc",
+                "miv": "miiverse.pretendo.cc",
+                "smm": "smm.pretendo.cc",
+                "splatoon": "splatoon.pretendo.cc",
+                "con": "conntest.pretendo.cc"
+            }
             
-            url_nodes = "\n".join([f"        <{s}>{url}</{s}>" for s in services])
+            services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas", "npts", "api", "ecs", "ias", "cas", "boss", "friends", "account", "clp", "shop", "news", "portal", "discovery"]
+            url_nodes = []
+            
+            # If no proxy is found or we want to be safe, we can point URLs directly to the local node
+            # But mitmproxy needs the Host headers! so we stick to hostnames AND ensure proxy_server is set.
+            # If settings.xml was NOT found, we MUST use direct IPs in network_services.xml as a fallback.
+            use_direct_urls = not settings_files
+            
+            # Extract domain from url (handle http://1.2.3.4:8070 -> 1.2.3.4:8070)
+            node_host = url.replace("http://", "").replace("https://", "").split('/')[0]
+
+            for s in services:
+                target_host = host_map.get(s, f"{s}.pretendo.cc")
+                if use_direct_urls:
+                    url_nodes.append(f"        <{s}>http://{node_host}</{s}>")
+                else:
+                    url_nodes.append(f"        <{s}>http://{target_host}</{s}>")
+            
+            url_nodes = "\n".join(url_nodes)
             urls_block = f"    <urls>\n{url_nodes}\n    </urls>"
 
             ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n{urls_block}\n</content>'
@@ -4108,21 +5719,29 @@ try {{
         )
 
     def apply_cemu_patch_all(self):
-        use_official = self.mode_pretendo.isChecked()
-        url = "https://api.pretendo.network" if use_official else self.patch_url_input.text().strip()
+        try:
+            use_official = self.mode_pretendo.isChecked()
+            url = "https://api.pretendo.network" if use_official else self.patch_url_input.text().strip()
 
-        if not use_official:
-            # Sync Docker services to the target port BEFORE patching the emulator
-            self._sync_docker_services_to_port(url)
+            if not use_official:
+                self.cemu_log.append("<b>[System]</b> Starting full optimization & sync sequence...")
+                # Sync Docker services to the target port BEFORE patching the emulator
+                self._sync_docker_services_to_port(url)
+                # Ensure account service ban checks are disabled for local stack
+                self._patch_account_ban_bypass()
 
-        self.patch_cemu_settings(url, is_official=use_official)
-        self.generate_cemu_manual()
-        if not use_official:
-            self.create_local_account()
-        
-        # Track in vault if local server
-        if not use_official and ("127.0.0.1" in url or "localhost" in url):
-            self._track_account_in_vault(self.cemu_username.text(), self.cemu_password.text(), self.cemu_miiname.text())
+            self.patch_cemu_settings(url, is_official=use_official)
+            self.generate_cemu_manual()
+            if not use_official:
+                self.create_local_account()
+            
+            # Track in vault if local server
+            if not use_official and ("127.0.0.1" in url or "localhost" in url):
+                self._track_account_in_vault(self.cemu_username.text(), self.cemu_password.text(), self.cemu_miiname.text())
+        except Exception as e:
+            QMessageBox.critical(self, "Patch Error", f"An uncaught exception occurred while patching Cemu:\n\n{str(e)}")
+            if hasattr(self, 'cemu_log'):
+                self.cemu_log.append(f"<b style='color:red;'>[ERROR]</b> Patch Exception: {e}")
 
     def generate_cemu_manual(self):
         username = self.cemu_username.text().strip()
@@ -4132,6 +5751,10 @@ try {{
 
         if not username or not password:
             QMessageBox.warning(self, "Error", "Username and password required.")
+            return
+
+        if not data_path or not os.path.isdir(data_path):
+            self.cemu_log.append("[WARN] Cemu data path invalid — skipping identity generation.")
             return
 
         try:
@@ -4167,14 +5790,16 @@ try {{
 
             # 2. Account Generation (NEX-Compatible Authenticated Hash)
             # Use same deterministic PID generation so UI syncs with Database exactly
-            pid = int(hashlib.sha256(username.lower().encode('utf-8')).hexdigest(), 16) % 1000000000 + 1000000000
+            # Match PID to 1337 (0x0539) from the FakeOnlineFiles reference
+            pid = 1337
             pid_bytes = pid.to_bytes(4, byteorder='little')
             
             pwd_hash = hashlib.sha256(pid_bytes + b"\x02eCF" + password.encode('utf-8')).hexdigest()
             
             # Authentically link account to BannedPenta console IDs
-            uuid_hex = "e7e455936d2acbae339c189fb2c42990"
-            trans_id_hex = "2000004b2c42990"
+            # TransferableIdBase = 15 hex digits, Uuid = 32 hex digits (matching FakeOnlineFiles format)
+            uuid_hex = "112233445566778899aabbccddeeff00"
+            trans_id_hex = "112233445566778"
             
             # Persistent Mii Hex (MiiName & Data sync)
             # Always regenerate from the validated template to ensure CRC is correct
@@ -4187,10 +5812,9 @@ try {{
             account_name_hex = binascii.hexlify(acct_name_bytes).decode('ascii')
             
             if not stored_mii:
-                # Build MiiData using the same validated template as the server
-                # This template has valid facial features, body proportions, etc.
-                # Without a valid template, games show "???" for the Mii name.
-                base_mii_hex = "03000003024DBA3A3420040A56094B184334341B281D413000000000B225000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004004140224104085006CC4CD41AD0CD2"
+                # FakeOnlineFiles-compatible Mii template (exact bytes from reference account.dat)
+                # Name is patched in dynamically at offset 0x1A (name) and 0x48 (author)
+                base_mii_hex = "030000305ac6bb2520c470f09426e82fb8ae6ed59004000000005f304b30683000000000000000000000000000004737000021010264a41820454614811217680d0000290251485000000000000000000000000000000000000000000000bfee"
                 mii_buf = bytearray(binascii.unhexlify(base_mii_hex.ljust(192, '0')))
                 
                 # Write name at offset 0x1A (26), 10 chars UTF-16LE = 20 bytes  
@@ -4242,28 +5866,43 @@ try {{
                 "PersistentId=80000001",
                 f"TransferableIdBase={trans_id_hex}",
                 f"Uuid={uuid_hex}",
-                "ParentalControlSlotNo=0",
-                f"MiiData={stored_mii}", 
+                "ParentalControlSlotNo=2",
+                f"MiiData={stored_mii}",
                 f"MiiName={account_name_hex}",
-                "IsMiiUpdated=1",
+                "IsMiiUpdated=0",
                 f"AccountId={username}",
-                "BirthYear=2003", "BirthMonth=1", "BirthDay=1", "Gender=0",
+                "BirthYear=7d0",
+                "BirthMonth=1",
+                "BirthDay=1",
+                "Gender=1",
                 "IsMailAddressValidated=1",
-                "EmailAddress=none@pretendo.network",
-                "Country=49", "SimpleAddressId=49010000",
-                "TimeZoneId=America/New_York",
-                "UtcOffset=ffffffff9ac22000",
-                f"PrincipalId={pid}",
-                "IsNnidLinked=1",
+                "EmailAddress=dummy@pretendo.cc",
+                "Country=61",
+                "SimpleAddressId=61030000",
+                "TimeZoneId=Europe/Warsaw",
+                "UtcOffset=1ad274800",
+                f"PrincipalId={pid:04x}",
+                f"NfsPassword={password}",
+                "EciVirtualAccount=",
+                "NeedsToDownloadMiiImage=0",
+                "MiiImageUrl=",
+                f"AccountPasswordHash={pwd_hash}",
                 "IsPasswordCacheEnabled=1",
                 f"AccountPasswordCache={pwd_hash}",
-                "NnasType=1", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
+                "NnasType=0",
+                "NfsType=0",
+                "NfsNo=1",
+                "NnasSubDomain=",
+                "NnasNfsEnv=L1",
                 "IsPersistentIdUploaded=1",
                 "IsConsoleAccountInfoUploaded=1",
                 "LastAuthenticationResult=0",
                 f"StickyAccountId={username}",
-                f"StickyPrincipalId={pid}",
+                "NextAccountId=",
+                f"StickyPrincipalId={pid:04x}",
                 "IsServerAccountDeleted=0",
+                "ServerAccountStatus=0",
+                "MiiImageLastModifiedDate=Tue, 09 Apr 2019 16:56:09 GMT",
                 "IsCommitted=1"
             ]
             
@@ -4284,28 +5923,17 @@ try {{
                 for fname in ["account.dat", "account.ini"]:
                     fpath = os.path.join(d, fname)
                     
-                    # Cemu is format-sensitive: .dat usually expects HEX PrincipalId, .ini expects DECIMAL.
-                    # CRITICAL: Both files MUST have the AccountInstance header to be recognized as emulated profiles.
+                    # Write all lines directly - PrincipalId is now a static value matching FakeOnlineFiles
                     file_lines = ["AccountInstance_20120705"]
-                    
                     for line in lines:
-                        if line == "AccountInstance_20120705": continue # Avoid duplication
-                        
-                        if line.startswith("PrincipalId=") or line.startswith("StickyPrincipalId="):
-                            key = line.split("=")[0]
-                            if fname.endswith(".ini"):
-                                file_lines.append(f"{key}={pid}")
-                            else:
-                                # Real Wii U .dat files use LOWERCASE hex for PIDs
-                                file_lines.append(f"{key}={pid:08x}")
-                        else:
-                            file_lines.append(line)
+                        if line == "AccountInstance_20120705": continue  # Avoid duplication
+                        file_lines.append(line)
                     
                     if self._force_write_file(fpath, "\n".join(file_lines)):
                         self.cemu_log.append(f"[System] Identity Updated: {fpath}")
 
             self.statusBar().showMessage(f"Deep Identity Fix Applied for {username}", 5000)
-            QMessageBox.information(self, "Success", f"Wii U Identity Files Realigned!\n\nAuthentication Hash: OK\nPrincipalId: {pid:08x}")
+            QMessageBox.information(self, "Success", f"Wii U Identity Files Realigned!\n\nMii Name: {miiname}\nAccount ID: {username}\nPrincipalId: 0539 (FakeOnlineFiles-compatible)")
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
     def patch_citra(self, mode):
@@ -4409,56 +6037,81 @@ try {{
                 z.writestr("Wii U/seeprom.bin", safe_unhex(seeprom_hex, 512))
 
                 # Use deterministic PID for database sync
-                pid = int(hashlib.sha256(user.lower().encode('utf-8')).hexdigest(), 16) % 1000000000 + 1000000000
+                # Match PID to 1337 (0x0539) from the FakeOnlineFiles reference
+                pid = 1337
                 pid_bytes = pid.to_bytes(4, byteorder='little')
                 pwd_hash = hashlib.sha256(pid_bytes + b"\x02eCF" + passw.encode('utf-8')).hexdigest()
                 
                 # Authentically link account to BannedPenta console IDs
-                uuid_hex = "e7e455936d2acbae339c189fb2c42990"
-                trans_id_hex = "2000004b2c42990"
+                # TransferableIdBase = 15 hex digits, Uuid = 32 hex digits (matching FakeOnlineFiles format)
+                uuid_hex = "112233445566778899aabbccddeeff00"
+                trans_id_hex = "112233445566778"
                 
                 # MiiName for zip bundle (UTF-16BE hex for Wii U compatibility)
                 acct_name_bytes = miiname[:10].encode('utf-16be').ljust(22, b'\x00')
                 account_name_hex = binascii.hexlify(acct_name_bytes).decode('ascii')
                 
-                # Build default MiiData with name at offset 0x1A (char 52)
+                # Build MiiData from the FakeOnlineFiles-compatible template, patch user's Mii name in
                 cur_mii = getattr(self, '_mii_data_hex', None)
-                if not cur_mii:
-                    m_name_bytes_be = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
-                    m_name_hex_be = binascii.hexlify(m_name_bytes_be).decode('ascii')
-                    cur_mii = ("03000000" + ("00" * 22) + m_name_hex_be).ljust(192, "0")
-                elif len(str(cur_mii)) >= 92:
-                    m_name_bytes_be = miiname[:10].encode('utf-16be').ljust(20, b'\x00')
-                    m_name_hex_be = binascii.hexlify(m_name_bytes_be).decode('ascii')
-                    cur_mii = str(cur_mii)[0:52] + m_name_hex_be + str(cur_mii)[92:]
+                base_mii_hex = "030000305ac6bb2520c470f09426e82fb8ae6ed59004000000005f304b30683000000000000000000000000000004737000021010264a41820454614811217680d0000290251485000000000000000000000000000000000000000000000bfee"
+                mii_buf = bytearray(binascii.unhexlify(base_mii_hex.ljust(192, '0')))
+                # Write Mii name (UTF-16LE) at offset 0x1A and author at 0x48
+                mii_name_limited = miiname[:10]
+                name_bytes_le = mii_name_limited.encode('utf-16le').ljust(20, b'\x00')
+                mii_buf[0x1A:0x1A+20] = name_bytes_le
+                mii_buf[0x48:0x48+20] = name_bytes_le
+                # Recalculate CRC16-CCITT
+                crc = 0
+                for i in range(0x5E):
+                    crc ^= (mii_buf[i] << 8)
+                    for _ in range(8):
+                        crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+                mii_buf[0x5E] = (crc >> 8) & 0xFF
+                mii_buf[0x5F] = crc & 0xFF
+                cur_mii = binascii.hexlify(mii_buf).decode('ascii')
 
                 acct_lines = [
                     "AccountInstance_20120705",
                     "PersistentId=80000001",
                     f"TransferableIdBase={trans_id_hex}",
                     f"Uuid={uuid_hex}",
-                    "ParentalControlSlotNo=0",
+                    "ParentalControlSlotNo=2",
                     f"MiiData={cur_mii}",
                     f"MiiName={account_name_hex}",
-                    "IsMiiUpdated=1",
+                    "IsMiiUpdated=0",
                     f"AccountId={user}",
-                    "BirthYear=2003", "BirthMonth=1", "BirthDay=1", "Gender=0",
+                    "BirthYear=7d0",
+                    "BirthMonth=1",
+                    "BirthDay=1",
+                    "Gender=1",
                     "IsMailAddressValidated=1",
-                    "EmailAddress=none@pretendo.network",
-                    "Country=49", "SimpleAddressId=49010000",
-                    "TimeZoneId=America/New_York",
-                    "UtcOffset=ffffffff9ac22000",
-                    f"PrincipalId={pid:08x}",
-                    "IsNnidLinked=1",
+                    "EmailAddress=dummy@pretendo.cc",
+                    "Country=61",
+                    "SimpleAddressId=61030000",
+                    "TimeZoneId=Europe/Warsaw",
+                    "UtcOffset=1ad274800",
+                    f"PrincipalId={pid:04x}",
+                    f"NfsPassword={passw}",
+                    "EciVirtualAccount=",
+                    "NeedsToDownloadMiiImage=0",
+                    "MiiImageUrl=",
+                    f"AccountPasswordHash={pwd_hash}",
                     "IsPasswordCacheEnabled=1",
                     f"AccountPasswordCache={pwd_hash}",
-                    "NnasType=1", "NfsType=0", "NfsNo=1", "NnasNfsEnv=L1",
+                    "NnasType=0",
+                    "NfsType=0",
+                    "NfsNo=1",
+                    "NnasSubDomain=",
+                    "NnasNfsEnv=L1",
                     "IsPersistentIdUploaded=1",
                     "IsConsoleAccountInfoUploaded=1",
                     "LastAuthenticationResult=0",
                     f"StickyAccountId={user}",
-                    f"StickyPrincipalId={pid:08x}",
+                    "NextAccountId=",
+                    f"StickyPrincipalId={pid:04x}",
                     "IsServerAccountDeleted=0",
+                    "ServerAccountStatus=0",
+                    "MiiImageLastModifiedDate=Tue, 09 Apr 2019 16:56:09 GMT",
                     "IsCommitted=1"
                 ]
                 z.writestr("Wii U/account.dat", "\n".join(acct_lines))
