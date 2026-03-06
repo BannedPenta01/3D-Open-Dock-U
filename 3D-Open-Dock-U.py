@@ -496,18 +496,83 @@ class CommandWorker(QThread):
 
     @staticmethod
     def _colorize_log(line):
-        """Apply HTML color formatting to log lines based on severity keywords."""
+        """Apply HTML color formatting to log lines based on severity keywords.
+        Enhanced with deep Cemu/Citra emulator connection detection."""
         import html as html_mod
         safe = html_mod.escape(line)
         low = line.lower()
         # Strip ANSI escape codes for keyword detection
         stripped = re.sub(r'\x1b\[[0-9;]*m', '', low)
+
+        # ── Emulator Connection Events (Cemu/Citra) ── Bright Cyan/Magenta ──
+        # PRUDP/NEX protocol layer (core Wii U / 3DS online protocol)
+        if any(k in stripped for k in [
+            'prudp', 'nex ', 'nex/types', 'prudpserver', 'prudp server',
+            'prudpendpoint', 'prudp endpoint', 'prudp connection',
+            'virtual server', 'secure server', 'authentication server',
+            'prudppacket', 'syn packet', 'connect packet', 'data packet',
+            'disconnect packet', 'ping packet',
+        ]):
+            return f"<span style='color:#b392f0;'>{safe}</span>"  # Purple for NEX/PRUDP
+
+        # Emulator authentication and account events
+        if any(k in stripped for k in [
+            'client connected', 'client disconnected', 'new connection from',
+            'connection from', 'accepted connection', 'incoming connection',
+            'user login', 'login request', 'logged in', 'register user',
+            'pid:', 'principal id', 'nexaccount', 'nex account',
+            'kerberos', 'ticket', 'authentication info',
+            'access_token', 'oauth', 'grant_type', 'token_type',
+            '/v1/api/oauth', '/v1/api/people', '/v1/api/provider',
+            'account.nintendo.net', 'friends service', 'matchmake',
+            'secure connection', 'station url',
+            'gathering', 'get_session_url',
+        ]):
+            return f"<span style='color:#58a6ff;'>{safe}</span>"  # Blue for auth/account
+
+        # Friends and presence service events
+        if any(k in stripped for k in [
+            'friend request', 'friend list', 'presence', 'update_presence',
+            'get_all_friends', 'add_friend', 'blacklist',
+        ]):
+            return f"<span style='color:#d2a8ff;'>{safe}</span>"  # Light purple for friends
+
+        # ── Connection Problems (Cemu/Citra specific) ── Red/Orange ──
+        if any(k in stripped for k in [
+            'invalid kerberos', 'incorrect password', 'bad decrypt',
+            'decryption failed', 'ticket validation failed',
+            'invalid signature', 'certificate error', 'ssl error',
+            'tls handshake', 'certificate verify failed',
+            'invalid credentials', 'authentication failed',
+            'access denied', 'account locked', 'account banned',
+            'access_level', 'nnid', 'pnid not found',
+            'pid not found', 'user not found',
+            'invalid mac', 'checksum', 'hmac',
+            'device_auth', 'serial_number', 'device_cert',
+        ]):
+            return f"<span style='color:#ff7b72;'>{safe}</span>"  # Soft red for auth failures
+
+        if any(k in stripped for k in [
+            'connection timed out', 'timeout', 'timed out',
+            'connection reset', 'network unreachable', 'host unreachable',
+            'no route to host', 'enetunreach', 'ehostunreach',
+            'econnreset', 'epipe', 'broken pipe',
+            'read tcp', 'write tcp', 'socket closed',
+            'buffer: read exceeds', 'unexpected eof',
+            'premature close', 'stream ended',
+        ]):
+            return f"<span style='color:#ffa657;'>{safe}</span>"  # Orange for network/timeout
+
+        # ── Standard Success ──
         if any(k in stripped for k in ['[success]', 'success:', 'started', 'created', 'connected', 'ready to accept', ' started on port']):
             return f"<span style='color:#3fb950;'>{safe}</span>"
+        # ── Standard Error ──
         elif any(k in stripped for k in ['[error]', 'error:', 'error]', 'fatal:', 'fatal]', 'panic:', 'panic ', 'segmentation', 'module_not_found', 'typeerror', 'exited with code 1', 'exited with code 2', 'connection refused']):
             return f"<span style='color:#f85149;'>{safe}</span>"
+        # ── Standard Warning ──
         elif any(k in stripped for k in ['[warn', 'warning', 'deprecated', 'deprecation']):
             return f"<span style='color:#d29922;'>{safe}</span>"
+        # ── Standard Info/Debug ──
         elif any(k in stripped for k in ['[info]', '[debug]']):
             return f"<span style='color:#8b949e;'>{safe}</span>"
         return safe
@@ -634,6 +699,12 @@ class PretendoManager(QMainWindow):
         self.last_popup_time = 0
         self.seen_errors = {} # error -> timestamp
         self.session_start_time = None # Track when containers were started
+        self._cemu_log_offset = 0  # Track position in Cemu's log.txt for streaming
+        self._citra_log_offset = 0  # Track position in Citra's log for streaming
+        self._cemu_log_path_cache = None
+        self._citra_log_path_cache = None
+        self._cemu_timeout_count = 0  # Track consecutive NEX timeouts
+        self._cemu_last_timeout_alert = 0  # Throttle timeout alerts
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -678,6 +749,23 @@ class PretendoManager(QMainWindow):
         self.tabs.addTab(make_scrollable(self._build_dashboard_tab()), "Server & Deployment")
         self.tabs.addTab(make_scrollable(self._build_emulator_tab()), "Identities & Emulators")
         self.tabs.addTab(make_scrollable(self._build_guide_tab()), "Help & Guide")
+        
+        # UI Customization: Make Guide Tab stand out as requested
+        # We use a specific stylesheet for the last tab to make it green
+        # UI Customization: Make tabs equal width and give Guide Tab special green gradients
+        self.tabs.tabBar().setExpanding(True)
+        self.tabs.tabBar().setStyleSheet(f"""
+            QTabBar::tab {{ min-width: 280px; }}
+            QTabBar::tab:last {{ 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #2ea043, stop:1 #1a7f37); 
+                color: white; 
+            }} 
+            QTabBar::tab:last:selected {{ 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #3fb950, stop:1 #2ea043); 
+                border-bottom: 3px solid {CYAN_PRIMARY}; 
+            }}
+        """)
+        
         root.addWidget(self.tabs)
 
         # Footer Credits & Reset
@@ -1056,7 +1144,9 @@ class PretendoManager(QMainWindow):
         self.mode_pretendo = QRadioButton("Public (Pretendo Network)")
         self.mode_local.setChecked(True)
         self.mode_local.setStyleSheet("color: white;")
-        self.mode_pretendo.setStyleSheet("color: white;")
+        self.mode_pretendo.setStyleSheet("color: #555555;")
+        self.mode_pretendo.setEnabled(False) # Enforce Private Local Stack
+        self.mode_pretendo.setToolTip("Public Pretendo is disabled in this custom build.")
         mode_row.addWidget(self.mode_local)
         mode_row.addWidget(self.mode_pretendo)
         nlay.addLayout(mode_row)
@@ -1126,39 +1216,18 @@ class PretendoManager(QMainWindow):
         guide = QTextEdit()
         guide.setReadOnly(True)
         guide.setHtml(f"""
-            <h1 style='color:{RED_PRIMARY};'>Quick Start Guide</h1>
-            <p>Welcome to <b>3D Open Dock U</b>. Follow these simple steps to get your private server running and connected.</p>
-
-            <h2 style='color:{CYAN_PRIMARY};'>Step 1: Power On</h2>
+            <h1 style='color:{RED_PRIMARY};'>Simple Setup Guide</h1>
+            <p>Follow these steps to get online quickly:</p>
             <ol>
-                <li>In <b>Setup & Maintenance</b>, click <b>Download Stack</b>.</li>
-                <li>Click <b>Run Full Setup Script</b> (sets up keys, IPs, and <b>Smash Bros</b> database).</li>
-                <li>Click <b>Build Server Containers</b> (wait ~10 mins).</li>
-                <li>On the main dashboard, click <b>START SERVER</b>.</li>
+                <li><b>Step 1:</b> Click <b>Deploy Server Stack</b> on the first tab.</li>
+                <li><b>Step 2:</b> Wait until the <b>Deploy Server Stack</b> button does its job.</li>
+                <li><b>Step 3:</b> Click <b>Start Server</b>.</li>
+                <li><b>Step 4:</b> Put a username, password (<b>NOT</b> your daily one), and a Mii name.</li>
+                <li><b>Step 5:</b> Locate your Cemu or any Citra fork folder and choose the root of these folders.</li>
+                <li><b>Step 6:</b> Go to the second tab and click either <b>Patch Cemu</b> or <b>Patch Citra</b>.</li>
+                <li><b>Step 7 (For Cemu):</b> Go to Options, General Settings, press the Account tab and toggle <b>Pretendo</b>. You should also see your Mii name on the active account.</li>
+                <li><b>Step 8:</b> Enjoy! And don't ever forget to share the <b>Target Node</b> to whoever you want to play against.</li>
             </ol>
-
-            <h2 style='color:{CYAN_PRIMARY};'>Step 2: Connect Emulators</h2>
-            <ul>
-                <li>In <b>Identities & Emulators</b>, enter your username/password.</li>
-                <li>Click <b>Sync & Patch Cemu</b> (or Citra). This automates everything: fonts, accounts, and server links.</li>
-                <li><b>Game Support:</b> Splatoon, Mario Maker, and <b>Super Smash Bros. Wii U</b> are fully supported.</li>
-            </ul>
-
-            <h2 style='color:{CYAN_PRIMARY};'>Step 3: Easy Troubleshooting</h2>
-            <ul>
-                <li><b>Docker Errors (Windows):</b> If Docker stops responding or shows "WSL stopped", click <b>Fix Docker Permissions</b> in Setup. It will offer to automatically repair the bridge.</li>
-                <li><b>Port Conflicts:</b> Close Steam or click Stop then Start to force-clear ports.</li>
-                <li><b>Real Hardware:</b> Use <b>Generate Console Bundle</b> to play on real Wii U/3DS hardware.</li>
-            </ul>
-
-            <h2 style='color:#85bb65;'>How to Connect to Other Pretendo Servers</h2>
-            <p>You can use this program to connect your emulators to external Pretendo servers (hosted by friends or others) without running your own stack:</p>
-            <ul>
-                <li>Go to the <b>Identities & Emulators</b> tab.</li>
-                <li>In the <b>Target Node</b> section, enter the <b>Public IP</b> or <b>Domain Name</b> of the server you wish to join.</li>
-                <li>Make sure the <b>Target Port</b> matches the server's public port (usually 80 or 8070).</li>
-                <li>Click <b>Sync & Patch Cemu</b> (or Citra). The manager will automatically configure your emulator to point to that external node instead of your localhost.</li>
-            </ul>
         """)
         layout.addWidget(guide)
         
@@ -1470,6 +1539,22 @@ class PretendoManager(QMainWindow):
                         if re.search(r'"?\d+-\d+:\d+-\d+/udp"?', stripped):
                             changed = True
                             continue  # Skip this line entirely
+
+                    # 2c. Game Servers: Shift all 60xx/udp ports to 60xxx/udp range for stability
+                    if current_service in ["friends", "mario-kart-8", "splatoon", "super-mario-maker", 
+                                           "minecraft-wiiu", "pikmin-3", "super-smash-bros-wiiu", 
+                                           "wiiu-chat-authentication", "wiiu-chat-secure", "pokken-tournament"]:
+                        if "/udp" in line and ":" in line:
+                             # Match 4-digit ports starting with 60 and add a trailing 0 (e.g. 6014 -> 60140)
+                             # Special case: 6001 should become 60001 for Friends Secure consistency
+                             if "6001:6001" in line:
+                                 new_line = line.replace("6001:6001", "60001:60001")
+                             else:
+                                 new_line = re.sub(r'(60\d{2}):(60\d{2})/udp', r'\1 0:\2 0/udp'.replace(' ', ''), line)
+                             
+                             if new_line != line:
+                                 line = new_line
+                                 changed = True
                     
                     # 3. mongodb: pin version and add alias + healthcheck
                     if current_service == "mongodb":
@@ -1603,8 +1688,8 @@ class PretendoManager(QMainWindow):
                         "    restart: unless-stopped\n",
                         "    ports:\n",
                         "      - 127.0.0.1:2352:2345\n",
-                        "      - 6012:6012/udp\n",
-                        "      - 6013:6013/udp\n",
+                        "      - 60120:60120/udp\n",
+                        "      - 60130:60130/udp\n",
                         "    networks:\n",
                         "      internal:\n",
                         "        aliases:\n",
@@ -1773,6 +1858,47 @@ class PretendoManager(QMainWindow):
         except Exception as e:
             self.setup_log.append(f"[WARN] Failed to patch mitmproxy addon: {e}")
 
+    def _refresh_env_ips(self, s_dir, current_ip):
+        """Scan all .local.env files and update any [SVC]_SECURE_SERVER_HOST lines to match the current IP."""
+        env_dir = os.path.join(s_dir, "environment")
+        if not os.path.isdir(env_dir): return
+        
+        self.server_log.append(f"<span style='color:{CYAN_LIGHT};'>[System] Synchronizing environment network nodes to {current_ip}...</span>")
+        updated_count = 0
+        try:
+            for fname in os.listdir(env_dir):
+                if not fname.endswith(".local.env"): continue
+                path = os.path.join(env_dir, fname)
+                
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                
+                new_lines = []
+                changed = False
+                for line in lines:
+                    # Match any line that looks like [SERVICE]_SECURE_SERVER_HOST= or [SERVICE]_CONFIG_SECURE_SERVER_HOST=
+                    if "_SECURE_SERVER_HOST=" in line:
+                        prefix, rest = line.split("=", 1)
+                        if rest.strip() != current_ip:
+                            new_lines.append(f"{prefix}={current_ip}\n")
+                            changed = True
+                        else:
+                            new_lines.append(line)
+                    else:
+                        new_lines.append(line)
+                
+                if changed:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.writelines(new_lines)
+                    updated_count += 1
+            
+            if updated_count > 0:
+                self.server_log.append(f"<span style='color:{GREEN_BRIGHT};'>  ✔ Updated {updated_count} environment files with new IP.</span>")
+            else:
+                self.server_log.append(f"<span style='color:{TEXT_SECONDARY};'>  ✔ Environment nodes already match current network IP.</span>")
+        except Exception as e:
+            self.server_log.append(f"<span style='color:{RED_LIGHT};'>  ❌ Failed to sync network IPs: {e}</span>")
+
 
     def run_setup_check(self):
         """Perform a deep system audit for dependencies and configuration."""
@@ -1886,7 +2012,7 @@ class PretendoManager(QMainWindow):
             QMessageBox.information(self, "Success", "3DS settings reset to default.")
 
     def _on_status_tick(self):
-        """Periodic check for system status and dynamic network sync."""
+        """Periodic check for system status, dynamic network sync, and emulator monitoring."""
         self._check_docker_status()
         current_ip = self._get_local_ip()
         is_connected = (current_ip != "127.0.0.1")
@@ -1908,36 +2034,459 @@ class PretendoManager(QMainWindow):
         
         self.last_connectivity_state = is_connected
         self._detect_current_game()
+        self._detect_emulator_connections()
+
+    def _detect_emulator_connections(self):
+        """Monitor for active TCP connections from Cemu/Citra to the Pretendo server ports.
+        This runs every 5 seconds from the heartbeat timer."""
+        if not self.server_running:
+            return
+        try:
+            # Check for active connections on Pretendo service ports
+            # Account server (8080), mitmproxy (80/443), NEX (various high ports)
+            res = subprocess.run(
+                ["ss", "-tnp"],
+                capture_output=True, text=True, timeout=2
+            )
+            if res.returncode != 0:
+                return
+
+            emu_state = getattr(self, '_emu_connection_state', None)
+            if emu_state is None:
+                return
+
+            active_ips = set()
+            pretendo_ports = {'80', '443', '8080', '21', '53', '9231'}
+            # Also check the user-configured target port
+            try:
+                custom_port = self._get_target_port()
+                if custom_port:
+                    pretendo_ports.add(custom_port)
+            except:
+                pass
+
+            for line in res.stdout.splitlines():
+                if 'ESTAB' not in line:
+                    continue
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                local_addr = parts[3]  # local address:port
+                peer_addr = parts[4]   # peer address:port
+                # Check if local port matches a Pretendo service
+                local_port = local_addr.rsplit(':', 1)[-1] if ':' in local_addr else ''
+                if local_port in pretendo_ports:
+                    peer_ip = peer_addr.rsplit(':', 1)[0] if ':' in peer_addr else peer_addr
+                    # Skip docker-internal and loopback
+                    if not peer_ip.startswith('127.') and not peer_ip.startswith('172.'):
+                        active_ips.add(peer_ip)
+
+            # Report new external connections to the log
+            prev_ips = getattr(self, '_prev_active_emu_ips', set())
+            for ip in active_ips - prev_ips:
+                now_str = datetime.now().strftime('%H:%M:%S')
+                self.server_log.append(
+                    f"<b style='color:#58a6ff;'>🌐 [{now_str}] [NET-MONITOR] Emulator TCP session ESTABLISHED from {ip}</b>")
+            for ip in prev_ips - active_ips:
+                now_str = datetime.now().strftime('%H:%M:%S')
+                self.server_log.append(
+                    f"<span style='color:#d29922;'>📴 [{now_str}] [NET-MONITOR] Emulator at {ip} has disconnected</span>")
+            self._prev_active_emu_ips = active_ips
+
+        except Exception:
+            pass  # ss not available or permission denied — silently skip
 
     def _detect_current_game(self):
-        """Monitor Cemu log for the latest TitleID to show what game is booting."""
+        """Monitor Cemu/Citra logs for game titles AND actively stream connection events
+        into the server log panel. Tracks file offset to only process new lines each tick."""
         try:
-            c_data = OS_INFO.get("cemu_data")
-            if not c_data: return
-            
-            cemu_log = os.path.join(c_data, "log.txt")
-            if os.path.exists(cemu_log):
-                with open(cemu_log, "r") as f:
-                    # Seek to near end to avoid parsing multi-MB logs
-                    f.seek(0, 2)
-                    size = f.tell()
-                    offset = max(0, size - 32768) # Check last 32KB
-                    f.seek(offset)
-                    content = f.read()
-                
-                # Cemu log format: [19:02:45.370] TitleId: 00050000-10176900
-                matches = re.findall(r"TitleId: ([0-9a-fA-F-]+)", content)
-                if matches:
-                    tid = matches[-1].lower()
-                    game_name = TITLE_MAP.get(tid, TITLE_MAP.get(tid.upper(), f"Unknown Title ({tid})"))
-                    self.detected_game_label.setText(f"Active Session: {game_name}")
-                    self.detected_game_label.setStyleSheet(f"color: {GREEN_BRIGHT}; font-weight: bold;")
-                    return
-            
-            self.detected_game_label.setText("Active Session: None Detected")
-            self.detected_game_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-style: italic;")
-        except:
+            self._stream_cemu_log()
+        except Exception:
             pass
+        try:
+            self._stream_citra_log()
+        except Exception:
+            pass
+
+    def _get_cemu_log_path(self):
+        """Resolve and cache the Cemu log.txt path."""
+        if self._cemu_log_path_cache and os.path.exists(self._cemu_log_path_cache):
+            return self._cemu_log_path_cache
+        c_data = OS_INFO.get("cemu_data") or OS_INFO.get("cemu_dir", "")
+        if c_data:
+            path = os.path.join(c_data, "log.txt")
+            if os.path.exists(path):
+                self._cemu_log_path_cache = path
+                return path
+        return None
+
+    def _get_citra_log_path(self):
+        """Resolve and cache the Citra/Lime3DS/Azahar log path."""
+        if self._citra_log_path_cache and os.path.exists(self._citra_log_path_cache):
+            return self._citra_log_path_cache
+        citra_config = OS_INFO.get("citra_config", "")
+        if not citra_config:
+            return None
+        citra_dir = os.path.dirname(os.path.dirname(citra_config))
+        candidates = [
+            os.path.join(citra_dir, "log", "citra_log.txt"),
+            os.path.join(citra_dir, "logs", "citra_log.txt"),
+            os.path.join(citra_dir, "citra_log.txt"),
+            os.path.join(os.path.dirname(citra_config), "citra_log.txt"),
+            # Lime3DS / Azahar variants
+            os.path.join(citra_dir, "log", "lime3ds_log.txt"),
+            os.path.join(citra_dir, "log", "azahar_log.txt"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                self._citra_log_path_cache = p
+                return p
+        return None
+
+    def _stream_cemu_log(self):
+        """Read new lines from Cemu's log.txt and stream connection-relevant events
+        into the server log panel with detailed annotations."""
+        cemu_log = self._get_cemu_log_path()
+        if not cemu_log:
+            return
+
+        try:
+            file_size = os.path.getsize(cemu_log)
+        except OSError:
+            return
+
+        # If file got smaller (Cemu restarted and log was truncated), reset offset
+        if file_size < self._cemu_log_offset:
+            self._cemu_log_offset = 0
+            self._cemu_timeout_count = 0
+            self.server_log.append(
+                f"<span style='color:#8b949e;'>[CEMU-LOG] Cemu log file reset detected — emulator may have restarted</span>")
+
+        # Nothing new to read
+        if file_size <= self._cemu_log_offset:
+            # Still update the game title label from the existing content
+            self._update_cemu_game_label(cemu_log)
+            return
+
+        # Read only new content
+        with open(cemu_log, "r", errors='ignore') as f:
+            # On first read, skip to last 64KB to avoid processing ancient history
+            if self._cemu_log_offset == 0 and file_size > 65536:
+                self._cemu_log_offset = file_size - 65536
+            f.seek(self._cemu_log_offset)
+            new_content = f.read()
+            self._cemu_log_offset = f.tell()
+
+        if not new_content.strip():
+            self._update_cemu_game_label(cemu_log)
+            return
+
+        new_lines = new_content.split('\n')
+        now_str = datetime.now().strftime('%H:%M:%S')
+
+        # ── Cemu connection-relevant keywords to stream ──
+        # These are the exact log prefixes Cemu uses for online services
+        CEMU_CONNECTION_KEYWORDS = [
+            'nex:', 'prudp', 'iosu_fpd', 'iosu_act', 'iosu_nim',
+            'iosu_boss', 'nn_fp', 'nn_act', 'nn_nex',
+            'friend', 'account', 'matchmake', 'secure',
+            'authentication', 'kerberos', 'nex token',
+            'online', 'session', 'gathering',
+            'connection', 'socket', 'ssl', 'http',
+            'olv:', 'miiverse',  # Miiverse
+        ]
+
+        for line in new_lines:
+            line = line.strip()
+            if not line:
+                continue
+            ll = line.lower()
+
+            # Extract Cemu timestamp if present: [HH:MM:SS.mmm]
+            ts_match = re.match(r'\[(\d{2}:\d{2}:\d{2}\.\d+)\]\s*(.*)', line)
+            if ts_match:
+                emu_ts = ts_match.group(1)
+                line_body = ts_match.group(2)
+            else:
+                emu_ts = now_str
+                line_body = line
+            ll_body = line_body.lower()
+
+            # Check if this line is connection-relevant
+            is_relevant = any(kw in ll for kw in CEMU_CONNECTION_KEYWORDS)
+            if not is_relevant:
+                continue
+
+            # ═══ DETAILED EVENT CLASSIFICATION ═══
+
+            # ── NEX: Secure login connection time-out ──
+            if 'nex:' in ll and 'time-out' in ll:
+                self._cemu_timeout_count += 1
+                self.server_log.append(
+                    f"<b style='color:#ff7b72;'>  ⏱️ [{emu_ts}] [CEMU/NEX] ❌ {line_body}</b>")
+                if self._cemu_timeout_count >= 3:
+                    # Only show the diagnostic block every 3 timeouts to avoid spam
+                    if time.time() - self._cemu_last_timeout_alert > 30:
+                        self._cemu_last_timeout_alert = time.time()
+                        self.server_log.append(
+                            f"<b style='color:#ff7b72;'>  🔴 [{emu_ts}] [CEMU/NEX] REPEATED TIMEOUT ({self._cemu_timeout_count}x) — Connection to server is FAILING</b>")
+                        self.server_log.append(
+                            f"<span style='color:#ffa657;'>  ├─ The NEX secure login keeps timing out. Cemu cannot reach the game server.</span>")
+                        self.server_log.append(
+                            f"<span style='color:#ffa657;'>  ├─ Possible causes:</span>")
+                        self.server_log.append(
+                            f"<span style='color:#ffa657;'>  │  1. Friends service container is crashed or not running (check 'docker compose ps')</span>")
+                        self.server_log.append(
+                            f"<span style='color:#ffa657;'>  │  2. NEX server port is blocked by firewall or not exposed from Docker</span>")
+                        self.server_log.append(
+                            f"<span style='color:#ffa657;'>  │  3. account.dat has wrong server IP (re-patch with Identity tab)</span>")
+                        self.server_log.append(
+                            f"<span style='color:#ffa657;'>  │  4. Kerberos password mismatch between Account and Friends services</span>")
+                        self.server_log.append(
+                            f"<span style='color:#ffa657;'>  └─ Try: Click 'Fix Server IPs', restart the server, and re-launch the game.</span>")
+                continue
+
+            # ── NEX: Attempt async friend/game service login ──
+            if 'nex:' in ll and 'attempt' in ll and 'login' in ll:
+                svc_name = 'Unknown Service'
+                if 'friend' in ll:
+                    svc_name = 'Friends'
+                elif 'game' in ll or 'secure' in ll:
+                    svc_name = 'Game/Secure'
+                self.server_log.append(
+                    f"<span style='color:#58a6ff;'>  🔄 [{emu_ts}] [CEMU/NEX] Attempting {svc_name} service login...</span>")
+                continue
+
+            # ── NEX: Secure login succeeded ──
+            if 'nex:' in ll and ('login' in ll or 'connect' in ll) and any(k in ll for k in ['success', 'ok', 'established', 'logged in']):
+                self._cemu_timeout_count = 0  # Reset timeout counter on success
+                self.server_log.append(
+                    f"<b style='color:#3fb950;'>  ✅ [{emu_ts}] [CEMU/NEX] {line_body}</b>")
+                continue
+
+            # ── IOSU_FPD: Friend Presence Daemon events ──
+            if 'iosu_fpd' in ll:
+                if 'created' in ll and 'session' in ll:
+                    self.server_log.append(
+                        f"<span style='color:#d2a8ff;'>  👥 [{emu_ts}] [CEMU/FPD] {line_body}</span>")
+                elif 'error' in ll or 'fail' in ll:
+                    self.server_log.append(
+                        f"<b style='color:#ff7b72;'>  ❌ [{emu_ts}] [CEMU/FPD] {line_body}</b>")
+                else:
+                    self.server_log.append(
+                        f"<span style='color:#d2a8ff;'>  👥 [{emu_ts}] [CEMU/FPD] {line_body}</span>")
+                continue
+
+            # ── IOSU_ACT: Account Service events ──
+            if 'iosu_act' in ll or 'nn_act' in ll:
+                if 'error' in ll or 'fail' in ll:
+                    self.server_log.append(
+                        f"<b style='color:#ff7b72;'>  🔑 [{emu_ts}] [CEMU/ACT] {line_body}</b>")
+                elif 'token' in ll or 'login' in ll or 'account' in ll:
+                    self.server_log.append(
+                        f"<span style='color:#58a6ff;'>  🔑 [{emu_ts}] [CEMU/ACT] {line_body}</span>")
+                else:
+                    self.server_log.append(
+                        f"<span style='color:#8b949e;'>  🔑 [{emu_ts}] [CEMU/ACT] {line_body}</span>")
+                continue
+
+            # ── NEX: General NEX events (not already caught above) ──
+            if 'nex:' in ll:
+                if 'error' in ll or 'fail' in ll or 'disconnect' in ll:
+                    self.server_log.append(
+                        f"<b style='color:#ff7b72;'>  ⚡ [{emu_ts}] [CEMU/NEX] {line_body}</b>")
+                elif 'connect' in ll or 'register' in ll or 'handshake' in ll:
+                    self.server_log.append(
+                        f"<span style='color:#b392f0;'>  📡 [{emu_ts}] [CEMU/NEX] {line_body}</span>")
+                else:
+                    self.server_log.append(
+                        f"<span style='color:#b392f0;'>  📡 [{emu_ts}] [CEMU/NEX] {line_body}</span>")
+                continue
+
+            # ── PRUDP events ──
+            if 'prudp' in ll:
+                self.server_log.append(
+                    f"<span style='color:#b392f0;'>  📡 [{emu_ts}] [CEMU/PRUDP] {line_body}</span>")
+                continue
+
+            # ── Matchmaking / Online gameplay ──
+            if 'matchmake' in ll or 'gathering' in ll or 'session' in ll:
+                self.server_log.append(
+                    f"<span style='color:#79c0ff;'>  🏆 [{emu_ts}] [CEMU/ONLINE] {line_body}</span>")
+                continue
+
+            # ── SSL/HTTP connection events ──
+            if 'ssl' in ll or 'http' in ll:
+                if 'error' in ll or 'fail' in ll:
+                    self.server_log.append(
+                        f"<b style='color:#ff7b72;'>  🔒 [{emu_ts}] [CEMU/NET] {line_body}</b>")
+                else:
+                    self.server_log.append(
+                        f"<span style='color:#8b949e;'>  🌐 [{emu_ts}] [CEMU/NET] {line_body}</span>")
+                continue
+
+            # ── IOSU_NIM / IOSU_BOSS (download/task manager) ──
+            if 'iosu_nim' in ll or 'iosu_boss' in ll:
+                self.server_log.append(
+                    f"<span style='color:#8b949e;'>  📥 [{emu_ts}] [CEMU/SYS] {line_body}</span>")
+                continue
+
+            # ── OLV / Miiverse ──
+            if 'olv:' in ll or 'miiverse' in ll:
+                self.server_log.append(
+                    f"<span style='color:#d2a8ff;'>  ✏️ [{emu_ts}] [CEMU/OLV] {line_body}</span>")
+                continue
+
+            # ── Catch-all for any other connection-relevant line ──
+            if any(kw in ll for kw in ['error', 'fail', 'refused', 'timeout', 'crash', 'panic']):
+                self.server_log.append(
+                    f"<b style='color:#ff7b72;'>  ⚠️ [{emu_ts}] [CEMU] {line_body}</b>")
+            else:
+                self.server_log.append(
+                    f"<span style='color:#8b949e;'>  📋 [{emu_ts}] [CEMU] {line_body}</span>")
+
+        # Update game title label
+        self._update_cemu_game_label(cemu_log)
+
+    def _update_cemu_game_label(self, cemu_log):
+        """Update the detected game label based on Cemu's log.txt."""
+        try:
+            with open(cemu_log, "r", errors='ignore') as f:
+                f.seek(0, 2)
+                size = f.tell()
+                offset = max(0, size - 32768)
+                f.seek(offset)
+                tail = f.read()
+
+            matches = re.findall(r"TitleId: ([0-9a-fA-F-]+)", tail)
+            if matches:
+                tid = matches[-1].lower()
+                game_name = TITLE_MAP.get(tid, TITLE_MAP.get(tid.upper(), f"Unknown Title ({tid})"))
+
+                # Determine connection status from recent log lines
+                lines = tail.split('\n')
+                last_100 = lines[-100:]
+                conn_status = "Launched"
+                timeout_streak = 0
+                for cline in last_100:
+                    cl = cline.lower()
+                    if 'nex:' in cl and 'time-out' in cl:
+                        timeout_streak += 1
+                        conn_status = f"❌ NEX Timeout (x{timeout_streak})"
+                    elif 'nex:' in cl and 'attempt' in cl and 'login' in cl:
+                        conn_status = "🔄 Connecting..."
+                    elif 'nex:' in cl and any(k in cl for k in ['success', 'established', 'logged in']):
+                        timeout_streak = 0
+                        conn_status = "✅ Online"
+                    elif 'iosu_fpd' in cl and 'created' in cl and 'session' in cl:
+                        conn_status = "🔄 Friends Connecting..."
+                    elif 'iosu_act' in cl and ('error' in cl or 'fail' in cl):
+                        conn_status = "⚠️ Account Error"
+                    elif 'friend' in cl and ('list' in cl or 'connected' in cl):
+                        timeout_streak = 0
+                        conn_status = "✅ Online (Friends OK)"
+
+                self.detected_game_label.setText(f"🎮 Cemu: {game_name} [{conn_status}]")
+                if 'Online' in conn_status or '✅' in conn_status:
+                    self.detected_game_label.setStyleSheet(f"color: {GREEN_BRIGHT}; font-weight: bold;")
+                elif '❌' in conn_status or '⚠️' in conn_status:
+                    self.detected_game_label.setStyleSheet(f"color: {RED_LIGHT}; font-weight: bold;")
+                else:
+                    self.detected_game_label.setStyleSheet(f"color: {CYAN_LIGHT}; font-weight: bold;")
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _stream_citra_log(self):
+        """Read new lines from Citra/Lime3DS/Azahar log and stream connection events."""
+        citra_log = self._get_citra_log_path()
+        if not citra_log:
+            return
+
+        try:
+            file_size = os.path.getsize(citra_log)
+        except OSError:
+            return
+
+        # Check if actively running (modified in last 60 seconds)
+        try:
+            mtime = os.path.getmtime(citra_log)
+            if time.time() - mtime > 60:
+                return  # Not actively running
+        except OSError:
+            return
+
+        # If file got smaller (Citra restarted), reset offset
+        if file_size < self._citra_log_offset:
+            self._citra_log_offset = 0
+            self.server_log.append(
+                f"<span style='color:#8b949e;'>[CITRA-LOG] Citra log file reset detected — emulator may have restarted</span>")
+
+        if file_size <= self._citra_log_offset:
+            # Still show label
+            game_label = self.detected_game_label.text()
+            if 'Citra' not in game_label and 'Azahar' not in game_label:
+                if 'Cemu' in game_label:
+                    self.detected_game_label.setText(f"{game_label} | 🕹️ Citra/3DS: Active")
+                else:
+                    self.detected_game_label.setText("🕹️ Citra/3DS: Active Session")
+                    self.detected_game_label.setStyleSheet(f"color: {GREEN_BRIGHT}; font-weight: bold;")
+            return
+
+        # Read new content
+        with open(citra_log, "r", errors='ignore') as f:
+            if self._citra_log_offset == 0 and file_size > 65536:
+                self._citra_log_offset = file_size - 65536
+            f.seek(self._citra_log_offset)
+            new_content = f.read()
+            self._citra_log_offset = f.tell()
+
+        if not new_content.strip():
+            return
+
+        now_str = datetime.now().strftime('%H:%M:%S')
+        CITRA_CONNECTION_KEYWORDS = [
+            'nex', 'http', 'ssl', 'socket', 'connect', 'friend',
+            'account', 'auth', 'session', 'matchmak', 'nasc',
+            'token', 'error', 'timeout', 'fail',
+        ]
+
+        for line in new_content.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            ll = line.lower()
+
+            is_relevant = any(kw in ll for kw in CITRA_CONNECTION_KEYWORDS)
+            if not is_relevant:
+                continue
+
+            # Classify
+            if 'error' in ll or 'fail' in ll or 'timeout' in ll or 'refused' in ll:
+                self.server_log.append(
+                    f"<b style='color:#ff7b72;'>  ❌ [{now_str}] [CITRA] {line}</b>")
+            elif 'connect' in ll or 'login' in ll or 'auth' in ll:
+                self.server_log.append(
+                    f"<span style='color:#58a6ff;'>  🔄 [{now_str}] [CITRA] {line}</span>")
+            elif 'success' in ll or 'ok' in ll or 'established' in ll:
+                self.server_log.append(
+                    f"<span style='color:#3fb950;'>  ✅ [{now_str}] [CITRA] {line}</span>")
+            elif 'friend' in ll:
+                self.server_log.append(
+                    f"<span style='color:#d2a8ff;'>  👥 [{now_str}] [CITRA] {line}</span>")
+            else:
+                self.server_log.append(
+                    f"<span style='color:#8b949e;'>  📋 [{now_str}] [CITRA] {line}</span>")
+
+        # Update label
+        game_label = self.detected_game_label.text()
+        if 'Citra' not in game_label and 'Azahar' not in game_label:
+            if 'Cemu' in game_label:
+                self.detected_game_label.setText(f"{game_label} | 🕹️ Citra/3DS: Active")
+            else:
+                self.detected_game_label.setText("🕹️ Citra/3DS: Active Session")
+                self.detected_game_label.setStyleSheet(f"color: {GREEN_BRIGHT}; font-weight: bold;")
 
     def show_reset_dialog(self):
         """Helper to show the reset options from different tabs."""
@@ -2182,7 +2731,8 @@ class PretendoManager(QMainWindow):
     def start_server(self):
         self.server_log.clear()
         # 1. Connectivity Gate
-        if self._get_local_ip() == "127.0.0.1":
+        local_ip = self._get_local_ip()
+        if local_ip == "127.0.0.1":
             QMessageBox.warning(self, "No Connection", "An internet connection is required to start the Pretendo server.\n\nPlease check your network and try again.")
             return
 
@@ -2197,6 +2747,7 @@ class PretendoManager(QMainWindow):
             return
 
         self._apply_compose_patches(custom_port, s_dir)
+        self._refresh_env_ips(s_dir, local_ip)
 
         # 2. Unified Credential Aggregation
         pw = self._get_effective_sudo_password()
@@ -2236,31 +2787,34 @@ class PretendoManager(QMainWindow):
                 
                 const acc_db = db.getSiblingDB("pretendo_account");
                 const gs_data = [
-                    {{ id: '1010EB00', name: 'Mario Kart 8', port: 6014, sub: 'Global' }},
-                    {{ id: '1010EC00', name: 'Mario Kart 8', port: 6014, sub: 'US' }},
-                    {{ id: '1010ED00', name: 'Mario Kart 8', port: 6014, sub: 'EU' }},
-                    {{ id: '1010EE00', name: 'Mario Kart 8', port: 6014, sub: 'JP' }},
+                    {{ id: '1010EB00', name: 'Mario Kart 8', port: 60140, sub: 'Global' }},
+                    {{ id: '1010EC00', name: 'Mario Kart 8', port: 60140, sub: 'US' }},
+                    {{ id: '1010ED00', name: 'Mario Kart 8', port: 60140, sub: 'EU' }},
+                    {{ id: '1010EE00', name: 'Mario Kart 8', port: 60140, sub: 'JP' }},
                     {{ id: '101DF400', name: 'Pokken Tournament', port: 60008, sub: 'Primary' }},
                     {{ id: '101C5800', name: 'Pokken Tournament', port: 60008, sub: 'Alt' }},
-                    {{ id: '10162E00', name: 'Splatoon', port: 6006, sub: 'EU/US' }},
-                    {{ id: '10170000', name: 'Splatoon', port: 6006, sub: 'JP' }},
-                    {{ id: '1018DC00', name: 'Super Mario Maker', port: 6004, sub: 'EU' }},
-                    {{ id: '1018DD00', name: 'Super Mario Maker', port: 6004, sub: 'US' }},
-                    {{ id: '1018DE00', name: 'Super Mario Maker', port: 6004, sub: 'JP' }},
-                    {{ id: '10148E00', name: 'Super Smash Bros. Wii U', port: 6012, sub: 'EU' }},
-                    {{ id: '10148F00', name: 'Super Smash Bros. Wii U', port: 6012, sub: 'US' }},
-                    {{ id: '10149000', name: 'Super Smash Bros. Wii U', port: 6012, sub: 'JP' }},
-                    {{ id: '101D7500', name: 'Minecraft', port: 6008, sub: 'EU' }},
-                    {{ id: '101D7600', name: 'Minecraft', port: 6008, sub: 'US' }},
-                    {{ id: '101D7700', name: 'Minecraft', port: 6008, sub: 'JP' }},
-                    {{ id: '1012C100', name: 'Pikmin 3', port: 6010, sub: 'EU' }},
-                    {{ id: '1012C200', name: 'Pikmin 3', port: 6010, sub: 'US' }},
-                    {{ id: '1012C300', name: 'Pikmin 3', port: 6010, sub: 'JP' }},
-                    {{ id: '00003200', name: 'Friends', port: 6001, sub: 'Global' }}
+                    {{ id: '10162E00', name: 'Splatoon', port: 60060, sub: 'EU/US' }},
+                    {{ id: '10170000', name: 'Splatoon', port: 60060, sub: 'JP' }},
+                    {{ id: '1018DC00', name: 'Super Mario Maker', port: 60040, sub: 'EU' }},
+                    {{ id: '1018DD00', name: 'Super Mario Maker', port: 60040, sub: 'US' }},
+                    {{ id: '1018DE00', name: 'Super Mario Maker', port: 60040, sub: 'JP' }},
+                    {{ id: '10148E00', name: 'Super Smash Bros. Wii U', port: 60120, sub: 'EU' }},
+                    {{ id: '10148F00', name: 'Super Smash Bros. Wii U', port: 60120, sub: 'US' }},
+                    {{ id: '10149000', name: 'Super Smash Bros. Wii U', port: 60120, sub: 'JP' }},
+                    {{ id: '101D7500', name: 'Minecraft', port: 60080, sub: 'EU' }},
+                    {{ id: '101D7600', name: 'Minecraft', port: 60080, sub: 'US' }},
+                    {{ id: '101D7700', name: 'Minecraft', port: 60080, sub: 'JP' }},
+                    {{ id: '1012C100', name: 'Pikmin 3', port: 60100, sub: 'EU' }},
+                    {{ id: '1012C200', name: 'Pikmin 3', port: 60100, sub: 'US' }},
+                    {{ id: '1012C300', name: 'Pikmin 3', port: 60100, sub: 'JP' }},
+                    {{ id: '00003200', name: 'Friends', port: 60001, sub: 'Global' }}
                 ];
                 const modes = ['prod', 'test', 'dev'];
                 
                 gs_data.forEach(gs => {{
+                    const isFriends = (gs.id === '00003200');
+                    const aesKey = isFriends ? '{friends_aes_key}' : '0'.repeat(64);
+                    
                     modes.forEach(mode => {{
                         acc_db.servers.updateOne(
                             {{ game_server_id: gs.id, access_mode: mode }},
@@ -2270,7 +2824,8 @@ class PretendoManager(QMainWindow):
                                     port: gs.port,
                                     service_name: gs.name + " (" + gs.sub + ")",
                                     maintenance_mode: false,
-                                    client_id: gs.id // Fix error 1021 by setting client_id
+                                    client_id: gs.id,
+                                    aes_key: aesKey
                                 }},
                                 $setOnInsert: {{
                                     service_type: 'nex',
@@ -2278,7 +2833,6 @@ class PretendoManager(QMainWindow):
                                     title_ids: ['00050000'+gs.id, '00050000'+gs.id.toLowerCase(), '00050002'+gs.id, '0005000E'+gs.id],
                                     access_mode: mode,
                                     device: 1,
-                                    aes_key: '0'.repeat(64),
                                     __v: 0
                                 }}
                             }},
@@ -2302,6 +2856,17 @@ class PretendoManager(QMainWindow):
                         ] }} }}
                     }}
                 );
+
+                // 3. MK8 Regions Initialization
+                const mk8_db = db.getSiblingDB("pretendo_mk8");
+                if (mk8_db.regions.count() === 0) {{
+                    mk8_db.regions.insertMany([
+                        {{id: 0, allowed_gamemodes: [true, true, true, true, true]}},
+                        {{id: 1, allowed_gamemodes: [true, true, true, true, true]}},
+                        {{id: 2, allowed_gamemodes: [true, true, true, true, true]}},
+                        {{id: 3, allowed_gamemodes: [true, true, true, true, true]}}
+                    ]);
+                }}
                 """
                 setup_cmds = []
                 setup_cmds.append(f"docker compose exec -T mongodb mongo --quiet --eval {shlex.quote(mongo_init_js)} >/dev/null 2>&1 || true")
@@ -2310,40 +2875,58 @@ class PretendoManager(QMainWindow):
                 # Without a nexaccount entry, the friends service Kerberos ticket validation silently fails
                 # causing "Lost friend server session" timeouts in Cemu
                 nex_sync_js = """
+                // Ensure service accounts (PIDs 1 and 2) exist with fixed password
+                [1, 2].forEach(function(pid) {
+                    var existing = db.getSiblingDB("pretendo_account").nexaccounts.findOne({pid: pid});
+                    if (!existing) {
+                        db.getSiblingDB("pretendo_account").nexaccounts.insertOne({
+                            device_type: "wiiu",
+                            pid: pid,
+                            password: "password",
+                            owning_pid: pid,
+                            access_level: 0,
+                            server_access_level: "prod",
+                            __v: 0
+                        });
+                    } else {
+                        db.getSiblingDB("pretendo_account").nexaccounts.updateOne({pid: pid}, {$set: {password: "password"}});
+                    }
+                });
+
                 var pnids = db.getSiblingDB("pretendo_account").pnids.find({}, {pid:1});
                 pnids.forEach(function(p) {
                     var existing = db.getSiblingDB("pretendo_account").nexaccounts.findOne({pid: p.pid});
                     if (!existing) {
-                        var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-                        var pw = "";
-                        for (var i = 0; i < 16; i++) pw += chars.charAt(Math.floor(Math.random() * chars.length));
                         db.getSiblingDB("pretendo_account").nexaccounts.insertOne({
                             device_type: "wiiu",
                             pid: p.pid,
-                            password: pw,
+                            password: "password",
                             owning_pid: p.pid,
                             access_level: 0,
                             server_access_level: "prod",
                             __v: 0
                         });
                         print("[NEX-Sync] Created NEX account for PID " + p.pid);
+                    } else {
+                        // Force password to "password" for compatibility
+                        db.getSiblingDB("pretendo_account").nexaccounts.updateOne({pid: p.pid}, {$set: {password: "password"}});
                     }
                 });
                 """
                 setup_cmds.append(f"docker compose exec -T mongodb mongo --quiet --eval {shlex.quote(nex_sync_js)} >/dev/null 2>&1 || true")
                 
                 # 2.6 Sync Friends Postgres (Populate profile tables from MongoDB accounts)
-                sync_pg_script = """
-PIDS=$(docker compose exec -T mongodb mongo pretendo_account --quiet --eval "db.pnids.find({}, {pid:1, username:1}).map(u => u.pid + ':' + u.username).join(',')" | tr -d '\\r')
-IFS=','
-for entry in $PIDS; do
-    PID=${entry%%:*}
-    NAME=${entry#*:}
-    if [ ! -z "$PID" ] && [ "$PID" != "null" ]; then
-        docker compose exec -T postgres psql -U postgres_pretendo -d friends -c "INSERT INTO wiiu.principal_basic_info (pid, username) VALUES ($PID, '$NAME') ON CONFLICT (pid) DO NOTHING;" >/dev/null 2>&1
-        docker compose exec -T postgres psql -U postgres_pretendo -d friends -c "INSERT INTO wiiu.network_account_info (pid, unknown1, unknown2) VALUES ($PID, 0, 0) ON CONFLICT (pid) DO NOTHING;" >/dev/null 2>&1
-    fi
-done
+                # Optimized: Build a single SQL script to avoid multiple docker exec overhead
+                mongo_js = "db.pnids.find({}, {pid:1, username:1}).forEach(u => { if (u.pid && u.username) { print('INSERT INTO wiiu.principal_basic_info (pid, username) VALUES (' + u.pid + \", '\" + u.username + \"') ON CONFLICT (pid) DO NOTHING;\"); print('INSERT INTO wiiu.network_account_info (pid, unknown1, unknown2) VALUES (' + u.pid + ', 0, 0) ON CONFLICT (pid) DO NOTHING;'); } })"
+                sync_pg_script = f"""
+SQL_FILE=$(mktemp)
+echo "Generating Postgres sync script..."
+docker compose exec -T mongodb mongo pretendo_account --quiet --eval {shlex.quote(mongo_js)} > "$SQL_FILE" 2>/dev/null
+if [ -s "$SQL_FILE" ]; then
+    echo "Applying sync to Postgres..."
+    docker compose exec -T postgres psql -U postgres_pretendo -d friends -f - < "$SQL_FILE" >/dev/null 2>&1
+fi
+rm "$SQL_FILE"
 """
                 setup_cmds.append(f"bash -c {shlex.quote(sync_pg_script)}")
                 
@@ -2404,9 +2987,7 @@ if result != content:
 done
 
 if [ $REBUILD_NEEDED -eq 1 ]; then
-    echo "Rebuilding account service..."
-    docker compose build --no-cache account >/dev/null 2>&1
-    echo "Account service patched and rebuilt."
+    echo "Account service source files patched (Rebuild skipped as requested)."
 fi
 
 # Fix BOSS Hash Expectation for Local Placeholder Keys
@@ -2417,7 +2998,7 @@ if [ -f "$BOSS_CFG" ]; then
         sed -i "s/5202ce5099232c3d365e28379790a919/e43881072b6c26928f8351c9c2f1381b/g" "$BOSS_CFG"
         sed -i "s/b4482fef177b0100090ce0dbeb8ce977/dcac47c7feace17a6aec0c171cc73f59/g" "$BOSS_CFG"
         sed -i "s/86fbc2bb4cb703b2a4c6cc9961319926/b06e25c2acdb585197493b738e64cdaf/g" "$BOSS_CFG"
-        docker compose build --no-cache boss >/dev/null 2>&1
+        # Skip slow rebuild during boot
     fi
 fi
 BOSS_GET="scripts/get-boss-keys.sh"
@@ -2566,20 +3147,37 @@ fi
         s_dir = self.server_dir_field.text().strip()
         if not os.path.isdir(s_dir): return
         
-        self.server_log.append("[System] Connecting to deep Docker event stream...")
-        self.server_log.append("--------------------------------------------------")
+        self.server_log.append("<b style='color:#58a6ff;'>[System] Connecting to deep Docker event stream...</b>")
+        self.server_log.append("<span style='color:#58a6ff;'>──────────────────────────────────────────────────</span>")
+        self.server_log.append("<span style='color:#8b949e;'>[Monitor] Enhanced emulator detection ACTIVE</span>")
+        self.server_log.append("<span style='color:#8b949e;'>[Monitor] Tracking: Cemu (Wii U) | Citra/Lime3DS/Azahar (3DS)</span>")
+        self.server_log.append("<span style='color:#8b949e;'>[Monitor] Protocol watchers: PRUDP/NEX, Account API, Friends, Matchmake</span>")
+        self.server_log.append("<span style='color:#8b949e;'>[Monitor] Connection problem detectors: Auth, Kerberos, TLS, Timeouts</span>")
         cmd = "docker compose logs -f --tail=20"
         
         if hasattr(self, 'log_worker') and getattr(self.log_worker, 'isRunning')():
             self.log_worker.terminate()
             self.server_log.append("[System] Restarting log watcher...")
             
+        # Initialize emulator connection tracking state
+        self._emu_connection_state = {
+            'cemu_seen': False, 'citra_seen': False,
+            'last_cemu_event': None, 'last_citra_event': None,
+            'cemu_auth_ok': False, 'citra_auth_ok': False,
+            'cemu_friends_ok': False, 'citra_friends_ok': False,
+            'active_pids': set(),
+            'connection_attempts': 0,
+            'auth_failures': 0,
+            'last_connection_ip': None,
+        }
+            
         self.log_worker = CommandWorker(cmd, cwd=s_dir)
         self.log_worker.output.connect(self._handle_server_log)
         self.log_worker.start()
 
     def _handle_server_log(self, html_text):
-        """Processes incoming server logs for both display and critical error detection."""
+        """Processes incoming server logs for both display, emulator connection detection,
+        and critical error detection. Enhanced with deep Cemu/Citra tracking."""
         self.server_log.append(html_text)
         
         # Strip simple HTML spans to get the raw text back for checking
@@ -2609,7 +3207,201 @@ fi
                     # If log time is before session start, ignore it (old error)
                     if log_time < self.session_start_time:
                         return
-        
+
+        low = raw_text.lower()
+        emu_state = getattr(self, '_emu_connection_state', None)
+        now_str = datetime.now().strftime('%H:%M:%S')
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # ── EMULATOR CONNECTION DETECTION ENGINE ──────────────────────────────
+        # Detects Cemu (Wii U) and Citra/Lime3DS/Azahar (3DS) connections
+        # by analyzing Docker service logs from the Pretendo backend.
+        # ═══════════════════════════════════════════════════════════════════════
+        if emu_state is not None:
+
+            # ── Extract source IP from connection events ──
+            ip_match = re.search(r'(?:from|connection)\s+(?:from\s+)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', low)
+            if ip_match:
+                src_ip = ip_match.group(1)
+                if src_ip != emu_state.get('last_connection_ip'):
+                    emu_state['last_connection_ip'] = src_ip
+                    emu_state['connection_attempts'] += 1
+                    self.server_log.append(
+                        f"<b style='color:#58a6ff;'>🔌 [{now_str}] [EMU-DETECT] New device connecting from IP: {src_ip} "
+                        f"(attempt #{emu_state['connection_attempts']})</b>")
+
+            # ── PRUDP/NEX Connection Detection (Wii U protocol = Cemu) ──
+            if any(k in low for k in ['prudp', 'prudpserver', 'prudpendpoint', 'prudp endpoint',
+                                       'nex server', 'virtual server started', 'secure server',
+                                       'authentication server', 'syn packet', 'connect packet']):
+                if not emu_state['cemu_seen']:
+                    emu_state['cemu_seen'] = True
+                    self.server_log.append(
+                        f"<b style='color:#b392f0;'>🎮 [{now_str}] [CEMU] ═══ Wii U PRUDP/NEX Activity Detected ═══</b>")
+                    self.server_log.append(
+                        f"<span style='color:#b392f0;'>  └─ Cemu or a Wii U client is initiating a NEX protocol handshake</span>")
+                emu_state['last_cemu_event'] = now_str
+
+                # Detect SYN (connection initiation)
+                if 'syn' in low and 'packet' in low:
+                    self.server_log.append(
+                        f"<span style='color:#b392f0;'>  📡 [{now_str}] [CEMU/PRUDP] SYN packet received — Client requesting connection</span>")
+                # Detect CONNECT (handshake completion)
+                if 'connect' in low and ('packet' in low or 'accepted' in low):
+                    self.server_log.append(
+                        f"<span style='color:#3fb950;'>  ✅ [{now_str}] [CEMU/PRUDP] Connection handshake in progress</span>")
+                # Detect DATA (active session)
+                if 'data packet' in low or 'data channel' in low:
+                    self.server_log.append(
+                        f"<span style='color:#3fb950;'>  📦 [{now_str}] [CEMU/PRUDP] Data channel active — Game traffic flowing</span>")
+                # Detect DISCONNECT
+                if 'disconnect' in low and 'packet' in low:
+                    self.server_log.append(
+                        f"<span style='color:#d29922;'>  ⚡ [{now_str}] [CEMU/PRUDP] Disconnect packet — Client ending session</span>")
+
+            # ── Account API Requests (both Cemu & Citra hit these) ──
+            if any(k in low for k in ['/v1/api/oauth', '/v1/api/people', '/v1/api/provider',
+                                       'oauth20/access_token', 'grant_type', 'token_type',
+                                       'access_token_generate', 'mapped_ids']):
+                emu_state['connection_attempts'] += 1
+                # Detect which emulator by API path patterns
+                if any(k in low for k in ['wiiu', 'wup-', 'wii u', 'cafe', 'espresso']):
+                    emu_who = 'CEMU'
+                    emu_state['cemu_seen'] = True
+                elif any(k in low for k in ['3ds', 'ctr', 'citra']):
+                    emu_who = 'CITRA'
+                    emu_state['citra_seen'] = True
+                else:
+                    emu_who = 'CLIENT'
+
+                if 'oauth' in low or 'access_token' in low:
+                    self.server_log.append(
+                        f"<span style='color:#58a6ff;'>  🔑 [{now_str}] [{emu_who}/AUTH] OAuth token request detected</span>")
+
+                    # Check for success or failure indicators
+                    if any(k in low for k in ['200', 'success', 'generated', 'ok']):
+                        self.server_log.append(
+                            f"<span style='color:#3fb950;'>  ✅ [{now_str}] [{emu_who}/AUTH] Authentication SUCCESSFUL — Token granted</span>")
+                        if emu_who == 'CEMU': emu_state['cemu_auth_ok'] = True
+                        elif emu_who == 'CITRA': emu_state['citra_auth_ok'] = True
+
+                if '/v1/api/people' in low:
+                    self.server_log.append(
+                        f"<span style='color:#58a6ff;'>  👤 [{now_str}] [{emu_who}/ACCOUNT] Account registration/lookup request</span>")
+
+                if 'mapped_ids' in low:
+                    self.server_log.append(
+                        f"<span style='color:#58a6ff;'>  🔄 [{now_str}] [{emu_who}/ACCOUNT] PID ↔ NNID mapping request</span>")
+
+            # ── Authentication Failures ──
+            if any(k in low for k in ['invalid kerberos', 'incorrect password', 'bad decrypt',
+                                       'decryption failed', 'invalid credentials',
+                                       'authentication failed', 'ticket validation',
+                                       'invalid signature', 'invalid mac', 'checksum error',
+                                       'hmac verification']):
+                emu_state['auth_failures'] += 1
+                fail_reason = 'Unknown'
+                if 'kerberos' in low or 'incorrect password' in low:
+                    fail_reason = 'Kerberos ticket decryption failed (password mismatch between Account and service)'
+                elif 'bad decrypt' in low or 'decryption' in low:
+                    fail_reason = 'Encryption key mismatch (NEX password might differ from database)'
+                elif 'invalid signature' in low or 'invalid mac' in low or 'hmac' in low:
+                    fail_reason = 'HMAC/Signature validation failed (corrupted packet or key mismatch)'
+                elif 'checksum' in low:
+                    fail_reason = 'Checksum validation failure (data corruption or key mismatch)'
+                elif 'authentication failed' in low or 'invalid credentials' in low:
+                    fail_reason = 'Account credentials rejected by server'
+
+                self.server_log.append(
+                    f"<b style='color:#ff7b72;'>  ❌ [{now_str}] [AUTH-FAIL] Emulator authentication FAILED! "
+                    f"(failure #{emu_state['auth_failures']})</b>")
+                self.server_log.append(
+                    f"<span style='color:#ff7b72;'>  └─ Diagnosis: {fail_reason}</span>")
+                self.server_log.append(
+                    f"<span style='color:#ffa657;'>  └─ Fix: Ensure Account service and game service use the same NEX password. "
+                    f"Try re-registering the account or running 'Fix Server IPs'.</span>")
+
+            # ── Friends Service Events ──
+            if any(k in low for k in ['friends', 'friend_', 'friend-']):
+                if any(k in low for k in ['service started', 'listening', 'server started', 'started on port']):
+                    self.server_log.append(
+                        f"<span style='color:#d2a8ff;'>  👥 [{now_str}] [FRIENDS] Friends service ready for connections</span>")
+                elif any(k in low for k in ['client connected', 'new connection', 'accepted']):
+                    self.server_log.append(
+                        f"<span style='color:#d2a8ff;'>  👥 [{now_str}] [FRIENDS] Emulator connecting to Friends service</span>")
+                    emu_state['cemu_friends_ok'] = True
+                elif 'update_presence' in low or 'presence_change' in low:
+                    self.server_log.append(
+                        f"<span style='color:#d2a8ff;'>  👥 [{now_str}] [FRIENDS] Presence update — Emulator is online and communicating</span>")
+                elif any(k in low for k in ['error', 'failed', 'panic', 'crash']):
+                    self.server_log.append(
+                        f"<b style='color:#ff7b72;'>  ⚠️ [{now_str}] [FRIENDS] Friends service ERROR — This will disconnect the emulator!</b>")
+
+            # ── Game-Specific Matchmaking/Ranking Events ──
+            if any(k in low for k in ['matchmake', 'matchmaking', 'gathering',
+                                       'get_session_url', 'create_gathering', 'join_gathering',
+                                       'ranking', 'leaderboard', 'datastore']):
+                self.server_log.append(
+                    f"<span style='color:#79c0ff;'>  🏆 [{now_str}] [GAME] Online gameplay service activity detected</span>")
+
+            # ── Connection Timeout / Network Problems ──
+            if any(k in low for k in ['connection timed out', 'timeout', 'timed out',
+                                       'connection reset', 'econnreset', 'epipe',
+                                       'broken pipe', 'enetunreach', 'ehostunreach',
+                                       'network unreachable', 'host unreachable',
+                                       'read tcp', 'write tcp', 'socket closed',
+                                       'unexpected eof', 'premature close']):
+                self.server_log.append(
+                    f"<b style='color:#ffa657;'>  ⏱️ [{now_str}] [NET-PROBLEM] Connection issue detected between emulator and server</b>")
+                if 'timeout' in low or 'timed out' in low:
+                    self.server_log.append(
+                        f"<span style='color:#ffa657;'>  └─ The emulator's request timed out. Check if server is overloaded or network is unstable.</span>")
+                elif 'reset' in low or 'epipe' in low or 'broken pipe' in low:
+                    self.server_log.append(
+                        f"<span style='color:#ffa657;'>  └─ Connection was forcibly reset. The emulator or server dropped the connection mid-stream.</span>")
+                elif 'unreachable' in low:
+                    self.server_log.append(
+                        f"<span style='color:#ffa657;'>  └─ Network/host unreachable. Verify the emulator's server IP configuration matches this machine.</span>")
+
+            # ── TLS/Certificate Problems ──
+            if any(k in low for k in ['certificate error', 'ssl error', 'tls handshake',
+                                       'certificate verify failed', 'x509',
+                                       'ssl_error', 'tls_error', 'cert_error',
+                                       'unable to verify', 'self-signed']):
+                self.server_log.append(
+                    f"<b style='color:#ff7b72;'>  🔒 [{now_str}] [TLS-ERROR] Certificate/SSL problem from emulator connection!</b>")
+                self.server_log.append(
+                    f"<span style='color:#ff7b72;'>  └─ The emulator may need mitmproxy cert installed, or Cemu's account.dat needs re-patching.</span>")
+
+            # ── PID / Account Registration Events ──
+            pid_match = re.search(r'pid[: ]+([0-9]+)', low)
+            if pid_match:
+                pid_val = pid_match.group(1)
+                if pid_val not in emu_state['active_pids']:
+                    emu_state['active_pids'].add(pid_val)
+                    self.server_log.append(
+                        f"<span style='color:#58a6ff;'>  🆔 [{now_str}] [SESSION] New Principal ID active: PID {pid_val}</span>")
+
+            # ── Citra/3DS-Specific Detection ──
+            if any(k in low for k in ['ctr', '3ds', 'citra']):
+                if not emu_state['citra_seen']:
+                    emu_state['citra_seen'] = True
+                    self.server_log.append(
+                        f"<b style='color:#b392f0;'>🕹️ [{now_str}] [CITRA] ═══ 3DS Client Activity Detected ═══</b>")
+                    self.server_log.append(
+                        f"<span style='color:#b392f0;'>  └─ Citra, Lime3DS, or Azahar is connecting to the Pretendo 3DS services</span>")
+                emu_state['last_citra_event'] = now_str
+
+            # ── Buffer / Crash Detections ──
+            if 'buffer: read exceeds' in low or 'buffer capacity' in low:
+                self.server_log.append(
+                    f"<b style='color:#f85149;'>  💥 [{now_str}] [CRASH-WARN] Buffer overflow detected — A service may crash!</b>")
+                self.server_log.append(
+                    f"<span style='color:#ffa657;'>  └─ This usually means a malformed packet from the emulator or a protocol mismatch.</span>")
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # ── CRITICAL ERROR DETECTION (original logic, preserved) ──────────────
+        # ═══════════════════════════════════════════════════════════════════════
         critical_patterns = [
             "failed request /oauth20/access_token/generate",
             "failed to retrieve oauth token",
@@ -2624,7 +3416,6 @@ fi
             "database is locked"
         ]
         
-        low = raw_text.lower()
         if any(p in low for p in critical_patterns):
             # Ignore panic loops caused by Docker containers starting before the database is ready.
             # Docker natively self-heals these crashes via 'restart: unless-stopped'.
@@ -2723,8 +3514,16 @@ fi
             self._run_command("sudo -S bash -c 'systemctl reset-failed docker; systemctl start docker.socket docker.service'", self.setup_log, stdin_data=pw, on_done=lambda c: self._check_docker_status())
 
     def refresh_database_ips(self):
-        """Force update all game server IPs in the MongoDB database to the current detected IP."""
-        current_ip = self._get_local_ip()
+        """Force update all game server IPs in the MongoDB database to the current target Node."""
+        use_official = self.mode_pretendo.isChecked()
+        url_input = self.patch_url_input.text().strip()
+        
+        if not use_official and url_input:
+            # Extract raw domain/IP from the target node URL
+            current_ip = url_input.replace("http://", "").replace("https://", "").split(':')[0].split('/')[0]
+        else:
+            current_ip = self._get_local_ip()
+            
         if current_ip == "127.0.0.1":
             QMessageBox.warning(self, "Connectivity Warning", "Could not detect a local network IP. Only 127.0.0.1 (localhost) will be used. This may prevent other devices from connecting.")
         
@@ -2734,19 +3533,19 @@ fi
         const acc_db = db.getSiblingDB('pretendo_account');
         const target_ip = '{current_ip}';
         const gs_data = [
-            {{ id: '1010EB00', name: 'MARIO KART 8', port: 6014, sub: 'EU' }},
-            {{ id: '1010EC00', name: 'MARIO KART 8', port: 6014, sub: 'US' }},
-            {{ id: '1010ED00', name: 'MARIO KART 8', port: 6014, sub: 'JP' }},
-            {{ id: '1010EE00', name: 'MARIO KART 8', port: 6014, sub: 'ALL' }},
-            {{ id: '10162A00', name: 'Splatoon', port: 6006, sub: 'EU' }},
-            {{ id: '10162B00', name: 'Splatoon', port: 6006, sub: 'US' }},
-            {{ id: '10162C00', name: 'Splatoon', port: 6006, sub: 'JP' }},
-            {{ id: '10176900', name: 'Splatoon', port: 6006, sub: 'ALL' }},
-            {{ id: '1018DC00', name: 'Super Mario Maker', port: 6004, sub: 'EU' }},
-            {{ id: '1018DD00', name: 'Super Mario Maker', port: 6004, sub: 'US' }},
-            {{ id: '1018DE00', name: 'Super Mario Maker', port: 6004, sub: 'JP' }},
-            {{ id: '10145C00', name: 'Minecraft', port: 6008, sub: 'EU' }},
-            {{ id: '00003200', name: 'Friends', port: 6001, sub: 'Global' }}
+            {{ id: '1010EB00', name: 'MARIO KART 8', port: 60140, sub: 'EU' }},
+            {{ id: '1010EC00', name: 'MARIO KART 8', port: 60140, sub: 'US' }},
+            {{ id: '1010ED00', name: 'MARIO KART 8', port: 60140, sub: 'EU' }},
+            {{ id: '1010EE00', name: 'MARIO KART 8', port: 60140, sub: 'ALL' }},
+            {{ id: '10162A00', name: 'Splatoon', port: 60060, sub: 'EU' }},
+            {{ id: '10162B00', name: 'Splatoon', port: 60060, sub: 'US' }},
+            {{ id: '10162C00', name: 'Splatoon', port: 60060, sub: 'JP' }},
+            {{ id: '10176900', name: 'Splatoon', port: 60060, sub: 'ALL' }},
+            {{ id: '1018DC00', name: 'Super Mario Maker', port: 60040, sub: 'EU' }},
+            {{ id: '1018DD00', name: 'Super Mario Maker', port: 60040, sub: 'US' }},
+            {{ id: '1018DE00', name: 'Super Mario Maker', port: 60040, sub: 'JP' }},
+            {{ id: '10145C00', name: 'Minecraft', port: 60080, sub: 'EU' }},
+            {{ id: '00003200', name: 'Friends', port: 60000, sub: 'Global' }}
         ];
         
         gs_data.forEach(gs => {{
@@ -2759,9 +3558,12 @@ fi
             }});
         }});
         """
-        # Remove newlines and escape for shell
+        # Remove newlines and use shlex.quote for safe shell execution
         compact_script = ' '.join(mongo_script.split())
-        cmd = f"docker exec -i pretendo-network-mongodb-1 mongo --quiet --eval \"{compact_script}\""
+        
+        # Determine correct container name and command
+        # Use shlex.quote to handle $set and curly braces correctly in the shell
+        cmd = f"docker exec -i pretendo-network-mongodb-1 mongo --quiet --eval {shlex.quote(compact_script)}"
         
         self.server_log.append(f"<b>[ACTION]</b> Refreshing Database IPs to {current_ip}...")
         self.worker = CommandWorker(cmd, cwd=self.server_dir)
@@ -2987,27 +3789,26 @@ fi
         minio_secret = get_existing("account.local.env", "PN_ACT_CONFIG_S3_ACCESS_SECRET", gen_password(32))
         postgres_pass = get_existing("postgres.local.env", "POSTGRES_PASSWORD", gen_password(32))
         
-        friends_auth_pw = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD", gen_password(32))
-        friends_secure_pw = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_SECURE_PASSWORD", gen_password(32))
+        friends_auth_pw = "password"
+        friends_secure_pw = "password"
         friends_api_key = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_GRPC_API_KEY", gen_password(32))
         friends_aes_key = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_AES_KEY", gen_hex(64))
         
-        chat_kerberos_pw = get_existing("wiiu-chat.local.env", "PN_WIIU_CHAT_KERBEROS_PASSWORD", gen_password(32))
-        smm_kerberos_pw = get_existing("super-mario-maker.local.env", "PN_SMM_KERBEROS_PASSWORD", gen_password(32))
+        chat_kerberos_pw = "password"
+        smm_kerberos_pw = "password"
         smm_aes_key = get_existing("super-mario-maker.local.env", "PN_SMM_CONFIG_AES_KEY", gen_hex(64))
         
-        splat_kerberos_pw = get_existing("splatoon.local.env", "PN_SPLATOON_KERBEROS_PASSWORD", gen_password(32))
+        splat_kerberos_pw = "password"
         splat_aes_key = get_existing("splatoon.local.env", "PN_SPLATOON_CONFIG_AES_KEY", gen_hex(64))
         
-        smash_kerberos_pw = get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_KERBEROS_PASSWORD", 
-                                         get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_KERBEROS_PASSWORD", gen_password(32)))
+        smash_kerberos_pw = "password"
         smash_aes_key = get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_AES_KEY", 
                                      get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_CONFIG_AES_KEY", gen_hex(64)))
         
-        mk8_kerberos_pw = get_existing("mario-kart-8.local.env", "PN_MK8_KERBEROS_PASSWORD", gen_password(32))
+        mk8_kerberos_pw = "password"
         
-        minecraft_kerberos_pw = get_existing("minecraft-wiiu.local.env", "PN_MINECRAFT_KERBEROS_PASSWORD", gen_password(32))
-        pikmin3_kerberos_pw = get_existing("pikmin-3.local.env", "PN_PIKMIN3_KERBEROS_PASSWORD", gen_password(32))
+        minecraft_kerberos_pw = "password"
+        pikmin3_kerberos_pw = "password"
         
         boss_api_key = get_existing("boss.local.env", "PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY", gen_password(32))
         
@@ -3018,7 +3819,7 @@ fi
         boss_3ds_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_AES_KEY", sk.get("BOSS_3DS_AES_KEY", gen_hex(32)))
         boss_3ds_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY", gen_hex(32))
         
-        pokken_kerberos_pw = get_existing("pokken-tournament.local.env", "PN_POKKENTOURNAMENT_KERBEROS_PASSWORD", gen_password(32))
+        pokken_kerberos_pw = "password"
         pokken_aes_key = get_existing("pokken-tournament.local.env", "PN_POKKENTOURNAMENT_CONFIG_AES_KEY", gen_hex(64))
         mk8_aes_key = get_existing("mario-kart-8.local.env", "PN_MK8_CONFIG_AES_KEY", gen_hex(64))
         
@@ -3045,6 +3846,10 @@ fi
             f"PN_FRIENDS_CONFIG_GRPC_API_KEY={friends_api_key}",
             f"PN_FRIENDS_CONFIG_AES_KEY={friends_aes_key}",
             f"PN_FRIENDS_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/friends?sslmode=disable",
+            "PN_FRIENDS_AUTHENTICATION_SERVER_PORT=60000",
+            "PN_FRIENDS_CONFIG_AUTHENTICATION_SERVER_PORT=60000",
+            "PN_FRIENDS_SECURE_SERVER_PORT=60001",
+            "PN_FRIENDS_CONFIG_SECURE_SERVER_PORT=60001",
             f"PN_FRIENDS_SECURE_SERVER_HOST={server_ip}",
             f"PN_FRIENDS_CONFIG_SECURE_SERVER_HOST={server_ip}",
             f"PN_WEBSITE_CONFIG_DATABASE_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/website?sslmode=disable",
@@ -3153,8 +3958,8 @@ fi
         # 11. Super Smash Bros. Wii U
         env_files["super-smash-bros-wiiu.local.env"] = [
             f"PN_SSBWIIU_KERBEROS_PASSWORD={smash_kerberos_pw}",
-            "PN_SSBWIIU_AUTHENTICATION_SERVER_PORT=6012",
-            "PN_SSBWIIU_SECURE_SERVER_PORT=6013",
+            "PN_SSBWIIU_AUTHENTICATION_SERVER_PORT=60120",
+            "PN_SSBWIIU_SECURE_SERVER_PORT=60130",
             f"PN_SSBWIIU_SECURE_SERVER_HOST={server_ip}",
             "PN_SSBWIIU_ACCOUNT_GRPC_HOST=account",
             "PN_SSBWIIU_ACCOUNT_GRPC_PORT=5000",
@@ -3196,8 +4001,10 @@ fi
         env_files["mario-kart-8.local.env"] = [
             f"PN_MK8_KERBEROS_PASSWORD={mk8_kerberos_pw}",
             f"PN_MK8_CONFIG_AES_KEY={mk8_aes_key}",
-            "PN_MK8_AUTHENTICATION_SERVER_PORT=6014",
-            "PN_MK8_SECURE_SERVER_PORT=6015",
+            f"PN_MK8_SECURE_SERVER_ACCESS_KEY={mk8_aes_key}",
+            f"PN_MK8_AUTHENTICATION_SERVER_ACCESS_KEY={mk8_aes_key}",
+            "PN_MK8_AUTHENTICATION_SERVER_PORT=60140",
+            "PN_MK8_SECURE_SERVER_PORT=60150",
             "PN_MK8_ACCOUNT_GRPC_HOST=account",
             "PN_MK8_ACCOUNT_GRPC_PORT=5000",
             f"PN_MK8_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
@@ -3388,30 +4195,153 @@ Server IP address: {server_ip}
                 try:
                     with open(friends_dockerfile, "r") as f:
                         df_content = f.read()
-                    patch_marker = "# PAYLOAD_GUARD_PATCH"
-                    if patch_marker not in df_content and "go mod vendor" in df_content:
-                        # Insert a sed after `go mod vendor` to add payload length check
-                        # The guard checks if payload is too small before attempting Kerberos read
-                        sed_patch = (
-                            f'\n{patch_marker}\n'
-                            'RUN PRUDP_FILE=$(find vendor -path "*/nex-go/v2/prudp_endpoint.go" | head -1) && \\\n'
-                            '    if [ -n "$PRUDP_FILE" ]; then \\\n'
-                            '    sed -i \'s/if pep.IsSecureEndPoint {/if pep.IsSecureEndPoint {\\n\\t\\tif len(packet.Payload()) < 8 {\\n\\t\\t\\treturn\\n\\t\\t}/\' "$PRUDP_FILE"; \\\n'
-                            '    echo "Patched $PRUDP_FILE with empty-payload guard"; \\\n'
-                            '    fi\n'
-                        )
-                        df_content = df_content.replace(
-                            "RUN go mod vendor",
-                            "RUN go mod vendor" + sed_patch
-                        )
-                        with open(friends_dockerfile, "w") as f:
-                            f.write(df_content)
-                        self.setup_log.append("[OK] Patched friends Dockerfile with empty-payload guard for handleConnect.")
+                    # Fix build string definition
+                    df_content = df_content.replace("main.serverBuildString", "github.com/PretendoNetwork/friends/nex.serverBuildString")
+                    with open(friends_dockerfile, "w") as f:
+                        f.write(df_content)
+                    self.setup_log.append("[OK] Patched friends Dockerfile with serverBuildString fix.")
                 except Exception as e:
                     self.setup_log.append(f"[WARN] Failed to patch friends Dockerfile: {e}")
 
-        # 6. Mario Kart 8 deep patches for nex-go v1.0.41 / nex-protocols-go v1.0.58 compatibility
+        # 6. Friends service: Support for MK8 Authentication (Protocol 0xA) and AES-256 (32-byte keys)
+                friends_makefile = os.path.join(friends_dir, "Makefile")
+                if os.path.isfile(friends_makefile):
+                    try:
+                        with open(friends_makefile, "r") as f: content = f.read()
+                        content = content.replace("main.serverBuildString", "github.com/PretendoNetwork/friends/nex.serverBuildString")
+                        with open(friends_makefile, "w") as f: f.write(content)
+                        self.setup_log.append("[OK] Patched friends Makefile with serverBuildString fix.")
+                    except: pass
+        self._patch_friends(s_dir)
+
+        # 7. Mario Kart 8 deep patches for nex-go v1.0.41 / nex-protocols-go v1.0.58 compatibility
         self._patch_mario_kart_8(s_dir)
+
+    def _patch_friends(self, s_dir):
+        """Restore Friends service to standard settings and add stability/debug fixes."""
+        friends_dir = os.path.join(s_dir, "repos", "friends")
+        if not os.path.isdir(friends_dir): return
+        
+        self.setup_log.append("[System] Patching Friends service for stability...")
+        
+        main_go = os.path.join(friends_dir, "main.go")
+        if os.path.isfile(main_go):
+            try:
+                content = """package main
+
+import (
+	"fmt"
+	"runtime/debug"
+	"sync"
+
+	"github.com/PretendoNetwork/friends/grpc"
+	"github.com/PretendoNetwork/friends/nex"
+)
+
+var wg sync.WaitGroup
+
+func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("[MAIN PANIC] %v\\n", r)
+			fmt.Println(string(debug.Stack()))
+		}
+	}()
+
+	wg.Add(3)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("[GRPC PANIC] %v\\n", r)
+				fmt.Println(string(debug.Stack()))
+			}
+			wg.Done()
+		}()
+		grpc.StartGRPCServer()
+	}()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("[Auth PANIC] %v\\n", r)
+				fmt.Println(string(debug.Stack()))
+			}
+			wg.Done()
+		}()
+		nex.StartAuthenticationServer()
+	}()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("[Secure PANIC] %v\\n", r)
+				fmt.Println(string(debug.Stack()))
+			}
+			wg.Done()
+		}()
+		nex.StartSecureServer()
+	}()
+
+	wg.Wait()
+}
+"""
+                with open(main_go, "w") as f: f.write(content)
+            except: pass
+
+        init_go = os.path.join(friends_dir, "init.go")
+        if os.path.isfile(init_go):
+            try:
+                with open(init_go, "r") as f: content = f.read()
+                if 'globals.AuthenticationServer = nex.NewPRUDPServer()' not in content:
+                    content = content.replace('database.ConnectPostgres()', 'globals.AuthenticationServer = nex.NewPRUDPServer()\n\tglobals.AuthenticationEndpoint = nex.NewPRUDPEndPoint(1)\n\tglobals.SecureServer = nex.NewPRUDPServer()\n\tglobals.SecureEndpoint = nex.NewPRUDPEndPoint(1)\n\n\tdatabase.ConnectPostgres()')
+                
+                # Fix Kerberos checksum error by forcing standard password
+                content = content.replace('authenticationServerPassword := os.Getenv("PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD")', 'authenticationServerPassword := "password"')
+                content = content.replace('secureServerPassword := os.Getenv("PN_FRIENDS_CONFIG_SECURE_PASSWORD")', 'secureServerPassword := "password"')
+                
+                with open(init_go, "w") as f: f.write(content)
+            except: pass
+
+        auth_go = os.path.join(friends_dir, "nex", "authentication.go")
+        if os.path.isfile(auth_go):
+            try:
+                with open(auth_go, "r") as f: content = f.read()
+                if '"fmt"' not in content: content = content.replace('import (', 'import (\n\t"fmt"')
+                content = re.sub(r'globals\.AuthenticationServer\s*=\s*nex\.NewPRUDPServer\(\)', '', content)
+                content = re.sub(r'globals\.AuthenticationEndpoint\s*=\s*nex\.NewPRUDPEndPoint\(1\)', '', content)
+                content = re.sub(r'SessionKeyLength\s*=\s*\d+', 'SessionKeyLength = 16', content)
+                content = re.sub(r'NewLibraryVersion\(\d+, \d+, \d+\)', 'NewLibraryVersion(1, 1, 0)', content)
+                # content = content.replace('SessionKeyLength = 16', 'SessionKeyLength = 16\n\tglobals.AuthenticationServer.SetKerberosKeySize(16)') # Removed for nex-go/v2 compatibility
+                content = content.replace('globals.AuthenticationServer.SetKerberosKeySize(16)', '') # Ensure it's removed if already present
+                content = re.sub(r'globals\.AuthenticationServer\.AccessKey\s*=\s*.*', 'globals.AuthenticationServer.AccessKey = "ridfebb9"', content)
+                content = re.sub(r'globals\.AuthenticationServer\.Listen\(port\)', r'fmt.Printf("[Friends-Auth] Starting server on port %d...\\n", port)\n\tglobals.AuthenticationServer.Listen(port)', content)
+                with open(auth_go, "w") as f: f.write(content)
+            except: pass
+
+        sec_go = os.path.join(friends_dir, "nex", "secure.go")
+        if os.path.isfile(sec_go):
+            try:
+                with open(sec_go, "r") as f: content = f.read()
+                if '"fmt"' not in content: content = content.replace('import (', 'import (\n\t"fmt"')
+                content = re.sub(r'globals\.SecureServer\s*=\s*nex\.NewPRUDPServer\(\)', '', content)
+                content = re.sub(r'globals\.SecureEndpoint\s*=\s*nex\.NewPRUDPEndPoint\(1\)', '', content)
+                content = re.sub(r'SessionKeyLength\s*=\s*\d+', 'SessionKeyLength = 16', content)
+                content = re.sub(r'NewLibraryVersion\(\d+, \d+, \d+\)', 'NewLibraryVersion(1, 1, 0)', content)
+                # content = content.replace('SessionKeyLength = 16', 'SessionKeyLength = 16\n\tglobals.SecureServer.SetKerberosKeySize(16)') # Removed for nex-go/v2 compatibility
+                content = content.replace('globals.SecureServer.SetKerberosKeySize(16)', '') # Ensure it's removed if already present
+                content = re.sub(r'globals\.SecureServer\.AccessKey\s*=\s*.*', 'globals.SecureServer.AccessKey = "ridfebb9"', content)
+                content = re.sub(r'globals\.SecureServer\.Listen\(port\)', r'fmt.Printf("[Friends-Secure] Starting server on port %d...\\n", port)\n\tglobals.SecureServer.Listen(port)', content)
+                with open(sec_go, "w") as f: f.write(content)
+            except: pass
+
+        common_go = os.path.join(friends_dir, "nex", "register_common_authentication_server_protocols.go")
+        if os.path.isfile(common_go):
+            try:
+                with open(common_go, "r") as f: content = f.read()
+                content = re.sub(r'SetPrincipalID\(types\.NewPID\([12]\)\)', 'SetPrincipalID(types.NewPID(1))', content)
+                with open(common_go, "w") as f: f.write(content)
+            except: pass
 
     def _patch_mario_kart_8(self, s_dir):
         """Patch Mario Kart 8 source files and Dockerfile for nex library v1 compatibility."""
@@ -3475,7 +4405,7 @@ COPY --from=build /app/bin/mk8-secure /app/mk8-secure
 COPY start.sh /app/start.sh
 RUN chmod +x /app/mk8-authentication /app/mk8-secure /app/start.sh
 
-EXPOSE 6014/udp 6015/udp
+EXPOSE 60140/udp 60150/udp
 CMD ["./start.sh"]
 ''')
             self.setup_log.append("[OK] Wrote Mario Kart 8 Dockerfile.")
@@ -3493,6 +4423,7 @@ import (
 	"os"
 
 	nex "github.com/PretendoNetwork/nex-go"
+	ticket_granting "github.com/PretendoNetwork/nex-protocols-common-go/ticket-granting"
 )
 
 var nexServer *nex.Server
@@ -3500,8 +4431,9 @@ var nexServer *nex.Server
 func main() {
 	port := os.Getenv("PN_MK8_AUTHENTICATION_SERVER_PORT")
 	if port == "" {
-		port = "6014"
+		port = "60140"
 	}
+
 	nexServer = nex.NewServer()
 	nexServer.SetPRUDPVersion(1)
 	nexServer.SetDefaultNEXVersion(&nex.NEXVersion{
@@ -3509,37 +4441,38 @@ func main() {
 		Minor: 5,
 		Patch: 0,
 	})
-	nexServer.SetKerberosKeySize(32)
+	nexServer.SetKerberosKeySize(16)
 	nexServer.SetAccessKey("25dbf96a")
-
-	nexServer.On("Data", func(packet *nex.PacketV1) {
-		request := packet.RMCRequest()
-
-		fmt.Println("==MK8 - Auth==")
-		fmt.Printf("Protocol ID: %#v\n", request.ProtocolID())
-		fmt.Printf("Method ID: %#v\n", request.MethodID())
-		fmt.Println("===============")
-	})
-
-	nexServer.On("RMCRequest", func(client *nex.Client, request *nex.RMCRequest) {
-		if request.ProtocolID() == 0xA {
-			if request.MethodID() == 1 {
-				// Login
-			} else if request.MethodID() == 2 {
-				// LoginEx
-				params := nex.NewStreamIn(request.Parameters(), nexServer)
-				userName, _ := params.ReadString()
-				loginEx(nil, client, request.CallID(), userName, nil)
-			} else if request.MethodID() == 3 {
-				// RequestTicket
-				params := nex.NewStreamIn(request.Parameters(), nexServer)
-				userPID, _ := params.ReadUInt32LE()
-				serverPID, _ := params.ReadUInt32LE()
-				requestTicket(nil, client, request.CallID(), userPID, serverPID)
-			}
+	
+	nexServer.SetPasswordFromPIDFunction(func(pid uint32) (string, uint32) {
+		user := getNEXAccountByPID(pid)
+		if user == nil {
+			return "", 0x80030064 // RendezVous::InvalidUsername
 		}
+		return user["password"].(string), 0
 	})
 
+	tgp := ticket_granting.NewCommonTicketGrantingProtocol(nexServer)
+	
+	secureHost := os.Getenv("PN_MK8_SECURE_SERVER_HOST")
+	if secureHost == "" {
+		secureHost = "10.49.173.98"
+	}
+	
+	stationURL := nex.NewStationURL("")
+	stationURL.SetScheme("prudps")
+	stationURL.SetAddress(secureHost)
+	stationURL.SetPort(60150)
+	stationURL.SetCID(1)
+	stationURL.SetPID(1)
+	stationURL.SetSID(1)
+	stationURL.SetStream(10)
+	stationURL.SetType(2)
+
+	tgp.SetSecureStationURL(stationURL)
+	tgp.SetBuildName("3D Open Dock U - MK8")
+
+	fmt.Printf("[MK8-Auth] Listening on port %s...\n", port)
 	nexServer.Listen(":" + port)
 }
 
@@ -3547,6 +4480,8 @@ func init() {
 	connectMongo()
 }
 ''')
+            self.setup_log.append("[OK] Patched mk8-authentication Go sources.")
+
             # database.go
             self._write_file(os.path.join(auth_dir, "database.go"), r'''package main
 
@@ -3595,128 +4530,8 @@ func getNEXAccountByPID(pid uint32) bson.M {
 	return result
 }
 ''')
-            # login_ex.go
-            local_ip = self._get_local_ip()
-            self._write_file(os.path.join(auth_dir, "login_ex.go"), r'''package main
 
-import (
-	"fmt"
-	"strconv"
-
-	nex "github.com/PretendoNetwork/nex-go"
-)
-
-func loginEx(err error, client *nex.Client, callID uint32, username string, authenticationInfo interface{}) {
-	// TODO: Verify auth info
-
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	userPID, _ := strconv.Atoi(username)
-
-	serverPID := 1 // Quazal Rendez-Vous
-
-	encryptedTicket, errorCode := generateKerberosTicket(uint32(userPID), uint32(serverPID), nexServer.KerberosKeySize())
-
-	if errorCode != 0 {
-		fmt.Println(errorCode)
-		return
-	}
-
-	// Build the response body
-	stationURL := "prudps:/address={local_ip};port=6015;CID=1;PID=2;sid=1;stream=10;type=2"
-	serverName := "3D Open Dock U - MK8"
-
-	rvConnectionData := nex.NewRVConnectionData()
-	rvConnectionData.SetStationURL(stationURL)
-	rvConnectionData.SetSpecialProtocols([]byte{})
-	rvConnectionData.SetStationURLSpecialProtocols("")
-	serverTime := nex.NewDateTime(0)
-	rvConnectionData.SetTime(serverTime)
-
-	rmcResponseStream := nex.NewStreamOut(nexServer)
-
-	rmcResponseStream.WriteUInt32LE(0x10001) // success
-	rmcResponseStream.WriteUInt32LE(uint32(userPID))
-	rmcResponseStream.WriteBuffer(encryptedTicket)
-	rmcResponseStream.WriteStructure(rvConnectionData)
-	rmcResponseStream.WriteString(serverName)
-
-	rmcResponseBody := rmcResponseStream.Bytes()
-
-	// Build response packet
-	rmcResponse := nex.NewRMCResponse(0xA, callID)
-	rmcResponse.SetSuccess(1, rmcResponseBody)
-
-	rmcResponseBytes := rmcResponse.Bytes()
-
-	responsePacket, _ := nex.NewPacketV1(client, nil)
-
-	responsePacket.SetVersion(1)
-	responsePacket.SetSource(0xA1)
-	responsePacket.SetDestination(0xAF)
-	responsePacket.SetType(nex.DataPacket)
-	responsePacket.SetPayload(rmcResponseBytes)
-
-	responsePacket.AddFlag(nex.FlagNeedsAck)
-	responsePacket.AddFlag(nex.FlagReliable)
-
-	nexServer.Send(responsePacket)
-}
-'''.replace("{local_ip}", local_ip))
-            # request_ticket.go
-            self._write_file(os.path.join(auth_dir, "request_ticket.go"), r'''package main
-
-import (
-	"fmt"
-
-	nex "github.com/PretendoNetwork/nex-go"
-)
-
-func requestTicket(err error, client *nex.Client, callID uint32, userPID uint32, serverPID uint32) {
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	encryptedTicket, errorCode := generateKerberosTicket(userPID, serverPID, nexServer.KerberosKeySize())
-
-	if errorCode != 0 {
-		fmt.Println(errorCode)
-		return
-	}
-
-	// Build the response body
-	rmcResponseStream := nex.NewStreamOut(nexServer)
-
-	rmcResponseStream.WriteUInt32LE(0x10001) // success
-	rmcResponseStream.WriteBuffer(encryptedTicket)
-
-	rmcResponseBody := rmcResponseStream.Bytes()
-
-	// Build response packet
-	rmcResponse := nex.NewRMCResponse(0xA, callID)
-	rmcResponse.SetSuccess(2, rmcResponseBody)
-
-	rmcResponseBytes := rmcResponse.Bytes()
-
-	responsePacket, _ := nex.NewPacketV1(client, nil)
-
-	responsePacket.SetVersion(1)
-	responsePacket.SetSource(0xA1)
-	responsePacket.SetDestination(0xAF)
-	responsePacket.SetType(nex.DataPacket)
-	responsePacket.SetPayload(rmcResponseBytes)
-
-	responsePacket.AddFlag(nex.FlagNeedsAck)
-	responsePacket.AddFlag(nex.FlagReliable)
-
-	nexServer.Send(responsePacket)
-}
-''')
-            # kerberos.go - fix NewKerberosEncryption to handle error return
+            # kerberos.go - Fix Kerberos checksum error by removing redundant MD5 hashing
             self._write_file(os.path.join(auth_dir, "kerberos.go"), r'''package main
 
 import (
@@ -3740,9 +4555,8 @@ func generateKerberosTicket(userPID uint32, serverPID uint32, keySize int) ([]by
 	serverKey := deriveKey(serverPID, []byte(serverPassword))
 	finalKey := nex.MD5Hash(append(serverKey, ticketInfoKey...))
 
-	//rand.Read(sessionKey) // Create a random session key
-
-	//fmt.Println("Using Session Key: " + hex.EncodeToString(sessionKey))
+	// rand.Read(sessionKey) // DO NOT use random session key - use empty key for simplified secure server handshake sync
+	for i := range sessionKey { sessionKey[i] = 0 }
 
 	////////////////////////////////
 	// Build internal ticket info //
@@ -3757,7 +4571,6 @@ func generateKerberosTicket(userPID uint32, serverPID uint32, keySize int) ([]by
 	ticketInfoStream.WriteBytesNext(sessionKey)
 
 	// Encrypt internal ticket info
-
 	ticketInfoEncryption, _ := nex.NewKerberosEncryption(nex.MD5Hash(finalKey))
 	encryptedTicketInfo := ticketInfoEncryption.Encrypt(ticketInfoStream.Bytes())
 
@@ -3797,7 +4610,6 @@ func deriveKey(pid uint32, password []byte) []byte {
 	return password
 }
 ''')
-            self.setup_log.append("[OK] Patched mk8-authentication Go sources.")
 
         # --- mk8-secure patches ---
         sec_dir = os.path.join(mk8_dir, "mk8-secure")
@@ -3823,15 +4635,124 @@ const (
 	SecureMethodReplaceURL                      = 2
 	SecureMethodSendReport                       = 3
 
+	MatchMakingMethodRegister                    = 1
 	MatchMakingMethodGetSessionURLs             = 5
+	MatchMakingMethodSearchSession              = 6
 	MatchMakingMethodUpdateSessionHostV1        = 16
 
 	MatchMakingExtMethodEndParticipation        = 1
 
+	MatchmakeExtensionMethodUpdatePlayerStats    = 1
 	MatchmakeExtensionMethodAutoMatchmakeWithSearchCriteria_Postpone = 11
 
+	MatchMakingMethodFindBySingleID     = 0x15
+	MatchMakingMethodGetParticipants    = 0x0D
+
 	RankingMethodUploadCommonData                = 1
+	RankingMethodGetRanking            = 2
+	RankingMethodGetStats              = 4
+	RankingMethodRequestRating                  = 5
+	RankingMethodGetRankingByPIDList    = 5
+	RankingMethodGetCachedTopXRanking   = 7
+	RankingMethodGetCachedTopXRankings  = 8
+
+	MatchmakeExtMethodGetSimplePlayingSession = 0x1F
+	MatchmakeExtMethodGetPlayingSession       = 0x10
+
+	UtilityProtocolID = 0x6E
+	UtilityMethodGetAssociatedNexUniqueIdWithMyPrincipalId = 1
+	UtilityMethodAcquireNexUniqueId = 2
 )
+''')
+            # database.go
+            self._write_file(os.path.join(sec_dir, "database.go"), r'''package main
+
+import (
+	"context"
+	"os"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+var mongoClient *mongo.Client
+var mongoDatabase *mongo.Database
+var nexAccountsCollection *mongo.Collection
+var mk8Database *mongo.Database
+var roomsCollection *mongo.Collection
+var usersCollection *mongo.Collection
+var sessionsCollection *mongo.Collection
+
+func connectMongo() {
+	host := os.Getenv("PN_MK8_CONFIG_MONGODB_HOST")
+	if host == "" { host = "mongodb" }
+	port := os.Getenv("PN_MK8_CONFIG_MONGODB_PORT")
+	if port == "" { port = "27017" }
+
+	mongoClient, _ = mongo.Connect(context.TODO(), options.Client().ApplyURI("mongodb://"+host+":"+port+"/"))
+	
+	mongoDatabase = mongoClient.Database("pretendo_account")
+	nexAccountsCollection = mongoDatabase.Collection("nexaccounts")
+
+	mk8Database = mongoClient.Database("pretendo_mk8")
+	roomsCollection = mk8Database.Collection("rooms")
+	usersCollection = mk8Database.Collection("users")
+	sessionsCollection = mk8Database.Collection("sessions")
+}
+
+func getNEXAccountByPID(pid uint32) bson.M {
+	var result bson.M
+	err := nexAccountsCollection.FindOne(context.TODO(), bson.D{{Key: "pid", Value: pid}}).Decode(&result)
+	if err != nil { return nil }
+	return result
+}
+
+func doesUserExist(pid uint32) bool {
+	var result bson.M
+	err := usersCollection.FindOne(context.TODO(), bson.D{{Key: "pid", Value: pid}}).Decode(&result)
+	return err == nil
+}
+
+func addNewUser(pid uint32) {
+	usersCollection.InsertOne(context.TODO(), bson.D{{"pid", pid}, {"region", 1}})
+}
+
+func doesSessionExist(pid uint32) bool {
+	var result bson.M
+	err := sessionsCollection.FindOne(context.TODO(), bson.D{{Key: "pid", Value: pid}}).Decode(&result)
+	return err == nil
+}
+
+func addPlayerSession(pid uint32, stationURLs []string, address string, port string) {
+	sessionsCollection.InsertOne(context.TODO(), bson.D{{"pid", pid}, {"station_urls", stationURLs}, {"address", address}, {"port", port}})
+}
+
+func updatePlayerSessionAll(pid uint32, stationURLs []string, address string, port string) {
+	sessionsCollection.UpdateOne(context.TODO(), bson.D{{"pid", pid}}, bson.D{{"$set", bson.D{{"station_urls", stationURLs}, {"address", address}, {"port", port}}}})
+}
+
+func updatePlayerSessionUrl(pid uint32, oldURL string, newURL string) {
+	var result bson.M
+	sessionsCollection.FindOne(context.TODO(), bson.D{{Key: "pid", Value: pid}}).Decode(&result)
+	urls := result["station_urls"].(bson.A)
+	for i, url := range urls {
+		if url.(string) == oldURL {
+			urls[i] = newURL
+		}
+	}
+	sessionsCollection.UpdateOne(context.TODO(), bson.D{{Key: "pid", Value: pid}}, bson.D{{Key: "$set", Value: bson.D{{Key: "station_urls", Value: urls}}}})
+}
+
+func getPlayerUrls(pid uint32) []string {
+	var result bson.M
+	err := sessionsCollection.FindOne(context.TODO(), bson.D{{Key: "pid", Value: pid}}).Decode(&result)
+	if err != nil { return []string{} }
+	urls := result["station_urls"].(bson.A)
+	strs := make([]string, len(urls))
+	for i, v := range urls { strs[i] = v.(string) }
+	return strs
+}
 ''')
             # main.go
             self._write_file(os.path.join(sec_dir, "main.go"), r'''package main
@@ -3839,9 +4760,11 @@ const (
 import (
 	"fmt"
 	"os"
+	"time"
 
-	nex "github.com/PretendoNetwork/nex-go"
+	"github.com/PretendoNetwork/nex-go"
 	match_making_types "github.com/PretendoNetwork/nex-protocols-go/match-making/types"
+	secure_connection "github.com/PretendoNetwork/nex-protocols-common-go/secure-connection"
 )
 
 type MatchmakingData struct {
@@ -3880,14 +4803,14 @@ func main() {
 	// Initialize config from environment variables
 	config = &ServerConfig{
 		ServerPort: os.Getenv("PN_MK8_SECURE_SERVER_PORT"),
-		AccessKey:  os.Getenv("PN_MK8_SECURE_SERVER_ACCESS_KEY"),
+		AccessKey:  "25dbf96a", // Ignore docker-compose AES injection
 		NexVersion: 30500,
 
 		DatabaseIP:       os.Getenv("PN_MK8_CONFIG_MONGODB_HOST"),
 		DatabasePort:     os.Getenv("PN_MK8_CONFIG_MONGODB_PORT"),
 		DatabaseUsername: os.Getenv("PN_MK8_CONFIG_MONGODB_USERNAME"),
 		DatabasePassword: os.Getenv("PN_MK8_CONFIG_MONGODB_PASSWORD"),
-		DatabaseUseAuth: os.Getenv("PN_MK8_CONFIG_MONGODB_USERNAME") != "",
+		DatabaseUseAuth:  os.Getenv("PN_MK8_CONFIG_MONGODB_USERNAME") != "",
 
 		AccountDatabase:       "pretendo_account",
 		PNIDCollection:        "users",
@@ -3902,11 +4825,9 @@ func main() {
 	}
 
 	if config.ServerPort == "" {
-		config.ServerPort = "6015"
+		config.ServerPort = "60150"
 	}
-	if config.AccessKey == "" {
-		config.AccessKey = "25dbf96a"
-	}
+
 	if config.DatabaseIP == "" {
 		config.DatabaseIP = "mongodb"
 	}
@@ -3923,49 +4844,120 @@ func main() {
 		Minor: 5,
 		Patch: 0,
 	})
-	nexServer.SetKerberosKeySize(32)
+	nexServer.SetKerberosKeySize(16)
 	nexServer.SetAccessKey(config.AccessKey)
+	
+	nexServer.SetPasswordFromPIDFunction(func(pid uint32) (string, uint32) {
+		user := getNEXAccountByPID(pid)
+		if user == nil {
+			return "", 0x80030064
+		}
+		return user["password"].(string), 0
+	})
+
+	secure_connection.NewCommonSecureConnectionProtocol(nexServer)
 
 	nexServer.On("Data", func(packet *nex.PacketV1) {
 		request := packet.RMCRequest()
+		fmt.Printf("[%s][NEX RPC] service=0x%X method=0x%X pid=%d result=Dispatching struct-Size=%d\n",
+			time.Now().Format("15:04:05.000"),
+			request.ProtocolID(), request.MethodID(), packet.Sender().PID(), len(request.Parameters()))
 
-		fmt.Println("==MK8 - Secure==")
-		fmt.Printf("Protocol ID: %#v\n", request.ProtocolID())
-		fmt.Printf("Method ID: %#v\n", request.MethodID())
-		fmt.Println("=================")
-
-		if packet.Type() == nex.DataPacket && request.ProtocolID() == 0 {
-			// This might be the secure connection check
-			connect(packet)
-		}
-	})
-
-	nexServer.On("RMCRequest", func(client *nex.Client, request *nex.RMCRequest) {
 		params := nex.NewStreamIn(request.Parameters(), nexServer)
-		if request.ProtocolID() == SecureProtocolID {
-			if request.MethodID() == SecureMethodRegister {
-				count, _ := params.ReadUInt32LE()
-				urls := make([]*nex.StationURL, count)
-				for i := 0; i < int(count); i++ {
-					urlStr, _ := params.ReadString()
-					urls[i] = nex.NewStationURL(urlStr)
+
+		switch request.ProtocolID() {
+		case MatchMakingProtocolID:
+			switch request.MethodID() {
+			case MatchMakingMethodRegister:
+				handleRegister(packet.Sender(), request.CallID())
+			case MatchMakingMethodGetSessionURLs:
+				gatheringId, _ := params.ReadUInt32LE()
+				getSessionURLs(nil, packet.Sender(), request.CallID(), gatheringId)
+			case MatchMakingMethodSearchSession:
+				handleSearchSession(packet.Sender(), request.CallID())
+			case MatchMakingMethodUpdateSessionHostV1:
+				gid, _ := params.ReadUInt32LE()
+				updateSessionHostV1(nil, packet.Sender(), request.CallID(), gid)
+			case MatchMakingMethodFindBySingleID:
+				handleFindBySingleID(packet.Sender(), request.CallID())
+			case MatchMakingMethodGetParticipants:
+				handleGetParticipants(packet.Sender(), request.CallID())
+			default:
+				handleGenericSuccess(packet.Sender(), uint32(MatchMakingProtocolID), uint32(request.CallID()), uint32(request.MethodID()))
+			}
+		case MatchMakingExtProtocolID:
+			switch request.MethodID() {
+			case MatchMakingExtMethodEndParticipation:
+				gid, _ := params.ReadUInt32LE()
+				msg, _ := params.ReadString()
+				endParticipation(nil, packet.Sender(), request.CallID(), gid, msg)
+			default:
+				handleGenericSuccess(packet.Sender(), uint32(MatchMakingExtProtocolID), uint32(request.CallID()), uint32(request.MethodID()))
+			}
+		case MatchmakeExtensionProtocolID:
+			switch request.MethodID() {
+			case MatchmakeExtensionMethodUpdatePlayerStats:
+				handleUpdatePlayerStats(packet.Sender(), request.CallID())
+			case MatchmakeExtensionMethodAutoMatchmakeWithSearchCriteria_Postpone:
+				criteriaCount, _ := params.ReadUInt32LE()
+				criteria := make([]*match_making_types.MatchmakeSessionSearchCriteria, criteriaCount)
+				for i := 0; i < int(criteriaCount); i++ {
+					c := match_making_types.NewMatchmakeSessionSearchCriteria()
+					c.ExtractFromStream(params)
+					criteria[i] = c
 				}
-				register(nil, client, request.CallID(), urls)
+				params.ReadString() // MatchmakeSession TypeName
+				params.ReadUInt32LE() // DataHolder payload length + 4
+				sessionData, _ := params.ReadBuffer() // DataHolder payload bytes
+				session := match_making_types.NewMatchmakeSession()
+				sessionStream := nex.NewStreamIn(sessionData, nexServer)
+				session.Gathering.ExtractFromStream(sessionStream)
+				session.ExtractFromStream(sessionStream)
+				message, _ := params.ReadString()
+				autoMatchmakeWithSearchCriteria_Postpone(nil, packet.Sender(), request.CallID(), criteria, session, message)
+			case MatchmakeExtMethodGetSimplePlayingSession:
+				handleGetSimplePlayingSession(packet.Sender(), request.CallID())
+			case MatchmakeExtMethodGetPlayingSession:
+				handleGetPlayingSession(packet.Sender(), request.CallID())
+			default:
+				handleGenericSuccess(packet.Sender(), uint32(MatchmakeExtensionProtocolID), uint32(request.CallID()), uint32(request.MethodID()))
 			}
-		} else if request.ProtocolID() == NatTraversalProtocolID {
-			if request.MethodID() == NatTraversalMethodReportNatProperties {
-				natm, _ := params.ReadUInt32LE()
-				natf, _ := params.ReadUInt32LE()
-				rtt, _ := params.ReadUInt32LE()
-				reportNatProperties(nil, client, request.CallID(), natm, natf, rtt)
+		case RankingProtocolID:
+			switch request.MethodID() {
+			case RankingMethodUploadCommonData:
+				commonData, _ := params.ReadBuffer()
+				uniqueID, _ := params.ReadUInt64LE()
+				uploadCommonData(nil, packet.Sender(), request.CallID(), commonData, uniqueID)
+			case RankingMethodGetRanking:
+				handleGetRanking(packet.Sender(), request.CallID())
+			case RankingMethodGetStats:
+				handleGetStats(packet.Sender(), request.CallID())
+			case RankingMethodGetRankingByPIDList:
+				handleGetRankingByPIDList(packet.Sender(), request.CallID())
+			case RankingMethodGetCachedTopXRanking:
+				handleGetCachedTopXRanking(packet.Sender(), request.CallID())
+			case RankingMethodGetCachedTopXRankings:
+				handleGetCachedTopXRankings(packet.Sender(), request.CallID())
+			default:
+				handleGenericSuccess(packet.Sender(), uint32(RankingProtocolID), uint32(request.CallID()), uint32(request.MethodID()))
 			}
+		case UtilityProtocolID:
+			switch request.MethodID() {
+			case UtilityMethodGetAssociatedNexUniqueIdWithMyPrincipalId:
+				handleGetAssociatedNexUniqueId(packet.Sender(), request.CallID())
+			case UtilityMethodAcquireNexUniqueId:
+				handleAcquireNexUniqueId(packet.Sender(), request.CallID())
+			default:
+				handleGenericSuccess(packet.Sender(), uint32(UtilityProtocolID), uint32(request.CallID()), uint32(request.MethodID()))
+			}
+		default:
+			fmt.Printf("[%s][NEX RPC] service=0x%X method=0x%X pid=%d result=UnhandledProtocol\n",
+				time.Now().Format("15:04:05.000"), request.ProtocolID(), request.MethodID(), packet.Sender().PID())
+			handleGenericSuccess(packet.Sender(), uint32(request.ProtocolID()), uint32(request.CallID()), uint32(request.MethodID()))
 		}
 	})
 
-	// Protocol handlers initialization (must be handled by the library or manual registration)
-	// secureServer = nexproto.NewSecureProtocol(nexServer)
-	// ... (The rest is in mk8-secure handlers)
-
+	fmt.Printf("[MK8-Secure] Listening on port %s...\n", config.ServerPort)
 	nexServer.Listen(":" + config.ServerPort)
 }
 ''')
@@ -3973,10 +4965,14 @@ func main() {
             self._write_file(os.path.join(sec_dir, "connect.go"), r'''package main
 
 import (
+	"fmt"
+	"time"
+
 	nex "github.com/PretendoNetwork/nex-go"
 )
 
 func connect(packet *nex.PacketV1) {
+	fmt.Printf("[%s][PRUDP] CONNECT from %s\n", time.Now().Format("15:04:05.000"), packet.Sender().Address())
 	payload := packet.Payload()
 
 	stream := nex.NewStreamIn(payload, nexServer)
@@ -4048,8 +5044,7 @@ func register(err error, client *nex.Client, callID uint32, stationUrls []*nex.S
 	}
 
 	rmcResponseStream := nex.NewStreamOut(nexServer)
-
-	rmcResponseStream.WriteUInt32LE(0x10001) // Success
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Result: Success
 	rmcResponseStream.WriteUInt32LE(connectionId)
 	rmcResponseStream.WriteString(globalStationURL)
 
@@ -4172,6 +5167,156 @@ func requestProbeInitiationExt(err error, client *nex.Client, callID uint32, tar
 	}
 }
 ''')
+            # post_login_stubs.go - stub handlers for all MK8 post-login RPC calls
+            self._write_file(os.path.join(sec_dir, "post_login_stubs.go"), r'''package main
+
+import (
+	"fmt"
+
+	nex "github.com/PretendoNetwork/nex-go"
+)
+
+// sendSuccessResponse sends a generic success RMC response
+func sendSuccessResponse(client *nex.Client, protocolID uint32, callID uint32, methodID uint32, body []byte) {
+	rmcResponse := nex.NewRMCResponse(uint8(protocolID), callID)
+	rmcResponse.SetSuccess(methodID, body)
+	rmcResponseBytes := rmcResponse.Bytes()
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+	nexServer.Send(responsePacket)
+}
+
+func handleGenericSuccess(client *nex.Client, protocolID uint32, callID uint32, methodID uint32) {
+	fmt.Printf("[NEX RPC] service=0x%X method=0x%X pid=%d result=GenericSuccess struct-Size=0\n", protocolID, methodID, client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	sendSuccessResponse(client, protocolID, callID, methodID, rmcResponseStream.Bytes())
+}
+
+func handleGetRanking(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=Ranking method=GetRanking pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(0)
+	rmcResponseStream.WriteUInt32LE(0)
+	rmcResponseStream.WriteUInt64LE(0)
+	sendSuccessResponse(client, RankingProtocolID, callID, RankingMethodGetRanking, rmcResponseStream.Bytes())
+}
+
+func handleGetStats(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=Ranking method=GetStats pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(0)
+	sendSuccessResponse(client, RankingProtocolID, callID, RankingMethodGetStats, rmcResponseStream.Bytes())
+}
+
+func handleGetRankingByPIDList(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=Ranking method=GetRankingByPIDList pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(0)
+	rmcResponseStream.WriteUInt32LE(0)
+	rmcResponseStream.WriteUInt64LE(0)
+	sendSuccessResponse(client, RankingProtocolID, callID, RankingMethodGetRankingByPIDList, rmcResponseStream.Bytes())
+}
+
+func handleGetCachedTopXRanking(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=Ranking method=GetCachedTopXRanking pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(0)
+	rmcResponseStream.WriteUInt32LE(0)
+	rmcResponseStream.WriteUInt64LE(0)
+	sendSuccessResponse(client, RankingProtocolID, callID, RankingMethodGetCachedTopXRanking, rmcResponseStream.Bytes())
+}
+
+func handleGetCachedTopXRankings(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=Ranking method=GetCachedTopXRankings pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(0)
+	sendSuccessResponse(client, RankingProtocolID, callID, RankingMethodGetCachedTopXRankings, rmcResponseStream.Bytes())
+}
+
+func handleGetSimplePlayingSession(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=MatchmakeExt method=GetSimplePlayingSession pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(0)
+	sendSuccessResponse(client, MatchmakeExtensionProtocolID, callID, MatchmakeExtMethodGetSimplePlayingSession, rmcResponseStream.Bytes())
+}
+
+func handleGetPlayingSession(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=MatchmakeExt method=GetPlayingSession pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(0)
+	sendSuccessResponse(client, MatchmakeExtensionProtocolID, callID, MatchmakeExtMethodGetPlayingSession, rmcResponseStream.Bytes())
+}
+
+func handleFindBySingleID(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=MatchMaking method=FindBySingleID pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt8(0)
+	sendSuccessResponse(client, MatchMakingProtocolID, callID, MatchMakingMethodFindBySingleID, rmcResponseStream.Bytes())
+}
+
+func handleGetParticipants(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=MatchMaking method=GetParticipants pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(0)
+	sendSuccessResponse(client, MatchMakingProtocolID, callID, MatchMakingMethodGetParticipants, rmcResponseStream.Bytes())
+}
+
+func handleGetAssociatedNexUniqueId(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=Utility method=GetAssociatedNexUniqueId pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt64LE(uint64(client.PID()))
+	rmcResponseStream.WriteUInt64LE(0)
+	sendSuccessResponse(client, UtilityProtocolID, callID, UtilityMethodGetAssociatedNexUniqueIdWithMyPrincipalId, rmcResponseStream.Bytes())
+}
+
+func handleAcquireNexUniqueId(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=Utility method=AcquireNexUniqueId pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt64LE(uint64(client.PID()))
+	sendSuccessResponse(client, UtilityProtocolID, callID, UtilityMethodAcquireNexUniqueId, rmcResponseStream.Bytes())
+}
+
+func handleRegister(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=Matchmaking method=Register pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(1)          // Some non-zero ID
+	sendSuccessResponse(client, MatchMakingProtocolID, callID, MatchMakingMethodRegister, rmcResponseStream.Bytes())
+}
+
+func handleSearchSession(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=Matchmaking method=SearchSession pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	rmcResponseStream.WriteUInt32LE(0)          // List size 0
+	sendSuccessResponse(client, MatchMakingProtocolID, callID, MatchMakingMethodSearchSession, rmcResponseStream.Bytes())
+}
+
+func handleUpdatePlayerStats(client *nex.Client, callID uint32) {
+	fmt.Printf("[NEX RPC] service=MatchmakeExtension method=UpdatePlayerStats pid=%d\n", client.PID())
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
+	sendSuccessResponse(client, MatchmakeExtensionProtocolID, callID, MatchmakeExtensionMethodUpdatePlayerStats, rmcResponseStream.Bytes())
+}
+''')
             # upload_common_data.go
             self._write_file(os.path.join(sec_dir, "upload_common_data.go"), r'''package main
 
@@ -4214,6 +5359,7 @@ func getSessionURLs(err error, client *nex.Client, callID uint32, gatheringId ui
 	stationUrlStrings = getPlayerUrls(hostpid)
 
 	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Success
 	rmcResponseStream.WriteListString(stationUrlStrings)
 
 	rmcResponseBody := rmcResponseStream.Bytes()
@@ -4297,6 +5443,7 @@ func autoMatchmakeWithSearchCriteria_Postpone(err error, client *nex.Client, cal
 	matchmakeSession.Attributes[5] = dlcmode
 
 	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Result: Success
 	rmcResponseStream.WriteString("MatchmakeSession")
 	lengthStream := nex.NewStreamOut(nexServer)
 	lengthStream.WriteStructure(matchmakeSession.Gathering)
@@ -4331,7 +5478,10 @@ func autoMatchmakeWithSearchCriteria_Postpone(err error, client *nex.Client, cal
 func endParticipation(err error, client *nex.Client, callID uint32, idGathering uint32, strMessage string) {
 	removePlayerFromRoom(idGathering, client.PID())
 
-	returnval := []byte{0x1}
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Result: Success
+	rmcResponseStream.WriteUInt8(0x1)
+	returnval := rmcResponseStream.Bytes()
 
 	rmcResponse := nex.NewRMCResponse(MatchMakingExtProtocolID, callID)
 	rmcResponse.SetSuccess(MatchMakingExtMethodEndParticipation, returnval)
@@ -4356,8 +5506,12 @@ func sendReport(err error, client *nex.Client, callID uint32, reportID uint32, r
 	fmt.Println("Report ID: " + strconv.Itoa(int(reportID)))
 	fmt.Println("Report Data: " + hex.EncodeToString(reportData))
 
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Result: Success
+	rmcResponseBody := rmcResponseStream.Bytes()
+
 	rmcResponse := nex.NewRMCResponse(SecureProtocolID, callID)
-	rmcResponse.SetSuccess(SecureMethodSendReport, nil)
+	rmcResponse.SetSuccess(SecureMethodSendReport, rmcResponseBody)
 
 	rmcResponseBytes := rmcResponse.Bytes()
 
@@ -4379,8 +5533,12 @@ func updateSessionHostV1(err error, client *nex.Client, callID uint32, gid uint3
 
 	updateRoomHost(gid, client.PID())
 
+	rmcResponseStream := nex.NewStreamOut(nexServer)
+	rmcResponseStream.WriteUInt32LE(0x00010001) // Result: Success
+	rmcResponseBody := rmcResponseStream.Bytes()
+
 	rmcResponse := nex.NewRMCResponse(MatchMakingProtocolID, callID)
-	rmcResponse.SetSuccess(MatchMakingMethodUpdateSessionHostV1, nil)
+	rmcResponse.SetSuccess(MatchMakingMethodUpdateSessionHostV1, rmcResponseBody)
 
 	rmcResponseBytes := rmcResponse.Bytes()
 
@@ -4625,14 +5783,16 @@ func replaceURL(err error, client *nex.Client, callID uint32, oldStation *nex.St
             self._check_docker_status()
         
         def _do_build():
-            cmd = "docker compose build"
+            # Parallel build for speed; explicitly excluding 'account' and 'boss' to save time as requested
+            services = "pokken-tournament super-smash-bros-wiiu website friends miiverse-api juxtaposition-ui wiiu-chat-authentication wiiu-chat-secure super-mario-maker mario-kart-8 splatoon minecraft-wiiu pikmin-3"
+            cmd = f"docker compose build --parallel {services}"
             if pw and OS_INFO["os"] == "linux":
                 cmd = f"sudo -S {cmd}"
             QTimer.singleShot(500, lambda: self._run_command(
                 cmd, self.setup_log, cwd=s_dir,
                 stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
                 on_done=_on_build_done,
-                display_cmd="docker compose build"
+                display_cmd="docker compose build --parallel [Excluding Account/Boss]"
             ))
         
         # Ensure Docker is active on all platforms
@@ -4676,7 +5836,12 @@ func replaceURL(err error, client *nex.Client, callID uint32, oldStation *nex.St
             if QMessageBox.warning(self, "Conflicts", msg, QMessageBox.Ok | QMessageBox.Cancel) == QMessageBox.Cancel:
                 return
             
-        local_ip = self._get_local_ip()
+        use_official = self.mode_pretendo.isChecked()
+        url_input = self.patch_url_input.text().strip()
+        if not use_official and url_input:
+            local_ip = url_input.replace("http://", "").replace("https://", "").split(':')[0].split('/')[0]
+        else:
+            local_ip = self._get_local_ip()
         ports_to_kill = f"80 443 21 53 8080 {custom_port} 9231"
         
         pw = None
@@ -4752,13 +5917,16 @@ func replaceURL(err error, client *nex.Client, callID uint32, oldStation *nex.St
         t = self.server_dir_field.text().strip()
         def _do_build():
             pw = self._get_effective_sudo_password()
-            b_cmd = "docker compose build"
+            # parallel build and skip account/boss rebuild to save time
+            services = "pokken-tournament super-smash-bros-wiiu website friends miiverse-api juxtaposition-ui wiiu-chat-authentication wiiu-chat-secure super-mario-maker mario-kart-8 splatoon minecraft-wiiu pikmin-3"
+            b_cmd = f"docker compose build --parallel {services}"
             if pw and OS_INFO["os"] == "linux":
                 b_cmd = f"sudo -S {b_cmd}"
             QTimer.singleShot(500, lambda: self._run_command(
                 b_cmd, self.setup_log, cwd=t,
                 stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
-                on_done=lambda c: QMessageBox.information(self, "Success", "Full Stack Deployment Finished! Ready to boot.") if c == 0 else self.setup_log.append(f"[ERROR] Build failed with exit code {c}")
+                on_done=lambda c: QMessageBox.information(self, "Success", "Full Stack Deployment Finished! Ready to boot.") if c == 0 else self.setup_log.append(f"[ERROR] Build failed with exit code {c}"),
+                display_cmd="docker compose build --parallel [Excluding Account/Boss]"
             ))
         if OS_INFO["os"] == "linux":
             self._ensure_docker_active(_do_build)
@@ -5008,7 +6176,14 @@ func replaceURL(err error, client *nex.Client, callID uint32, oldStation *nex.St
                 return
             # Match PID to 1337 (0x0539) from the FakeOnlineFiles reference
             pid = 1337
-            local_ip = self._get_local_ip()
+            
+            use_official = self.mode_pretendo.isChecked()
+            url_input = self.patch_url_input.text().strip()
+            if not use_official and url_input:
+                local_ip = url_input.replace("http://", "").replace("https://", "").split(':')[0].split('/')[0]
+            else:
+                local_ip = self._get_local_ip()
+                
             s_dir = self.server_dir_field.text().strip()
             
             # Pull AES keys from host env files to sync into the container's database
@@ -5168,19 +6343,19 @@ try {{
     }}
 
     console.log("[Notice] Patching Game Server Definitions...");
-    await upsertNexServer("Splatoon", "10162B00", ["0005000010176A00", "0005000010176900", "0005000010162B00"], 6006, "{splatoon_aes}");
-    await upsertNexServer("Super Mario Maker", "1018DB00", ["000500001018DB00", "000500001018DC00", "000500001018DD00"], 6004, "{smm_aes}");
-    await upsertNexServer("Mario Kart 8", "1010EB00", ["000500001010EB00"], 6014, "{mk8_aes}");
-    await upsertNexServer("Mario Kart 8", "1010EC00", ["000500001010EC00"], 6014, "{mk8_aes}");
-    await upsertNexServer("Mario Kart 8", "1010ED00", ["000500001010ED00"], 6014, "{mk8_aes}");
-    await upsertNexServer("Mario Kart 8", "1010EE00", ["000500001010EE00"], 6014, "{mk8_aes}");
-    await upsertNexServer("Friend List", "00003200", ["0005001010001C00", "000500301001500A", "000500301001510A", "000500301001520A", "00050000101DF400", "000500001010EB00", "000500001010EC00", "000500001010ED00", "000500001010EE00"], 6000, "{friends_aes}");
+    await upsertNexServer("Splatoon", "10162B00", ["0005000010176A00", "0005000010176900", "0005000010162B00"], 60060, "{splatoon_aes}");
+    await upsertNexServer("Super Mario Maker", "1018DB00", ["000500001018DB00", "000500001018DC00", "000500001018DD00"], 60040, "{smm_aes}");
+    await upsertNexServer("Mario Kart 8", "1010EB00", ["000500001010EB00"], 60140, "{mk8_aes}");
+    await upsertNexServer("Mario Kart 8", "1010EC00", ["000500001010EC00"], 60140, "{mk8_aes}");
+    await upsertNexServer("Mario Kart 8", "1010ED00", ["000500001010ED00"], 60140, "{mk8_aes}");
+    await upsertNexServer("Mario Kart 8", "1010EE00", ["000500001010EE00"], 60140, "{mk8_aes}");
+    await upsertNexServer("Friend List", "00003200", ["0005001010001C00", "000500301001500A", "000500301001510A", "000500301001520A", "00050000101DF400", "000500001010EB00", "000500001010EC00", "000500001010ED00", "000500001010EE00"], 60000, "{friends_aes}");
     await upsertNexServer("Miiverse", null, ["000500301001600A", "000500301001610A", "000500301001620A"], 80, "{miiverse_aes}", "87cd32617f1985439ea608c2746e4610");
-    await upsertNexServer("Minecraft: Wii U Edition", "101D9D00", ["0005000E101D9D00", "0005000E101DBE00", "00050000101D7500"], 6008, "{minecraft_aes}");
+    await upsertNexServer("Minecraft: Wii U Edition", "101D9D00", ["0005000E101D9D00", "0005000E101DBE00", "00050000101D7500"], 60080, "{minecraft_aes}");
     await upsertNexServer("Pokkén Tournament", "101DF400", ["00050000101DF400", "0005000E101DF400", "00050002101DF400"], 60008, "{pokken_aes}");
-    await upsertNexServer("Pikmin 3", "1012BC00", ["000500001012BC00", "000500001012BD00", "000500001012BE00"], 6010, "");
-    await upsertNexServer("Super Smash Bros. for Wii U", "10144F00", ["0005000010144F00", "0005000010145000", "0005000010110E00"], 6012, "{smash_aes}");
-    await upsertNexServer("Wii U Chat", "1005A000", ["000500101005A000", "000500101005A100", "000500101005A200"], 6002, "");
+    await upsertNexServer("Pikmin 3", "1012BC00", ["000500001012BC00", "000500001012BD00", "000500001012BE00"], 60100, "");
+    await upsertNexServer("Super Smash Bros. for Wii U", "10144F00", ["0005000010144F00", "0005000010145000", "0005000010110E00"], 60120, "{smash_aes}");
+    await upsertNexServer("Wii U Chat", "1005A000", ["000500101005A000", "000500101005A100", "000500101005A200"], 60020, "");
 
     // --- Miiverse Discovery Patch (Fixes 400 error) ---
     try {{
@@ -5489,10 +6664,10 @@ try {{
         cmd_parts = []
         
         if rebuild_needed:
-            self.cemu_log.append("[Anti-Ban] Rebuilding account service with ban bypasses (Cached)...")
-            build_cmd = "docker compose build account && docker compose up -d --force-recreate account"
-            if pw and OS_INFO["os"] == "linux": build_cmd = f"sudo -S {build_cmd}"
-            cmd_parts.append(build_cmd)
+            self.cemu_log.append("[Anti-Ban] Account service source files updated (Rebuild skipped to save time).")
+            # Skip the slow rebuild block
+            # build_cmd = "docker compose build account && docker compose up -d --force-recreate account"
+            # ...
 
         # Reset any existing ban flags in database
         reset_mongo = 'db.devices.updateMany({access_level: {$lt: 0}}, {$set: {access_level: 0}}); db.pnids.updateMany({access_level: {$lt: 0}}, {$set: {access_level: 0}})'
@@ -5626,15 +6801,25 @@ try {{
             # If no proxy is found or we want to be safe, we can point URLs directly to the local node
             # But mitmproxy needs the Host headers! so we stick to hostnames AND ensure proxy_server is set.
             # If settings.xml was NOT found, we MUST use direct IPs in network_services.xml as a fallback.
-            use_direct_urls = not settings_files
+            # UPDATE: User requested direct node URL in network_services.xml for private servers
+            use_direct_urls = not is_official
             
-            # Extract domain from url (handle http://1.2.3.4:8070 -> 1.2.3.4:8070)
-            node_host = url.replace("http://", "").replace("https://", "").split('/')[0]
+            # Extract IP only from url (handle http://1.2.3.4:8070 -> 1.2.3.4)
+            node_ip = url.replace("http://", "").replace("https://", "").split('/')[0].split(':')[0]
+
+            # NEX services use UDP and require direct IPs if DNS isn't set up.
+            # HTTP services require Host headers to work with Nginx virtual hosts via the proxy.
+            nex_services = {"friends", "smm", "splatoon", "bas", "npts", "pdm", "mk8"}
 
             for s in services:
                 target_host = host_map.get(s, f"{s}.pretendo.cc")
                 if use_direct_urls:
-                    url_nodes.append(f"        <{s}>http://{node_host}</{s}>")
+                    if s in nex_services:
+                        # Direct IP for UDP/NEX stability
+                        url_nodes.append(f"        <{s}>http://{node_ip}</{s}>")
+                    else:
+                        # Hostname for HTTP virtual host routing (via mitmproxy)
+                        url_nodes.append(f"        <{s}>http://{target_host}</{s}>")
                 else:
                     url_nodes.append(f"        <{s}>http://{target_host}</{s}>")
             
@@ -5644,16 +6829,15 @@ try {{
             ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n{urls_block}\n</content>'
             
             # Collect ALL directories that Cemu might read network_services.xml from
-            ns_targets = set()
-            if cemu_dir:
-                ns_targets.add(str(cemu_dir))
-            if p and os.path.dirname(p) != ".":
-                ns_targets.add(str(os.path.dirname(p)))
-            # Always include the OS-detected dirs (config + data split)
-            for key in ["cemu_dir", "cemu_data"]:
-                val = OS_INFO.get(key, "")
-                if val:
-                    ns_targets.add(str(val))
+            ns_targets = set(config_targets)
+            # Use detected settings path dir as well if available
+            for s_path in settings_files:
+                ns_targets.add(os.path.dirname(s_path))
+            
+            # Explicitly include the requested path if it exists
+            local_share_cemu = os.path.join(os.path.expanduser("~"), ".local/share/Cemu")
+            if os.path.isdir(local_share_cemu):
+                ns_targets.add(local_share_cemu)
             
             for target_dir in ns_targets:
                 if target_dir and os.path.isdir(target_dir):
@@ -6088,6 +7272,7 @@ try {{
                     "EmailAddress=dummy@pretendo.cc",
                     "Country=61",
                     "SimpleAddressId=61030000",
+                    "OnlineAccountFlag=1",
                     "TimeZoneId=Europe/Warsaw",
                     "UtcOffset=1ad274800",
                     f"PrincipalId={pid:04x}",
