@@ -504,6 +504,14 @@ class CommandWorker(QThread):
         # Strip ANSI escape codes for keyword detection
         stripped = re.sub(r'\x1b\[[0-9;]*m', '', low)
 
+        # ── Advanced Path/Context Highlighting ──
+        # Highlight paths, code locations, and line numbers (e.g., github.com/../file.go:123 or /home/jan/..)
+        safe = re.sub(
+            r'([a-zA-Z0-9/\._\-\\]+\.[a-zA-Z]{1,4}(?::\d+)?|/[a-zA-Z0-9/\._\-\\]+)',
+            r'<b style="color:#eebafa;">\1</b>',
+            safe
+        )
+
         # ── Emulator Connection Events (Cemu/Citra) ── Bright Cyan/Magenta ──
         # PRUDP/NEX protocol layer (core Wii U / 3DS online protocol)
         if any(k in stripped for k in [
@@ -559,8 +567,14 @@ class CommandWorker(QThread):
             'econnreset', 'epipe', 'broken pipe',
             'read tcp', 'write tcp', 'socket closed',
             'buffer: read exceeds', 'unexpected eof',
-            'premature close', 'stream ended',
+            'premature close', 'stream ended', 'connection refused',
+            'address already in use', 'eaddrinuse', 'econnrefused',
         ]):
+            # Highlight common network error codes specifically
+            if 'eaddrinuse' in stripped or 'address already in use' in stripped:
+                return f"<span style='color:#ffa657;'><b>⚠️ PORT CONFLICT:</b> {safe}</span>"
+            if 'econnrefused' in stripped or 'connection refused' in stripped:
+                return f"<span style='color:#ffa657;'><b>🚫 SERVICE DOWN:</b> {safe}</span>"
             return f"<span style='color:#ffa657;'>{safe}</span>"  # Orange for network/timeout
 
         # ── Standard Success ──
@@ -1768,6 +1782,7 @@ class PretendoManager(QMainWindow):
 
                 if changed and new_lines:
                     self._patch_mitmproxy_addon(s_dir)
+                    self._patch_friends_kerberos(s_dir)
                     # Force DB addition to init script
                     pg_init = os.path.join(s_dir, "scripts", "run-in-container", "postgres-init.sh")
                     if os.path.exists(pg_init):
@@ -1856,7 +1871,43 @@ class PretendoManager(QMainWindow):
                 with open(addon_path, "w") as f: f.write(content)
                 self.setup_log.append("[System] mitmproxy addon patched for IP-based loop prevention.")
         except Exception as e:
-            self.setup_log.append(f"[WARN] Failed to patch mitmproxy addon: {e}")
+            self.setup_log.append(f"[ERROR] Failed to patch mitmproxy addon: {e}")
+
+    def _patch_friends_kerberos(self, s_dir):
+        """Fix Kerberos validation issue for Friends secure server matching Cemu PIDs"""
+        repo_dir = os.path.join(s_dir, "repos/friends")
+        if not os.path.exists(repo_dir): return
+        
+        # Patch init.go to use PID 0x3200 (12800) instead of 2 for SecureServerAccount
+        init_go = os.path.join(repo_dir, "init.go")
+        if os.path.exists(init_go):
+            try:
+                with open(init_go, "r", encoding="utf-8") as f: content = f.read()
+                if "nex_types.NewPID(2)" in content and "globals.SecureServerAccount = nex.NewAccount" in content:
+                    content = content.replace("globals.SecureServerAccount = nex.NewAccount(nex_types.NewPID(2),", "globals.SecureServerAccount = nex.NewAccount(nex_types.NewPID(0x3200),")
+                    with open(init_go, "w", encoding="utf-8") as f: f.write(content)
+            except Exception: pass
+            
+        # Patch account_details_by_pid.go to log lookups and fix matching types
+        acc_go = os.path.join(repo_dir, "globals/account_details_by_pid.go")
+        if os.path.exists(acc_go):
+            try:
+                with open(acc_go, "r", encoding="utf-8") as f: content = f.read()
+                changed = False
+                if "func AccountDetailsByPID(pid nex.PID) (*nex.Account, error) {" in content:
+                    content = content.replace("func AccountDetailsByPID(pid nex.PID) (*nex.Account, error) {", "func AccountDetailsByPID(pid *types.PID) (*nex.Account, *nex.Error) {")
+                    changed = True
+                
+                if "[Kerberos Lookup]" not in content and "func AccountDetailsByPID(pid" in content:
+                    content = content.replace(
+                        "func AccountDetailsByPID(pid *types.PID) (*nex.Account, *nex.Error) {",
+                        "func AccountDetailsByPID(pid *types.PID) (*nex.Account, *nex.Error) {\n\tLogger.Infof(\"[Kerberos Lookup] Requesting account details for PID: %d\", pid.Value())"
+                    )
+                    changed = True
+                    
+                if changed:
+                    with open(acc_go, "w", encoding="utf-8") as f: f.write(content)
+            except Exception: pass
 
     def _refresh_env_ips(self, s_dir, current_ip):
         """Scan all .local.env files and update any [SVC]_SECURE_SERVER_HOST lines to match the current IP."""
@@ -2601,20 +2652,24 @@ class PretendoManager(QMainWindow):
             if self.command_lock_count == 1:
                 self.setEnabled(False)
                 QApplication.setOverrideCursor(Qt.WaitCursor)
+                self.statusBar().showMessage("SYSTEM LOCKED — PROCESSING BACKGROUND TASK...")
+                QApplication.processEvents()
         else:
             self.command_lock_count -= 1
             if self.command_lock_count <= 0:
                 self.command_lock_count = 0
                 self.setEnabled(True)
                 QApplication.restoreOverrideCursor()
+                self.statusBar().showMessage("Ready", 5000)
+                QApplication.processEvents()
 
-    def _run_command(self, cmd, log_widget, cwd=None, on_done=None, stdin_data=None, display_cmd=None):
+    def _run_command(self, cmd, log_widget, cwd=None, on_done=None, stdin_data=None, display_cmd=None, show_success=False, success_msg=None, success_title="Task Successful"):
         # If a worker is still running, wait up to 3 seconds for it to finish before giving up
         worker = self.worker  # local reference for type narrowing
         if worker is not None and worker.isRunning() and not worker.isFinished():
             if not worker.wait(3000):  # 3 second timeout
                 log_widget.append("<b style='color:orange;'>[WARN]</b> Previous command still running - queuing after 1s...")
-                QTimer.singleShot(1000, lambda: self._run_command(cmd, log_widget, cwd, on_done, stdin_data, display_cmd))
+                QTimer.singleShot(1000, lambda: self._run_command(cmd, log_widget, cwd, on_done, stdin_data, display_cmd, show_success, success_msg, success_title))
                 return
         
         # Locking the UI before starting the worker thread
@@ -2645,10 +2700,15 @@ class PretendoManager(QMainWindow):
             status_txt = "SUCCESS" if code == 0 else f"FAILED ({code})"
             log_widget.append(f"<b>[DONE]</b> Process exited with status: <b style='color:{status_clr};'>{status_txt}</b>\n")
             
+            # Execute callback chain BEFORE unlocking (ensures lock persists if chain continues)
+            if on_done: on_done(code)
+            
+            # Show popup if requested and successful
+            if code == 0 and show_success:
+                QMessageBox.information(self, success_title, success_msg if success_msg else "The operation completed successfully.")
+
             # Re-enable the UI
             self._manage_ui_lock(False)
-            
-            if on_done: on_done(code)
             
         worker.finished.connect(handle_done)
         worker.start()
@@ -2775,13 +2835,20 @@ class PretendoManager(QMainWindow):
                 
                 # 1. Unified MongoDB Initialization Script (Combines 15+ exec calls into 1)
                 target_ip = self._get_local_ip()
+                
+                # Retrieve the actual Friends AES key from environment to match the server precisely
+                f_env = os.path.join(s_dir, "environment/friends.local.env")
+                friends_aes = self._grep_env_file(f_env, "PN_FRIENDS_CONFIG_AES_KEY") or "900532293DAF5FC24EDC103A270271A9FF46396B14A1810788921FC663602D56"
+                
                 mongo_init_js = f"""
                 // 1. Replica Set Init
                 try {{ rs.initiate(); }} catch(e) {{}}
                 
-                // Wait for Primary (max 10s)
-                for (let i = 0; i < 10; i++) {{
-                    if (rs.status().myState === 1) break;
+                // Wait for Primary (max 15s) with more robust state check
+                for (let i = 0; i < 15; i++) {{
+                    try {{
+                        if (rs.status().ok && (rs.status().myState === 1 || rs.isMaster().ismaster)) break;
+                    }} catch(e) {{}}
                     sleep(1000);
                 }}
                 
@@ -2807,13 +2874,14 @@ class PretendoManager(QMainWindow):
                     {{ id: '1012C100', name: 'Pikmin 3', port: 60100, sub: 'EU' }},
                     {{ id: '1012C200', name: 'Pikmin 3', port: 60100, sub: 'US' }},
                     {{ id: '1012C300', name: 'Pikmin 3', port: 60100, sub: 'JP' }},
-                    {{ id: '00003200', name: 'Friends', port: 60001, sub: 'Global' }}
+                    {{ id: '12800', name: 'Friends', port: 60001, sub: 'Global' }},
+                    {{ id: '00003200', name: 'Friends (Secure)', port: 60001, sub: 'Global' }}
                 ];
                 const modes = ['prod', 'test', 'dev'];
                 
                 gs_data.forEach(gs => {{
                     const isFriends = (gs.id === '00003200');
-                    const aesKey = isFriends ? '{friends_aes_key}' : '0'.repeat(64);
+                    const aesKey = isFriends ? '{friends_aes}' : '0'.repeat(64);
                     
                     modes.forEach(mode => {{
                         acc_db.servers.updateOne(
@@ -2875,8 +2943,8 @@ class PretendoManager(QMainWindow):
                 # Without a nexaccount entry, the friends service Kerberos ticket validation silently fails
                 # causing "Lost friend server session" timeouts in Cemu
                 nex_sync_js = """
-                // Ensure service accounts (PIDs 1 and 2) exist with fixed password
-                [1, 2].forEach(function(pid) {
+                // Ensure service accounts (PIDs 1, 2, 11 and 12800) exist with fixed password
+                [1, 2, 11, 12800].forEach(function(pid) {
                     var existing = db.getSiblingDB("pretendo_account").nexaccounts.findOne({pid: pid});
                     if (!existing) {
                         db.getSiblingDB("pretendo_account").nexaccounts.insertOne({
@@ -3312,11 +3380,15 @@ fi
                 elif 'authentication failed' in low or 'invalid credentials' in low:
                     fail_reason = 'Account credentials rejected by server'
 
+                # Try to extract source location (file:line) to expand log details
+                src_match = re.search(r'([a-zA-Z0-9_\-\./]+/[a-zA-Z0-9_\-\.]+\.[a-zA-Z0-9]+:\d+)', raw_text)
+                src_info = f"<br>  └─ Source Location: {src_match.group(1)}" if src_match else ""
+
                 self.server_log.append(
                     f"<b style='color:#ff7b72;'>  ❌ [{now_str}] [AUTH-FAIL] Emulator authentication FAILED! "
                     f"(failure #{emu_state['auth_failures']})</b>")
                 self.server_log.append(
-                    f"<span style='color:#ff7b72;'>  └─ Diagnosis: {fail_reason}</span>")
+                    f"<span style='color:#ff7b72;'>  └─ Diagnosis: {fail_reason}{src_info}</span>")
                 self.server_log.append(
                     f"<span style='color:#ffa657;'>  └─ Fix: Ensure Account service and game service use the same NEX password. "
                     f"Try re-registering the account or running 'Fix Server IPs'.</span>")
@@ -3334,8 +3406,15 @@ fi
                     self.server_log.append(
                         f"<span style='color:#d2a8ff;'>  👥 [{now_str}] [FRIENDS] Presence update — Emulator is online and communicating</span>")
                 elif any(k in low for k in ['error', 'failed', 'panic', 'crash']):
-                    self.server_log.append(
-                        f"<b style='color:#ff7b72;'>  ⚠️ [{now_str}] [FRIENDS] Friends service ERROR — This will disconnect the emulator!</b>")
+                    # Filter out non-critical "Buffer length empty" noise which is common during Cemu keepalives
+                    if "buffer length empty" not in low and "probe handled" not in low:
+                        self.server_log.append(
+                            f"<b style='color:#ff7b72;'>  ⚠️ [{now_str}] [FRIENDS] Friends service ERROR — This will disconnect the emulator!</b>")
+                    else:
+                        # Success! The server is now acknowledging the probe instead of hanging
+                        self.server_log.append(
+                            f"<span style='color:#ffa657;'>  👥 [{now_str}] [FRIENDS] (Sync) NEX Probe Acknowledged — connection stable</span>")
+                        emu_state['cemu_friends_ok'] = True
 
             # ── Game-Specific Matchmaking/Ranking Events ──
             if any(k in low for k in ['matchmake', 'matchmaking', 'gathering',
@@ -3481,9 +3560,13 @@ fi
             else:
                 if self._get_local_ip() == "127.0.0.1":
                     QMessageBox.warning(self, "No Connection", "An active internet connection is required to enable Docker services.")
+                    self._manage_ui_lock(False)
                     return
                 self.setup_log.append("[System] Starting Docker Desktop...")
                 self._ensure_docker_desktop(lambda: self._check_docker_status())
+                # _ensure_docker_desktop should handle its own lock release if it uses _run_command
+                # but for safety let's assume it doesn't and we need to release eventually.
+                # Actually _check_docker_status might call it.
             return
 
         # ─── Linux: systemctl Toggle ───
@@ -3565,11 +3648,14 @@ fi
         # Use shlex.quote to handle $set and curly braces correctly in the shell
         cmd = f"docker exec -i pretendo-network-mongodb-1 mongo --quiet --eval {shlex.quote(compact_script)}"
         
-        self.server_log.append(f"<b>[ACTION]</b> Refreshing Database IPs to {current_ip}...")
-        self.worker = CommandWorker(cmd, cwd=self.server_dir)
-        self.worker.output.connect(lambda s: self.server_log.append(s))
-        self.worker.finished.connect(lambda r: QMessageBox.information(self, "Success", f"Database IPs updated to {current_ip}.") if r == 0 else None)
-        self.worker.start()
+        self._run_command(
+            cmd, 
+            self.server_log, 
+            cwd=s_dir, 
+            show_success=True, 
+            success_msg=f"Database IPs updated to {current_ip}.",
+            success_title="IP Refresh Success"
+        )
 
     def automated_install_stack(self):
         """Combined multi-step workflow for deployment."""
@@ -4197,9 +4283,18 @@ Server IP address: {server_ip}
                         df_content = f.read()
                     # Fix build string definition
                     df_content = df_content.replace("main.serverBuildString", "github.com/PretendoNetwork/friends/nex.serverBuildString")
+                    
+                    if "RUN go mod vendor" in df_content:
+                        df_content = df_content.replace(
+                            "RUN go mod vendor",
+                            "RUN go mod vendor && \\\n"
+                            "    sed -i 's/if pep.IsSecureEndPoint {/if len(packet.Payload()) == 0 { logger.Warningf(\"NEX PROBE HANDLED - sending ACK\"); pep.Server.sendRaw(connection.Socket, ack.Bytes()); return; } else if pep.IsSecureEndPoint {/' vendor/github.com/PretendoNetwork/nex-go/v2/prudp_endpoint.go && \\\n"
+                            "    sed -i 's/Failed to read NEX Buffer length. %s/NEX Buffer length empty. %s/' vendor/github.com/PretendoNetwork/nex-go/v2/types/buffer.go"
+                        )
+                    
                     with open(friends_dockerfile, "w") as f:
                         f.write(df_content)
-                    self.setup_log.append("[OK] Patched friends Dockerfile with serverBuildString fix.")
+                    self.setup_log.append("[OK] Patched friends Dockerfile with NEX buffer stability fixes.")
                 except Exception as e:
                     self.setup_log.append(f"[WARN] Failed to patch friends Dockerfile: {e}")
 
@@ -5702,6 +5797,7 @@ func replaceURL(err error, client *nex.Client, callID uint32, oldStation *nex.St
             QMessageBox.warning(self, "Invalid Path", "Server directory not found.")
             return
         
+        self._manage_ui_lock(True)
         self.setup_log.append("[Action] Applying Live Splatoon Rotations and Mii Font Fix...")
         try:
             # Trigger font fix as well since it's frequently needed alongside rotation fixes
@@ -5713,7 +5809,10 @@ func replaceURL(err error, client *nex.Client, callID uint32, oldStation *nex.St
 
             QMessageBox.information(self, "Success", "Splatoon Mii fonts and Live Rotations have been applied successfully!\n\nYour server will now pull live multiplayer schedules directly from the public Pretendo Network CDN, bypassing broken local encryptions.")
         except Exception as e:
+            self.setup_log.append(f"<b style='color:red;'>[ERROR]</b> Failed to patch fonts: {e}")
             QMessageBox.critical(self, "Error", f"Failed to patch fonts: {e}")
+        finally:
+            self._manage_ui_lock(False)
 
     def _deploy_step2_clear_and_pull(self, s_dir, local_ip, custom_port, pw=None):
         """Step 2: Clear ports and remove old containers."""
@@ -6349,7 +6448,7 @@ try {{
     await upsertNexServer("Mario Kart 8", "1010EC00", ["000500001010EC00"], 60140, "{mk8_aes}");
     await upsertNexServer("Mario Kart 8", "1010ED00", ["000500001010ED00"], 60140, "{mk8_aes}");
     await upsertNexServer("Mario Kart 8", "1010EE00", ["000500001010EE00"], 60140, "{mk8_aes}");
-    await upsertNexServer("Friend List", "00003200", ["0005001010001C00", "000500301001500A", "000500301001510A", "000500301001520A", "00050000101DF400", "000500001010EB00", "000500001010EC00", "000500001010ED00", "000500001010EE00"], 60000, "{friends_aes}");
+    await upsertNexServer("Friend List", "00003200", ["0005001010001C00", "000500301001500A", "000500301001510A", "000500301001520A", "00050000101DF400", "000500001010EB00", "000500001010EC00", "000500001010ED00", "000500001010EE00"], 60001, "{friends_aes}");
     await upsertNexServer("Miiverse", null, ["000500301001600A", "000500301001610A", "000500301001620A"], 80, "{miiverse_aes}", "87cd32617f1985439ea608c2746e4610");
     await upsertNexServer("Minecraft: Wii U Edition", "101D9D00", ["0005000E101D9D00", "0005000E101DBE00", "00050000101D7500"], 60080, "{minecraft_aes}");
     await upsertNexServer("Pokkén Tournament", "101DF400", ["00050000101DF400", "0005000E101DF400", "00050002101DF400"], 60008, "{pokken_aes}");
@@ -6857,6 +6956,62 @@ try {{
             QMessageBox.information(self, "Success", f"Wii U Patched & Connected!\n\nAll services redirected to {url}\nSSL Verification Disabled.\nLocal services synced.")
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
 
+    def _apply_env_updates(self, target_url, s_dir):
+        """Update SECURE_SERVER_HOST in .env files to match the Target Node IP."""
+        # Extract IP only from url (handle http://1.2.3.4:8070 -> 1.2.3.4)
+        node_ip = target_url.replace("http://", "").replace("https://", "").split('/')[0].split(':')[0]
+        
+        # If it's a localhost/127 address, resolve to real local IP
+        if node_ip in ["localhost", "127.0.0.1"]:
+            node_ip = self._get_local_ip()
+
+        env_dir = os.path.join(s_dir, "environment")
+        if not os.path.exists(env_dir): return False
+        
+        changed_any = False
+        # Mapping of filenames to the keys that need updating
+        env_map = {
+            "friends.local.env": ["PN_FRIENDS_SECURE_SERVER_HOST", "PN_FRIENDS_CONFIG_SECURE_SERVER_HOST"],
+            "super-mario-maker.local.env": ["PN_SMM_SECURE_SERVER_HOST", "PN_SMM_CONFIG_SECURE_SERVER_HOST"],
+            "wiiu-chat.local.env": ["PN_WIIU_CHAT_SECURE_SERVER_LOCATION", "PN_WIIU_CHAT_CONFIG_SECURE_SERVER_LOCATION"],
+            "splatoon.local.env": ["PN_SPLATOON_SECURE_SERVER_HOST", "PN_SPLATOON_CONFIG_SECURE_SERVER_HOST"],
+            "mario-kart-8.local.env": ["PN_MK8_SECURE_SERVER_HOST", "PN_MK8_CONFIG_SECURE_SERVER_HOST"],
+            "minecraft-wiiu.local.env": ["PN_MINECRAFT_SECURE_SERVER_HOST", "PN_MINECRAFT_CONFIG_SECURE_SERVER_HOST"],
+            "pikmin-3.local.env": ["PN_PIKMIN3_SECURE_SERVER_HOST", "PN_PIKMIN3_CONFIG_SECURE_SERVER_HOST"]
+        }
+        
+        for fname, keys in env_map.items():
+            fpath = os.path.join(env_dir, fname)
+            if not os.path.exists(fpath): continue
+            
+            try:
+                with open(fpath, "r") as f: lines = f.readlines()
+                new_lines = []
+                file_changed = False
+                
+                for line in lines:
+                    updated = False
+                    for key in keys:
+                        if line.startswith(f"{key}="):
+                            new_line = f"{key}={node_ip}\n"
+                            if new_line != line:
+                                new_lines.append(new_line)
+                                updated = True
+                                file_changed = True
+                                break
+                    if not updated:
+                        new_lines.append(line)
+                
+                if file_changed:
+                    # Write with sudo-like force if possible, or just standard write
+                    with open(fpath, "w") as f: f.writelines(new_lines)
+                    changed_any = True
+                    self.cemu_log.append(f"[Docker Sync] Updated {fname} Node IP -> {node_ip}")
+            except Exception as e:
+                self.cemu_log.append(f"[ERROR] Failed to patch {fname}: {e}")
+                
+        return changed_any
+
     def _sync_docker_services_to_port(self, target_url):
         """Patch Docker compose.yml mitmproxy port to match the Target Node URL and restart key services.
         This ensures that the emulator's configured URL correctly reaches the mitmproxy reverse-proxy,
@@ -6879,30 +7034,41 @@ try {{
         else:
             self.cemu_log.append(f"[Docker Sync] compose.yml already configured for port {custom_port} (no change needed).")
 
-        # 2. Restart the critical service chain ONLY if needed
+        # 2. Patch environment files to match the user-typed Target Node IP (Crucial for NEX connection)
+        env_changed = self._apply_env_updates(target_url, s_dir)
+
+        # 3. Restart the critical service chain ONLY if needed
         #    mitmproxy-pretendo: the entry-point proxy that emulators connect to
         
-        if not compose_changed:
+        if not (compose_changed or env_changed):
             self.cemu_log.append("[Docker Sync] Docker services are stable. No restart required.")
             return
 
         pw = self._get_effective_sudo_password()
 
-        restart_services = "mitmproxy-pretendo"
-        # Port changed in compose → need docker compose up -d to re-create the port binding
-        restart_cmd = f"docker compose up -d --no-deps {restart_services}"
+        restart_services = ["mitmproxy-pretendo"]
+        if env_changed:
+            # Recreate services that depend on the secure server host IP
+            restart_services.extend(["friends", "super-mario-maker", "wiiu-chat-authentication", "wiiu-chat-secure", "splatoon", "mario-kart-8"])
+
+        # Create space-separated string of services
+        s_list = " ".join(restart_services)
+        
+        # Port changed in compose or Env changed -> need docker compose up -d to re-create
+        restart_cmd = f"docker compose up -d --no-deps {s_list}"
 
         if pw and OS_INFO["os"] == "linux":
             restart_cmd = f"sudo -S {restart_cmd}"
 
-        self.cemu_log.append(f"[Docker Sync] Applying changes to services: {restart_services}")
+        self.cemu_log.append(f"[Docker Sync] Applying configuration changes to services: {s_list}")
         self._run_command(
             restart_cmd, self.cemu_log, cwd=s_dir,
             stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
-            display_cmd=f"[Docker Sync] Refreshing mitmproxy on port {custom_port}"
+            display_cmd=f"[Docker Sync] Refreshing services on node {target_url}"
         )
 
     def apply_cemu_patch_all(self):
+        self._manage_ui_lock(True)
         try:
             use_official = self.mode_pretendo.isChecked()
             url = "https://api.pretendo.network" if use_official else self.patch_url_input.text().strip()
@@ -6922,10 +7088,15 @@ try {{
             # Track in vault if local server
             if not use_official and ("127.0.0.1" in url or "localhost" in url):
                 self._track_account_in_vault(self.cemu_username.text(), self.cemu_password.text(), self.cemu_miiname.text())
+            
+            # Only show success if no background commands were spawned (if spawned, they will show their own success)
+            if use_official:
+                QMessageBox.information(self, "Patch Successful", "Cemu has been successfully patched for the official Pretendo Network.")
         except Exception as e:
+            self.cemu_log.append(f"<b style='color:red;'>[ERROR]</b> Patch Exception: {e}")
             QMessageBox.critical(self, "Patch Error", f"An uncaught exception occurred while patching Cemu:\n\n{str(e)}")
-            if hasattr(self, 'cemu_log'):
-                self.cemu_log.append(f"<b style='color:red;'>[ERROR]</b> Patch Exception: {e}")
+        finally:
+            self._manage_ui_lock(False)
 
     def generate_cemu_manual(self):
         username = self.cemu_username.text().strip()
@@ -7156,14 +7327,15 @@ try {{
         target_url = "https://account.pretendo.cc" if mode in ["pretendo", "official_restore"] else self.patch_url_input.text()
         if mode == "nintendo" or mode == "nintendo_restore": target_url = "https://account.nintendo.net"
 
+        self._manage_ui_lock(True)
         try:
             with open(p, "r") as f: lines = f.readlines()
             new_lines = []
             found = False
             for line in lines:
                 if line.startswith("web_api_url="):
-                   new_lines.append(f"web_api_url={target_url}\n")
-                   found = True
+                    new_lines.append(f"web_api_url={target_url}\n")
+                    found = True
                 else: new_lines.append(line)
             if not found: new_lines.append(f"web_api_url={target_url}\n")
             with open(p, "w") as f: f.writelines(new_lines)
@@ -7171,6 +7343,14 @@ try {{
             # 3DS Zero-Cert Bypass logic
             citra_root = os.path.dirname(os.path.dirname(p))
             sysdata = os.path.join(citra_root, "sysdata")
+            
+            # Show success BEFORE unlocking (keeps background greyed out)
+            QMessageBox.information(self, "Patch Successful", f"Citra has been successfully patched for {mode}.\n\nConfig path: {p}")
+        except Exception as e:
+            self.cemu_log.append(f"<b style='color:red;'>[ERROR]</b> Citra Patch Exception: {e}")
+            QMessageBox.critical(self, "Patch Error", f"An uncaught exception occurred while patching Citra:\n\n{str(e)}")
+        finally:
+            self._manage_ui_lock(False)
             if os.path.isdir(sysdata):
                 # Generate a dummy LocalFriendCodeSeed if missing
                 seed_p = os.path.join(sysdata, "LocalFriendCodeSeed_B")
@@ -7184,15 +7364,15 @@ try {{
                     with open(info_p, "wb") as f: f.write(os.urandom(0x111))
                     self.setup_log.append("[System] Generated dummy SecureInfo_A for Citra.")
 
+            username = self.cemu_username.text().strip()
+            password = self.cemu_password.text()
+            miiname = self.cemu_miiname.text().strip() or "Player"
+            
             if mode == "custom":
-                username = self.cemu_username.text().strip()
-                password = self.cemu_password.text()
-                miiname = self.cemu_miiname.text().strip() or "Player"
-                QMessageBox.information(self, "Success", f"3DS Patched & Connected!\n\nTarget: {target_url}\nDocker services synced to port {self._get_target_port()}.\nIdentity bypass files verified.")
                 self._track_account_in_vault(username, password, miiname)
-            else:
-                QMessageBox.information(self, "Success", f"Patched Citra to use:\n{target_url}\n\nIdentity bypass files checked.")
-        except Exception as e: QMessageBox.critical(self, "Error", str(e))
+                self.setup_log.append(f"[Success] Citra Patched for Local Dev. Identity synced.")
+            
+            # The lock is released in finally block.
 
 
 
