@@ -1781,8 +1781,6 @@ class PretendoManager(QMainWindow):
                                 break
 
                 if changed and new_lines:
-                    self._patch_mitmproxy_addon(s_dir)
-                    self._patch_friends_kerberos(s_dir)
                     # Force DB addition to init script
                     pg_init = os.path.join(s_dir, "scripts", "run-in-container", "postgres-init.sh")
                     if os.path.exists(pg_init):
@@ -1908,6 +1906,23 @@ class PretendoManager(QMainWindow):
                 if changed:
                     with open(acc_go, "w", encoding="utf-8") as f: f.write(content)
             except Exception: pass
+
+        # Fix nex-go/v2 compatibility in authentication.go and secure.go
+        for go_file in ["nex/authentication.go", "nex/secure.go"]:
+            p = os.path.join(repo_dir, go_file)
+            if os.path.exists(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as f: c = f.read()
+                    changed = False
+                    # These methods were removed in nex-go/v2 and cause build failures
+                    for method in ["SetPRUDPVersion", "SetKerberosKeySize", "SetSignatureKeyLength"]:
+                        pattern = rf'^\s*.*\.{method}\(.*\)\s*\n'
+                        if re.search(pattern, c, re.MULTILINE):
+                            c = re.sub(pattern, '', c, flags=re.MULTILINE)
+                            changed = True
+                    if changed:
+                        with open(p, "w", encoding="utf-8") as f: f.write(c)
+                except Exception: pass
 
     def _refresh_env_ips(self, s_dir, current_ip):
         """Scan all .local.env files and update any [SVC]_SECURE_SERVER_HOST lines to match the current IP."""
@@ -3818,6 +3833,8 @@ fi
             self.setup_log.append("[ERROR] Port must be numeric.")
             return
         self._apply_compose_patches(custom_port, s_dir)
+        self._patch_mitmproxy_addon(s_dir)
+        self._patch_friends_kerberos(s_dir)
 
         local_ip = self._get_local_ip()
         
@@ -4288,7 +4305,7 @@ Server IP address: {server_ip}
                         df_content = df_content.replace(
                             "RUN go mod vendor",
                             "RUN go mod vendor && \\\n"
-                            "    sed -i 's/if pep.IsSecureEndPoint {/if len(packet.Payload()) == 0 { logger.Warningf(\"NEX PROBE HANDLED - sending ACK\"); pep.Server.sendRaw(connection.Socket, ack.Bytes()); return; } else if pep.IsSecureEndPoint {/' vendor/github.com/PretendoNetwork/nex-go/v2/prudp_endpoint.go && \\\n"
+                            "    sed -i 's/if pep.IsSecureEndPoint {/if len(packet.Payload()) < 4 { ack, _ := NewPRUDPPacketV0(pep.Server, connection, nil); ack.SetType(1); ack.AddFlag(1); pep.Server.sendRaw(connection.Socket, ack.Bytes()); return; } else if pep.IsSecureEndPoint {/' vendor/github.com/PretendoNetwork/nex-go/v2/prudp_endpoint.go && \\\n"
                             "    sed -i 's/Failed to read NEX Buffer length. %s/NEX Buffer length empty. %s/' vendor/github.com/PretendoNetwork/nex-go/v2/types/buffer.go"
                         )
                     
@@ -4406,9 +4423,8 @@ func main() {
                 content = re.sub(r'globals\.AuthenticationServer\s*=\s*nex\.NewPRUDPServer\(\)', '', content)
                 content = re.sub(r'globals\.AuthenticationEndpoint\s*=\s*nex\.NewPRUDPEndPoint\(1\)', '', content)
                 content = re.sub(r'SessionKeyLength\s*=\s*\d+', 'SessionKeyLength = 16', content)
-                content = re.sub(r'NewLibraryVersion\(\d+, \d+, \d+\)', 'NewLibraryVersion(1, 1, 0)', content)
-                # content = content.replace('SessionKeyLength = 16', 'SessionKeyLength = 16\n\tglobals.AuthenticationServer.SetKerberosKeySize(16)') # Removed for nex-go/v2 compatibility
-                content = content.replace('globals.AuthenticationServer.SetKerberosKeySize(16)', '') # Ensure it's removed if already present
+                content = re.sub(r'NewLibraryVersion\(\d+, \d+, \d+\)', 'NewLibraryVersion(3, 2, 0)', content)
+                content = content.replace('globals.AuthenticationServer.SetKerberosKeySize(16)', '') 
                 content = re.sub(r'globals\.AuthenticationServer\.AccessKey\s*=\s*.*', 'globals.AuthenticationServer.AccessKey = "ridfebb9"', content)
                 content = re.sub(r'globals\.AuthenticationServer\.Listen\(port\)', r'fmt.Printf("[Friends-Auth] Starting server on port %d...\\n", port)\n\tglobals.AuthenticationServer.Listen(port)', content)
                 with open(auth_go, "w") as f: f.write(content)
@@ -4422,9 +4438,8 @@ func main() {
                 content = re.sub(r'globals\.SecureServer\s*=\s*nex\.NewPRUDPServer\(\)', '', content)
                 content = re.sub(r'globals\.SecureEndpoint\s*=\s*nex\.NewPRUDPEndPoint\(1\)', '', content)
                 content = re.sub(r'SessionKeyLength\s*=\s*\d+', 'SessionKeyLength = 16', content)
-                content = re.sub(r'NewLibraryVersion\(\d+, \d+, \d+\)', 'NewLibraryVersion(1, 1, 0)', content)
-                # content = content.replace('SessionKeyLength = 16', 'SessionKeyLength = 16\n\tglobals.SecureServer.SetKerberosKeySize(16)') # Removed for nex-go/v2 compatibility
-                content = content.replace('globals.SecureServer.SetKerberosKeySize(16)', '') # Ensure it's removed if already present
+                content = re.sub(r'NewLibraryVersion\(\d+, \d+, \d+\)', 'NewLibraryVersion(3, 2, 0)', content)
+                content = content.replace('globals.SecureServer.SetKerberosKeySize(16)', '')
                 content = re.sub(r'globals\.SecureServer\.AccessKey\s*=\s*.*', 'globals.SecureServer.AccessKey = "ridfebb9"', content)
                 content = re.sub(r'globals\.SecureServer\.Listen\(port\)', r'fmt.Printf("[Friends-Secure] Starting server on port %d...\\n", port)\n\tglobals.SecureServer.Listen(port)', content)
                 with open(sec_go, "w") as f: f.write(content)
@@ -4434,7 +4449,7 @@ func main() {
         if os.path.isfile(common_go):
             try:
                 with open(common_go, "r") as f: content = f.read()
-                content = re.sub(r'SetPrincipalID\(types\.NewPID\([12]\)\)', 'SetPrincipalID(types.NewPID(1))', content)
+                content = re.sub(r'SetPrincipalID\(types\.NewPID\([12]\)\)', 'SetPrincipalID(types.NewPID(0x3200))', content)
                 with open(common_go, "w") as f: f.write(content)
             except: pass
 
