@@ -399,13 +399,12 @@ const mongoose = require("mongoose");
             acct_name_bytes = mii_name_limited.encode('utf-16be').ljust(22, b'\x00')
             account_name_hex = binascii.hexlify(acct_name_bytes).decode('ascii')
             
-            # FakeOnlineFiles-compatible Mii template
-            base_mii_hex = "030000305ac6bb2520c470f09426e82fb8ae6ed59004000000005f304b30683000000000000000000000000000004737000021010264a41820454614811217680d0000290251485000000000000000000000000000000000000000000000bfee"
-            mii_buf = bytearray(binascii.unhexlify(base_mii_hex.ljust(192, '0')))
+            # Pretendo/mii-js default Mii template. MiiData stores the nickname as UTF-16LE.
+            base_mii_hex = "03000040e955a209e7c74182dbfba88003b3b88d27d900000040440065006600610075006c0074000000000000004040000021010268441826344614811217680d000029005248500000000000000000000000000000000000000000000069bd"
+            mii_buf = bytearray(binascii.unhexlify(base_mii_hex))
             
-            name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
-            mii_buf[0x1A:0x1A+20] = name_bytes_be
-            mii_buf[0x48:0x48+20] = name_bytes_be
+            name_bytes_le = mii_name_limited.encode('utf-16le').ljust(20, b'\x00')
+            mii_buf[0x1A:0x1A+20] = name_bytes_le
             
             # CRC16-CCITT
             crc = 0
@@ -546,7 +545,7 @@ const mongoose = require("mongoose");
             if not match:
                 return ""
             raw = bytes.fromhex(match.group(1))
-            return raw[0x1A:0x1A + 20].decode("utf-16be", errors="ignore").rstrip("\x00")
+            return raw[0x1A:0x1A + 20].decode("utf-16le", errors="ignore").rstrip("\x00")
         except Exception:
             return ""
 
@@ -1034,13 +1033,12 @@ const mongoose = require("mongoose");
                 acct_name_bytes = miiname[:10].encode('utf-16be').ljust(22, b'\x00')
                 account_name_hex = binascii.hexlify(acct_name_bytes).decode('ascii')
 
-                # Build MiiData from the FakeOnlineFiles-compatible template
-                base_mii_hex = "030000305ac6bb2520c470f09426e82fb8ae6ed59004000000005f304b30683000000000000000000000000000004737000021010264a41820454614811217680d0000290251485000000000000000000000000000000000000000000000bfee"
-                mii_buf = bytearray(binascii.unhexlify(base_mii_hex.ljust(192, '0')))
+                # Build MiiData from Pretendo's mii-js default template.
+                base_mii_hex = "03000040e955a209e7c74182dbfba88003b3b88d27d900000040440065006600610075006c0074000000000000004040000021010268441826344614811217680d000029005248500000000000000000000000000000000000000000000069bd"
+                mii_buf = bytearray(binascii.unhexlify(base_mii_hex))
                 mii_name_limited = miiname[:10]
-                name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
-                mii_buf[0x1A:0x1A+20] = name_bytes_be
-                mii_buf[0x48:0x48+20] = name_bytes_be
+                name_bytes_le = mii_name_limited.encode('utf-16le').ljust(20, b'\x00')
+                mii_buf[0x1A:0x1A+20] = name_bytes_le
                 # Recalculate CRC16-CCITT
                 crc = 0
                 for i in range(0x5E):

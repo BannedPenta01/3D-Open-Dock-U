@@ -6,15 +6,82 @@ import shlex
 import re
 import json
 import time
+import stat
+import base64
 from PySide6.QtWidgets import QMessageBox
 from PySide6.QtCore import QTimer
 from constants import PRETENDO_REPO, SEC_KEYS
 from secrets_manager import SecretStore, get_secret_file_path, hex_token, secure_file, token
 from utils import OS_INFO, _win_to_wsl_path, get_local_ip, _docker_available, _CACHED_RESULTS
 
+def _prepare_file_for_write(path):
+    """Clear hidden/read-only flags and restrictive ACLs before regenerating a managed file."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+        if OS_INFO["os"] == "windows":
+            try:
+                subprocess.run(["attrib", "-H", "-R", parent], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            for principal in (os.environ.get("USERNAME"), "CodexSandboxUsers", "*S-1-5-32-545"):
+                if not principal:
+                    continue
+                try:
+                    subprocess.run(
+                        ["icacls", parent, "/inheritance:e", "/grant", f"{principal}:(OI)(CI)(M)"],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+
+    if not os.path.exists(path):
+        return
+
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except Exception:
+        pass
+
+    if OS_INFO["os"] == "windows":
+        try:
+            subprocess.run(["attrib", "-H", "-R", path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        for principal in (os.environ.get("USERNAME"), "CodexSandboxUsers", "*S-1-5-32-545"):
+            if not principal:
+                continue
+            try:
+                subprocess.run(
+                    ["icacls", path, "/inheritance:e", "/grant", f"{principal}:(M)"],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+
+
+def _write_managed_file(path, content, *, binary=False):
+    _prepare_file_for_write(path)
+    tmp_path = f"{path}.tmp"
+    _prepare_file_for_write(tmp_path)
+    mode = "wb" if binary else "w"
+    kwargs = {} if binary else {"encoding": "utf-8", "newline": "\n"}
+    with open(tmp_path, mode, **kwargs) as f:
+        f.write(content)
+    _prepare_file_for_write(path)
+    os.replace(tmp_path, path)
+    secure_file(path)
+    _prepare_file_for_write(path)
+
 class Deployer:
     def __init__(self, manager):
         self.manager = manager
+        self._docker_recovery_attempted = False
 
     def automated_install_stack(self):
         s_dir = self.manager.server_dir_field.text().strip()
@@ -90,8 +157,10 @@ class Deployer:
         kill_cmd = self._get_kill_ports_cmd(ports_to_kill, pw)
         
         if OS_INFO["os"] == "windows":
-            d_cmd = "docker compose down --remove-orphans 2>NUL || echo done"
-            full_cmd = f"{kill_cmd} & {d_cmd}"
+            d_cmd = "docker compose down --remove-orphans 1>NUL 2>NUL || echo done"
+            # Compose down first so Docker releases its own proxy bindings. The port
+            # cleanup below deliberately skips Docker/WSL processes.
+            full_cmd = f"{d_cmd} & {kill_cmd}"
         else:
             d_cmd = "docker compose down --remove-orphans 2>/dev/null || true"
             if pw and OS_INFO["os"] == "linux":
@@ -100,6 +169,10 @@ class Deployer:
             
         def _on_ports_cleared(c):
             if c != 0:
+                if OS_INFO["os"] == "windows":
+                    self.manager.setup_log.append("[WARN] Cleanup returned a non-zero status, continuing because Windows port cleanup is best-effort.")
+                    self._run_submodule_patches(s_dir)
+                    return
                 self.manager.setup_log.append("[ERROR] Failed to clear ports or down containers.")
                 return
             self._run_submodule_patches(s_dir)
@@ -111,10 +184,39 @@ class Deployer:
     def _get_kill_ports_cmd(self, ports_str, pw=None):
         ports = ports_str.split()
         if OS_INFO["os"] == "windows":
-            ps_parts = []
-            for p in ports:
-                ps_parts.append(f"Get-NetTCPConnection -LocalPort {p} -ErrorAction SilentlyContinue | Where-Object {{ $_.OwningProcess -gt 0 }} | ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}")
-            return 'powershell -Command "' + "; ".join(ps_parts) + '"'
+            ports_literal = "@(" + ",".join(str(int(p)) for p in ports if str(p).isdigit()) + ")"
+            script = f"""
+$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$ports = {ports_literal}
+$protectedNames = @(
+  'Docker Desktop','com.docker.backend','com.docker.service','dockerd','docker',
+  'wslhost','wslservice','vmmem','vmmemWSL','vpnkit','containerd','com.docker.proxy'
+)
+$seen = @{{}}
+foreach ($port in $ports) {{
+  $connections = @(Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue)
+  foreach ($conn in $connections) {{
+    if (-not $conn.OwningProcess -or $conn.OwningProcess -le 0) {{ continue }}
+    $key = "$port`:$($conn.OwningProcess)"
+    if ($seen.ContainsKey($key)) {{ continue }}
+    $seen[$key] = $true
+    try {{
+      $proc = Get-Process -Id $conn.OwningProcess -ErrorAction Stop
+      if ($protectedNames -contains $proc.ProcessName) {{
+        Write-Output \"skip docker-owned port $port ($($proc.ProcessName), pid $($proc.Id))\"
+      }} else {{
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        Write-Output \"released port $port from $($proc.ProcessName) pid $($proc.Id)\"
+      }}
+    }} catch {{}}
+  }}
+}}
+exit 0
+"""
+            encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+            return f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"
         else:
             f_parts = [f"fuser -k -n tcp {p}" for p in ports]
             inner = " ; ".join(f_parts) + " ; true"
@@ -572,9 +674,7 @@ class Deployer:
         # Write all env files
         for filename, lines in env_files.items():
             filepath = os.path.join(env_dir, filename)
-            with open(filepath, "w") as f:
-                f.write("\n".join(lines) + "\n")
-            secure_file(filepath)
+            _write_managed_file(filepath, "\n".join(lines) + "\n")
             self.manager.setup_log.append(f"  [ENV] Created {filename}")
             
             # Ensure the non-local version exists too (satisfied by empty if referenced in compose)
@@ -582,9 +682,7 @@ class Deployer:
                 base_env = filename.replace(".local.env", ".env")
                 base_path = os.path.join(env_dir, base_env)
                 if not os.path.exists(base_path):
-                    with open(base_path, "w") as f:
-                        f.write("# Placeholder env file\n")
-                    secure_file(base_path)
+                    _write_managed_file(base_path, "# Placeholder env file\n")
                     self.manager.setup_log.append(f"  [ENV] Created placeholder {base_env}")
         
         for fname in os.listdir(env_dir):
@@ -592,15 +690,11 @@ class Deployer:
                 local_name = fname.replace(".env", ".local.env")
                 local_path = os.path.join(env_dir, local_name)
                 if not os.path.exists(local_path):
-                    with open(local_path, "w") as f:
-                        f.write("# Auto-generated empty local env\n")
-                    secure_file(local_path)
+                    _write_managed_file(local_path, "# Auto-generated empty local env\n")
                     self.manager.setup_log.append(f"  [ENV] Created empty {local_name}")
         
         root_env = os.path.join(s_dir, ".env")
-        with open(root_env, "w") as f:
-            f.write(f"SERVER_IP={server_ip}\n")
-        secure_file(root_env)
+        _write_managed_file(root_env, f"SERVER_IP={server_ip}\n")
         self.manager.setup_log.append(f"  [ENV] Created .env (SERVER_IP={server_ip})")
         
         old_secrets_path = os.path.join(s_dir, "secrets.txt")
@@ -1463,9 +1557,7 @@ TournamentsCollection=tourneys
         }
         try:
             config_path = os.path.join(ui_repo, "config.json")
-            with open(config_path, "w") as f:
-                json.dump(config, f, indent=4)
-            secure_file(config_path)
+            _write_managed_file(config_path, json.dumps(config, indent=4) + "\n")
         except: pass
 
     def _inject_missing_services(self, s_dir):
@@ -1565,8 +1657,7 @@ TournamentsCollection=tourneys
             self.manager.setup_log.append(f"[WARN] Failed to inject missing services: {e}")
 
     def _write_file(self, path, content):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", newline="\n") as f: f.write(content)
+        _write_managed_file(path, content)
 
     def _post_setup_build(self, s_dir):
         """Verify Docker is responsive, then build all containers."""
@@ -1577,7 +1668,12 @@ TournamentsCollection=tourneys
         
         # Re-verify Docker is still available (pipe can vanish on Windows during long deploys)
         if not _docker_available():
-            self.manager.setup_log.append("[System] Docker pipe lost. Restarting Docker Desktop...")
+            if self._docker_recovery_attempted:
+                self.manager.setup_log.append("[ERROR] Docker is still unavailable after one recovery attempt. Deployment paused instead of restarting Docker repeatedly.")
+                return
+
+            self._docker_recovery_attempted = True
+            self.manager.setup_log.append("[System] Docker pipe lost. Starting Docker Desktop once...")
             
             def _on_docker_ready():
                 self.manager.setup_log.append("[OK] Docker re-established. Proceeding to build.")
