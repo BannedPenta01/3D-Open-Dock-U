@@ -9,11 +9,16 @@ import base64
 import random
 import io
 import shlex
+import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 from urllib.parse import urlparse
 from PySide6.QtWidgets import QMessageBox, QFileDialog, QApplication
 from PySide6.QtCore import QDir
 from constants import SEC_KEYS, CONSOLE_CERTS_PACKED
+from secrets_manager import secure_file
 from utils import safe_unhex, OS_INFO, get_local_ip
 
 class EmulatorPatcher:
@@ -45,6 +50,8 @@ class EmulatorPatcher:
 
     def apply_cemu_patch_all(self):
         m = self.manager
+        if hasattr(m, "save_settings"):
+            m.save_settings()
         use_official = m.mode_pretendo.isChecked()
         url = "https://api.pretendo.network" if use_official else m.patch_url_input.text().strip()
 
@@ -58,25 +65,197 @@ class EmulatorPatcher:
         # Deploy ALL necessary Wii U certificate files & identity blobs
         self._ensure_console_certs(c_dir)
 
+        def finish_patch():
+            self.patch_cemu_settings(url, use_official)
+            self.generate_cemu_manual()
+
+            if not use_official:
+                if hasattr(m, 'create_local_account'):
+                    def _after_account_sync(code):
+                        if code == 0:
+                            ok, detail = self._probe_local_oauth_credentials(url)
+                            if ok:
+                                m.server_log.append("<span style='color:#3fb950;'>[OAuth] Cemu identity, PNID, NEX account, and OAuth password path are synchronized.</span>")
+                                QApplication.processEvents()
+                                QMessageBox.information(m, "Cemu Patch Complete", f"Cemu identity is fully synchronized and ready.\n\nTarget Node: {url}\n\n{detail}")
+                            else:
+                                m.server_log.append(f"<span style='color:#ffa657;'>[OAuth] Sync completed but probe still failed: {detail}</span>")
+                                QApplication.processEvents()
+                                QMessageBox.warning(m, "Cemu Patch Needs Attention", f"Cemu files and database were updated, but the OAuth probe still failed:\n\n{detail}")
+                        else:
+                            m.server_log.append("<span style='color:#ffa657;'>[OAuth] Account refresh did not complete. Keep the server running and press Patch Cemu again.</span>")
+                            QApplication.processEvents()
+                            QMessageBox.warning(m, "Cemu Patch Needs Attention", "Cemu files were patched, but the local account database refresh failed.")
+
+                    m.create_local_account(
+                        silent=True,
+                        on_done=_after_account_sync
+                    )
+                else:
+                    m.server_log.append("<span style='color:#ffa657;'>[OAuth] Account sync API is unavailable in this build.</span>")
+                    QApplication.processEvents()
+                    QMessageBox.warning(m, "Cemu Patch Needs Attention", "Cemu files were patched, but this build cannot refresh the local account database.")
+                return
+
+            if use_official:
+                QApplication.processEvents()
+                QMessageBox.information(m, "Cemu Patch Complete", "Cemu has been successfully patched and configured to connect to the official Pretendo Network servers.\n\nYou can now safely launch Cemu and play online.")
+
+        def after_docker_sync(_code):
+            if not use_official:
+                if _code != 0:
+                    m.server_log.append("<span style='color:#ffa657;'>[Docker Sync] Could not prepare the local Docker stack for Cemu identity sync.</span>")
+                    QApplication.processEvents()
+                    QMessageBox.warning(m, "Cemu Patch Needs Attention", "Docker sync failed before the account database could be refreshed.")
+                    return
+
+                def after_account_service_patch(code):
+                    if code == 0:
+                        finish_patch()
+                    else:
+                        m.server_log.append("<span style='color:#ffa657;'>[Anti-Ban] Account service compatibility sync failed before account refresh.</span>")
+                        QApplication.processEvents()
+                        QMessageBox.warning(m, "Cemu Patch Needs Attention", "Account service compatibility sync failed before the local account database refresh.")
+
+                self._patch_account_ban_bypass(on_done=after_account_service_patch)
+            else:
+                finish_patch()
+
         if not use_official:
             # Sync Docker services to the target port BEFORE patching the emulator
-            self._sync_docker_services_to_port(url)
-            # Ensure account service ban checks are disabled for local stack
-            self._patch_account_ban_bypass()
-
-        self.patch_cemu_settings(url, use_official)
-        self.generate_cemu_manual()
-
-        if not use_official:
-            if hasattr(m, 'create_local_account'):
-                m.create_local_account()
-
-        if use_official:
-            QApplication.processEvents()
-            QMessageBox.information(m, "Cemu Patch Complete", "Cemu has been successfully patched and configured to connect to the official Pretendo Network servers.\n\nYou can now safely launch Cemu and play online.")
+            self._sync_docker_services_to_port(url, on_done=after_docker_sync)
         else:
-            QApplication.processEvents()
-            QMessageBox.information(m, "Cemu Patch Complete", f"Cemu has been successfully patched and configured to connect to your local 3D Open Dock U instance.\n\nTarget Node: {url}\n\nYou can now safely launch Cemu.")
+            finish_patch()
+
+    def _probe_local_oauth_credentials(self, url):
+        db_ok, db_detail = self._verify_local_account_database()
+        if not db_ok:
+            return False, db_detail
+
+        username = self.manager.cemu_username.text().strip()
+        password = self.manager.cemu_password.text()
+        base_url, _, _ = self._normalize_target_url(url, is_official=False)
+        endpoint = f"{base_url}/v1/api/oauth20/access_token/generate"
+        body = urllib.parse.urlencode({
+            "grant_type": "password",
+            "user_id": username,
+            "password": password,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            endpoint,
+            data=body,
+            headers={
+                "Host": "account.pretendo.cc",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "X-Nintendo-Client-ID": "a2efa818a34fa16b8afbc8a74eba3eda",
+                "X-Nintendo-Client-Secret": "c91cdb5658bd4954ade78533a339cf9a",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                text = response.read().decode("utf-8", errors="ignore")
+                status = response.status
+        except urllib.error.HTTPError as error:
+            text = error.read().decode("utf-8", errors="ignore")
+            status = error.code
+        except Exception as error:
+            return False, str(error)
+
+        if "Invalid account ID or password" in text or "0106" in text:
+            return False, f"OAuth still returns 106 for {username}."
+
+        if "Unlinked device" in text or "0110" in text:
+            return True, f"{db_detail} HTTP probe reached device-link validation without account/password rejection."
+
+        if "client_id" in text:
+            return True, f"{db_detail} HTTP probe reached client validation without account/password rejection."
+
+        return True, f"{db_detail} HTTP credential check reached HTTP {status} without account/password rejection."
+
+    def _verify_local_account_database(self):
+        m = self.manager
+        s_dir = m.server_dir_field.text().strip()
+        if not os.path.isdir(s_dir):
+            return False, "Server directory is missing; cannot verify local account database."
+
+        username = m.cemu_username.text().strip()
+        password = m.cemu_password.text()
+        miiname = m.cemu_miiname.text().strip() or "Player"
+        script = r'''
+const { connect, getPNIDByUsername } = require("./dist/database");
+const { NEXAccount } = require("./dist/models/nex-account");
+const { nintendoPasswordHash } = require("./dist/util");
+const bcrypt = require("bcrypt");
+const mongoose = require("mongoose");
+
+(async () => {
+	try {
+		await connect();
+		const username = __USERNAME__;
+		const password = __PASSWORD__;
+		const miiName = __MIINAME__;
+		const pid = 1337;
+		const pnid = await getPNIDByUsername(username);
+		const nex = await NEXAccount.findOne({ owning_pid: pid });
+		const cachedPassword = pnid ? nintendoPasswordHash(password, pnid.pid) : "";
+		const cachedOk = pnid ? await bcrypt.compare(cachedPassword, pnid.password) : false;
+		console.log(JSON.stringify({
+			ok: !!pnid && pnid.pid === pid && pnid.username === username && pnid.mii?.name === miiName && cachedOk && !!nex && nex.password === password,
+			username: pnid?.username || "",
+			pid: pnid?.pid || null,
+			miiName: pnid?.mii?.name || "",
+			cachedOk,
+			nexOk: !!nex && nex.password === password
+		}));
+		await mongoose.disconnect();
+	} catch (error) {
+		console.log(JSON.stringify({ ok: false, error: error.message }));
+		process.exitCode = 1;
+	}
+})();
+'''
+        script = script.replace("__USERNAME__", json.dumps(username))
+        script = script.replace("__PASSWORD__", json.dumps(password))
+        script = script.replace("__MIINAME__", json.dumps(miiname))
+
+        try:
+            result = subprocess.run(
+                ["docker", "compose", "exec", "-T", "account", "node"],
+                input=script,
+                cwd=s_dir,
+                text=True,
+                capture_output=True,
+                timeout=45,
+            )
+        except Exception as error:
+            return False, f"Could not verify local account database: {error}"
+
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        parsed = None
+        for line in reversed(output.splitlines()):
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    parsed = json.loads(line)
+                    break
+                except Exception:
+                    continue
+
+        if result.returncode != 0 and not parsed:
+            return False, "Account database verification command failed."
+
+        if not parsed:
+            return False, "Account database verification did not return a readable result."
+
+        if parsed.get("ok"):
+            return True, f"Database verified for {username} / PID 1337 / Mii {miiname}."
+
+        detail = parsed.get("error") or (
+            f"DB mismatch: username={parsed.get('username')}, pid={parsed.get('pid')}, "
+            f"mii={parsed.get('miiName')}, cachedHashOk={parsed.get('cachedOk')}, nexOk={parsed.get('nexOk')}."
+        )
+        return False, detail
 
     def patch_cemu_settings(self, url, is_official):
         c_dir = self.manager.cemu_dir_field.text().strip()
@@ -201,6 +380,8 @@ class EmulatorPatcher:
             return
 
         try:
+            self.manager.server_log.append(f"<span style='color:#58a6ff;'>[System] Writing Cemu identity: AccountId={username}, MiiName={miiname}</span>")
+
             # Deploy essential ccerts, identity files (otp/seeprom) and fonts
             self._ensure_console_certs(data_path)
             self._ensure_cemu_fonts(data_path)
@@ -222,9 +403,9 @@ class EmulatorPatcher:
             base_mii_hex = "030000305ac6bb2520c470f09426e82fb8ae6ed59004000000005f304b30683000000000000000000000000000004737000021010264a41820454614811217680d0000290251485000000000000000000000000000000000000000000000bfee"
             mii_buf = bytearray(binascii.unhexlify(base_mii_hex.ljust(192, '0')))
             
-            name_bytes_le = mii_name_limited.encode('utf-16le').ljust(20, b'\x00')
-            mii_buf[0x1A:0x1A+20] = name_bytes_le
-            mii_buf[0x48:0x48+20] = name_bytes_le
+            name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
+            mii_buf[0x1A:0x1A+20] = name_bytes_be
+            mii_buf[0x48:0x48+20] = name_bytes_be
             
             # CRC16-CCITT
             crc = 0
@@ -284,27 +465,144 @@ class EmulatorPatcher:
             ]
             
             p_targets = []
-            cemu_candidates = [data_path]
-            if OS_INFO["os"] == "linux":
-                home = os.path.expanduser("~")
-                cemu_candidates.extend([os.path.join(home, ".local/share/Cemu"), os.path.join(home, ".config/Cemu")])
+            cemu_candidates = self._get_cemu_data_candidates(data_path)
             
             for base in set(cemu_candidates):
                 if not base or not os.path.isdir(base): continue
-                p_targets.append(os.path.join(base, "mlc01/usr/save/system/act/80000001"))
+                act_roots = [
+                    os.path.join(base, "mlc01", "usr", "save", "system", "act"),
+                    os.path.join(base, "usr", "save", "system", "act"),
+                ]
                 p_targets.append(os.path.join(base, "accounts/80000001"))
+
+                for act_root in act_roots:
+                    p_targets.append(os.path.join(act_root, "80000001"))
+                    if os.path.isdir(act_root):
+                        for slot in os.listdir(act_root):
+                            slot_path = os.path.join(act_root, slot)
+                            if os.path.isdir(slot_path) and re.fullmatch(r"8000000[1-9a-fA-F]", slot):
+                                p_targets.append(slot_path)
+
+                accounts_root = os.path.join(base, "accounts")
+                if os.path.isdir(accounts_root):
+                    for slot in os.listdir(accounts_root):
+                        slot_path = os.path.join(accounts_root, slot)
+                        if os.path.isdir(slot_path) and re.fullmatch(r"8000000[1-9a-fA-F]", slot):
+                            p_targets.append(slot_path)
 
             for d in set(p_targets):
                 for fname in ["account.dat", "account.ini"]:
                     fpath = os.path.join(d, fname)
                     os.makedirs(os.path.dirname(fpath), exist_ok=True)
+                    self._make_cemu_account_file_writable(fpath)
                     with open(fpath, "w") as f:
                         f.write("\n".join(lines))
-                    self.manager.server_log.append(f"<span style='color:#3fb950;'>[System] Identity Updated: {fpath}</span>")
+                    secure_file(fpath)
+                    written_mii = self._read_account_file_mii_name(fpath)
+                    written_mii_data = self._read_account_file_mii_data_name(fpath)
+                    if written_mii == mii_name_limited and written_mii_data == mii_name_limited:
+                        self.manager.server_log.append(f"<span style='color:#3fb950;'>[System] Identity Updated: {fpath} (MiiName={written_mii}, MiiData={written_mii_data})</span>")
+                    else:
+                        self.manager.server_log.append(f"<span style='color:#ffa657;'>[Warning] Identity write verification mismatch: {fpath} expected {mii_name_limited}, read MiiName={written_mii or 'unknown'}, MiiData={written_mii_data or 'unknown'}</span>")
 
             self.manager.server_log.append(f"<span style='color:#3fb950;'>[System] Identity Re-aligned for {username} (PID: {pid})</span>")
         except Exception as e:
             self.manager.server_log.append(f"<span style='color:red;'>[ERROR] Identity generation failed: {e}</span>")
+
+    def _read_account_file_mii_name(self, path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            match = re.search(r"^MiiName=([0-9A-Fa-f]+)$", content, flags=re.MULTILINE)
+            if not match:
+                return ""
+            raw = bytes.fromhex(match.group(1))
+            return raw.decode("utf-16be", errors="ignore").rstrip("\x00")
+        except Exception:
+            return ""
+
+    def _make_cemu_account_file_writable(self, path):
+        if not os.path.exists(path):
+            return
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+        if os.name != "nt":
+            return
+        try:
+            subprocess.run(["attrib", "-H", "-R", path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            user = os.environ.get("USERNAME")
+            if user:
+                subprocess.run(["icacls", path, "/grant", f"{user}:(F)"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def _read_account_file_mii_data_name(self, path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            match = re.search(r"^MiiData=([0-9A-Fa-f]+)$", content, flags=re.MULTILINE)
+            if not match:
+                return ""
+            raw = bytes.fromhex(match.group(1))
+            return raw[0x1A:0x1A + 20].decode("utf-16be", errors="ignore").rstrip("\x00")
+        except Exception:
+            return ""
+
+    def _get_cemu_data_candidates(self, data_path):
+        candidates = []
+
+        def add(path):
+            if path:
+                full = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
+                if full not in candidates:
+                    candidates.append(full)
+
+        add(data_path)
+
+        if OS_INFO["os"] == "windows":
+            for env_name in ("APPDATA", "LOCALAPPDATA"):
+                base = os.environ.get(env_name)
+                if base:
+                    add(os.path.join(base, "Cemu"))
+                    add(os.path.join(base, "EmuDeck", "Emulators", "cemu"))
+                    add(os.path.join(base, "EmuDeck", "backend", "configs", "cemu"))
+        elif OS_INFO["os"] == "linux":
+            home = os.path.expanduser("~")
+            add(os.path.join(home, ".local/share/Cemu"))
+            add(os.path.join(home, ".config/Cemu"))
+
+        settings_candidates = []
+        for base in list(candidates):
+            settings_candidates.append(os.path.join(base, "settings.xml"))
+
+        for settings_path in settings_candidates:
+            mlc_path = self._read_cemu_mlc_path(settings_path)
+            if not mlc_path:
+                continue
+            if not os.path.isabs(mlc_path):
+                mlc_path = os.path.join(os.path.dirname(settings_path), mlc_path)
+            mlc_path = os.path.normpath(mlc_path)
+            if os.path.basename(mlc_path).lower() == "mlc01":
+                add(os.path.dirname(mlc_path))
+            else:
+                add(mlc_path)
+
+        return candidates
+
+    def _read_cemu_mlc_path(self, settings_path):
+        if not settings_path or not os.path.exists(settings_path):
+            return ""
+        try:
+            with open(settings_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            match = re.search(r"<mlc_path>(.*?)</mlc_path>", content, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        except Exception:
+            return ""
+        return ""
 
     def _ensure_console_certs(self, data_path):
         """Deploy essential ccerts, scerts, otp.bin, seeprom.bin and common.key to all candidates."""
@@ -441,7 +739,7 @@ class EmulatorPatcher:
 
     # ─── Docker Sync & OAuth Fix Methods ───
 
-    def _sync_docker_services_to_port(self, target_url):
+    def _sync_docker_services_to_port(self, target_url, on_done=None):
         """Patch Docker compose.yml mitmproxy port to match the Target Node URL and restart key services.
         This ensures that the emulator's configured URL correctly reaches the mitmproxy reverse-proxy,
         which in turn routes traffic through nginx to the account service — fixing 502 errors on
@@ -450,18 +748,21 @@ class EmulatorPatcher:
         s_dir = m.server_dir_field.text().strip()
         if not os.path.isdir(s_dir):
             m.server_log.append("[Docker Sync] Server directory not found — skipping Docker patching.")
+            if on_done:
+                on_done(1)
             return
 
         custom_port = m._get_target_port()
         if not custom_port.isdigit():
             m.server_log.append(f"[Docker Sync] Invalid port '{custom_port}' — skipping Docker patching.")
+            if on_done:
+                on_done(1)
             return
 
         # 1. Patch compose.yml mitmproxy port binding
         compose_changed = False
-        host_mode = m.host_net_check.isChecked()
         if hasattr(m, 'deployer') and hasattr(m.deployer, '_apply_compose_patches'):
-            compose_changed = m.deployer._apply_compose_patches(custom_port, s_dir, host_mode=host_mode)
+            compose_changed = m.deployer._apply_compose_patches(custom_port, s_dir, host_mode=False)
         if compose_changed:
             m.server_log.append(f"[Docker Sync] compose.yml updated: mitmproxy external port → {custom_port}")
         else:
@@ -473,6 +774,8 @@ class EmulatorPatcher:
         # 3. Restart the critical service chain ONLY if needed
         if not (compose_changed or env_changed):
             m.server_log.append("[Docker Sync] Docker services are stable. No restart required.")
+            if on_done:
+                on_done(0)
             return
 
         pw = m._get_effective_sudo_password()
@@ -491,7 +794,8 @@ class EmulatorPatcher:
         m._run_command(
             restart_cmd, m.server_log, cwd=s_dir,
             stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
-            display_cmd=f"[Docker Sync] Refreshing services on node {target_url}"
+            display_cmd=f"[Docker Sync] Refreshing services on node {target_url}",
+            on_done=on_done
         )
 
     def _apply_env_updates(self, target_url, s_dir):
@@ -530,6 +834,7 @@ class EmulatorPatcher:
 
                 if file_changed:
                     with open(fpath, "w") as f: f.writelines(new_lines)
+                    secure_file(fpath)
                     changed_any = True
                     m.server_log.append(f"[Docker Sync] Updated {fname} Node IP → {node_ip}")
             except Exception as e:
@@ -537,17 +842,21 @@ class EmulatorPatcher:
 
         return changed_any
 
-    def _patch_account_ban_bypass(self):
+    def _patch_account_ban_bypass(self, on_done=None):
         """Patch the account service source to disable ban checks and reset DB access levels."""
         m = self.manager
         s_dir = m.server_dir_field.text().strip()
         if not os.path.isdir(s_dir):
+            if on_done:
+                on_done(1)
             return
 
         m.server_log.append("[Anti-Ban] Checking account service ban checks...")
         repos_dir = os.path.join(s_dir, "repos", "account", "src")
         if not os.path.isdir(repos_dir):
             m.server_log.append("[Anti-Ban] Account service source not found — skipping.")
+            if on_done:
+                on_done(0)
             return
 
         ban_files = [
@@ -565,10 +874,19 @@ class EmulatorPatcher:
                 with open(fpath, "r") as f:
                     content = f.read()
 
+                file_changed = False
                 patched_content = self._comment_local_ban_checks(content)
                 if patched_content != content:
                     content = patched_content
                     rebuild_needed = True
+                    file_changed = True
+
+                if "services" + os.sep + "nnas" + os.sep + "routes" + os.sep + "oauth.ts" in fpath:
+                    patched_content = self._patch_oauth_password_compat(content)
+                    if patched_content != content:
+                        content = patched_content
+                        rebuild_needed = True
+                        file_changed = True
                 
                 # 2. Cemu Fake Files Bypass (Console Status Verification)
                 if "console-status-verification.ts" in fpath and "request.certificate.certificateName === 'NG00000000'" not in content:
@@ -588,8 +906,9 @@ class EmulatorPatcher:
                     content = content.replace("async function consoleStatusVerificationMiddleware(request: express.Request, response: express.Response, next: express.NextFunction): Promise<void> {", 
                                              f"async function consoleStatusVerificationMiddleware(request: express.Request, response: express.Response, next: express.NextFunction): Promise<void> {{{bypass_code}")
                     rebuild_needed = True
+                    file_changed = True
 
-                if rebuild_needed:
+                if file_changed:
                     with open(fpath, "w") as f:
                         f.write(content)
                     m.server_log.append(f"[Anti-Ban] Patched {os.path.basename(fpath)} for local compatibility")
@@ -602,7 +921,7 @@ class EmulatorPatcher:
         if rebuild_needed:
             m.server_log.append("[Anti-Ban] Account service source files updated. Account service will be rebuilt.")
         else:
-            m.server_log.append("[Anti-Ban] Source files already patched. Rebuilding account service to ensure compiled dist is current.")
+            m.server_log.append("[Anti-Ban] Account service source already compatible. Refreshing local account flags only.")
 
         # Reset any existing ban flags in database
         reset_mongo = (
@@ -620,12 +939,14 @@ class EmulatorPatcher:
         rebuild_cmd = "docker compose build account && docker compose up -d account"
         if pw and OS_INFO["os"] == "linux":
             rebuild_cmd = f"sudo -S {rebuild_cmd}"
-        cmd_parts.append(rebuild_cmd)
+        if rebuild_needed:
+            cmd_parts.append(rebuild_cmd)
 
         final_cmd = " && ".join(cmd_parts)
         m._run_command(final_cmd, m.server_log, cwd=s_dir,
                        stdin_data=pw if (pw and OS_INFO["os"] == "linux") else None,
-                       display_cmd="[Anti-Ban] Syncing local permission layers...")
+                       display_cmd="[Anti-Ban] Syncing local permission layers...",
+                       on_done=on_done)
 
     def _comment_local_ban_checks(self, content):
         """Disable local-stack ban responses while leaving the original source visible."""
@@ -647,6 +968,23 @@ class EmulatorPatcher:
                 flags=re.DOTALL
             )
         return result
+
+    def _patch_oauth_password_compat(self, content):
+        """Allow local Cemu OAuth to authenticate with raw or cached Nintendo password forms."""
+        if "OPEN_DOCK_OAUTH_PASSWORD_COMPAT" in content:
+            return content
+
+        content = content.replace(
+            "import { generateToken } from '@/util';",
+            "import { generateToken, nintendoPasswordHash } from '@/util';"
+        )
+
+        old = "if (!pnid || !await bcrypt.compare(password, pnid.password)) {"
+        new = """const directPasswordMatch = pnid ? await bcrypt.compare(password, pnid.password) : false;
+		const derivedPasswordMatch = pnid ? await bcrypt.compare(nintendoPasswordHash(password, pnid.pid), pnid.password) : false;
+
+		if (!pnid || (!directPasswordMatch && !derivedPasswordMatch)) { // OPEN_DOCK_OAUTH_PASSWORD_COMPAT"""
+        return content.replace(old, new)
 
     def generate_console_bundle_zip(self):
         m = self.manager
@@ -700,9 +1038,9 @@ class EmulatorPatcher:
                 base_mii_hex = "030000305ac6bb2520c470f09426e82fb8ae6ed59004000000005f304b30683000000000000000000000000000004737000021010264a41820454614811217680d0000290251485000000000000000000000000000000000000000000000bfee"
                 mii_buf = bytearray(binascii.unhexlify(base_mii_hex.ljust(192, '0')))
                 mii_name_limited = miiname[:10]
-                name_bytes_le = mii_name_limited.encode('utf-16le').ljust(20, b'\x00')
-                mii_buf[0x1A:0x1A+20] = name_bytes_le
-                mii_buf[0x48:0x48+20] = name_bytes_le
+                name_bytes_be = mii_name_limited.encode('utf-16be').ljust(20, b'\x00')
+                mii_buf[0x1A:0x1A+20] = name_bytes_be
+                mii_buf[0x48:0x48+20] = name_bytes_be
                 # Recalculate CRC16-CCITT
                 crc = 0
                 for i in range(0x5E):
@@ -795,6 +1133,7 @@ class EmulatorPatcher:
                     m.server_log.append(f"<span style='color:orange;'>[Warning] ZIP bundle cert error: {ce}</span>")
 
             with open(path, "wb") as f: f.write(buf.getvalue())
+            secure_file(path)
             QMessageBox.information(m, "Success", f"Premium Bundle created!\nLocation: {path}")
         except Exception as e:
             QMessageBox.critical(m, "Error", str(e))

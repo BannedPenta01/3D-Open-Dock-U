@@ -9,6 +9,7 @@ import time
 from PySide6.QtWidgets import QMessageBox
 from PySide6.QtCore import QTimer
 from constants import PRETENDO_REPO, SEC_KEYS
+from secrets_manager import SecretStore, get_secret_file_path, hex_token, secure_file, token
 from utils import OS_INFO, _win_to_wsl_path, get_local_ip, _docker_available, _CACHED_RESULTS
 
 class Deployer:
@@ -270,64 +271,70 @@ class Deployer:
 
     def _generate_env_files(self, s_dir, server_ip):
         """Corrected Env Generator: Fixed S3 protocols and missing MongoDB URIs."""
-        import secrets as sec_module
-        import string
         from utils import _grep_env_file
         
         def gen_password(length=32):
-            chars = string.ascii_letters + string.digits
-            return ''.join(sec_module.choice(chars) for _ in range(length))
+            return token(length)
         
         def gen_hex(length=64):
-            chars = 'ABCDEF0123456789'
-            return ''.join(sec_module.choice(chars) for _ in range(length))
+            return hex_token(length)
         
         env_dir = os.path.join(s_dir, "environment")
         os.makedirs(env_dir, exist_ok=True)
         
-        def get_existing(fname, key, fallback):
+        def get_existing(fname, key, fallback=None):
             val = _grep_env_file(os.path.join(env_dir, fname), key)
             return val if val else fallback
 
+        secret_store = SecretStore()
+
+        def managed_secret(name, fname, key, factory):
+            legacy = get_existing(fname, key)
+            return secret_store.get_or_create(name, factory, legacy=legacy)
+
         # Secrets aggregation
-        account_aes_key = get_existing("account.local.env", "PN_ACT_CONFIG_AES_KEY", gen_hex(64))
-        account_datastore_secret = get_existing("account.local.env", "PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET", gen_hex(32))
-        account_grpc_key = get_existing("account.local.env", "PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT", gen_password(32))
-        minio_secret = get_existing("account.local.env", "PN_ACT_CONFIG_S3_ACCESS_SECRET", gen_password(32))
-        postgres_pass = get_existing("postgres.local.env", "POSTGRES_PASSWORD", gen_password(32))
+        account_aes_key = managed_secret("account.aes_key", "account.local.env", "PN_ACT_CONFIG_AES_KEY", lambda: gen_hex(64))
+        account_datastore_secret = managed_secret("account.datastore_signature_secret", "account.local.env", "PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET", lambda: gen_hex(32))
+        account_grpc_key = managed_secret("account.grpc_master_api_key", "account.local.env", "PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT", lambda: gen_password(32))
+        minio_secret = managed_secret("minio.root_password", "account.local.env", "PN_ACT_CONFIG_S3_ACCESS_SECRET", lambda: gen_password(32))
+        postgres_pass = managed_secret("postgres.password", "postgres.local.env", "POSTGRES_PASSWORD", lambda: gen_password(32))
+        legacy_nex_password = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_AUTHENTICATION_PASSWORD")
+        if legacy_nex_password == "password":
+            legacy_nex_password = None
+        nex_service_password = secret_store.get_or_create("nex.service_password", lambda: gen_password(32), legacy=legacy_nex_password)
         
-        friends_auth_pw = "password"
-        friends_secure_pw = "password"
-        friends_api_key = get_existing("friends.local.env", "PN_FRIENDS_CONFIG_GRPC_API_KEY", gen_password(32))
+        friends_auth_pw = nex_service_password
+        friends_secure_pw = nex_service_password
+        friends_api_key = managed_secret("friends.grpc_api_key", "friends.local.env", "PN_FRIENDS_CONFIG_GRPC_API_KEY", lambda: gen_password(32))
         friends_aes_key = account_aes_key # Friends must use the same AES key as Account for Kerberos
         
-        chat_kerberos_pw = "password"
-        smm_kerberos_pw = "password"
-        smm_aes_key = get_existing("super-mario-maker.local.env", "PN_SMM_CONFIG_AES_KEY", gen_hex(64))
+        chat_kerberos_pw = nex_service_password
+        smm_kerberos_pw = nex_service_password
+        smm_aes_key = managed_secret("super_mario_maker.aes_key", "super-mario-maker.local.env", "PN_SMM_CONFIG_AES_KEY", lambda: gen_hex(64))
         
-        splat_kerberos_pw = "password"
-        splat_aes_key = get_existing("splatoon.local.env", "PN_SPLATOON_CONFIG_AES_KEY", gen_hex(64))
+        splat_kerberos_pw = nex_service_password
+        splat_aes_key = managed_secret("splatoon.aes_key", "splatoon.local.env", "PN_SPLATOON_CONFIG_AES_KEY", lambda: gen_hex(64))
         
-        smash_kerberos_pw = "password"
-        smash_aes_key = get_existing("super-smash-bros-wiiu.local.env", "PN_SSBWIIU_AES_KEY", 
-                                     get_existing("super-smash-bros-wiiu.local.env", "PN_SMASH_CONFIG_AES_KEY", gen_hex(64)))
+        smash_kerberos_pw = nex_service_password
+        smash_aes_key = managed_secret("super_smash_bros_wiiu.aes_key", "super-smash-bros-wiiu.local.env", "PN_SSBWIIU_AES_KEY", lambda: gen_hex(64))
         
-        mk8_kerberos_pw = "password"
-        minecraft_kerberos_pw = "password"
-        pikmin3_kerberos_pw = "password"
+        mk8_kerberos_pw = nex_service_password
+        minecraft_kerberos_pw = nex_service_password
+        pikmin3_kerberos_pw = nex_service_password
         
-        boss_api_key = get_existing("boss.local.env", "PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY", gen_password(32))
+        boss_api_key = managed_secret("boss.grpc_api_key", "boss.local.env", "PN_BOSS_CONFIG_GRPC_BOSS_SERVER_API_KEY", lambda: gen_password(32))
         
         # Load known keys if available from SEC_KEYS
         sk = SEC_KEYS
-        boss_wiiu_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY", sk.get("BOSS_WIIU_AES_KEY", gen_hex(32)))
-        boss_wiiu_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY", sk.get("BOSS_WIIU_HMAC_KEY", gen_hex(32)))
-        boss_3ds_aes = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_AES_KEY", sk.get("BOSS_3DS_AES_KEY", gen_hex(32)))
-        boss_3ds_hmac = get_existing("boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY", gen_hex(32))
+        boss_wiiu_aes = managed_secret("boss.wiiu_aes_key", "boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_AES_KEY", lambda: sk.get("BOSS_WIIU_AES_KEY", gen_hex(32)))
+        boss_wiiu_hmac = managed_secret("boss.wiiu_hmac_key", "boss.local.env", "PN_BOSS_CONFIG_BOSS_WIIU_HMAC_KEY", lambda: sk.get("BOSS_WIIU_HMAC_KEY", gen_hex(32)))
+        boss_3ds_aes = managed_secret("boss.3ds_aes_key", "boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_AES_KEY", lambda: sk.get("BOSS_3DS_AES_KEY", gen_hex(32)))
+        boss_3ds_hmac = managed_secret("boss.3ds_hmac_key", "boss.local.env", "PN_BOSS_CONFIG_BOSS_3DS_HMAC_KEY", lambda: gen_hex(32))
         
-        pokken_kerberos_pw = "password"
-        pokken_aes_key = get_existing("pokken-tournament.local.env", "PN_POKKENTOURNAMENT_CONFIG_AES_KEY", gen_hex(64))
-        mk8_aes_key = get_existing("mario-kart-8.local.env", "PN_MK8_CONFIG_AES_KEY", gen_hex(64))
+        pokken_kerberos_pw = nex_service_password
+        pokken_aes_key = managed_secret("pokken_tournament.aes_key", "pokken-tournament.local.env", "PN_POKKENTOURNAMENT_CONFIG_AES_KEY", lambda: gen_hex(64))
+        mk8_aes_key = managed_secret("mario_kart_8.aes_key", "mario-kart-8.local.env", "PN_MK8_CONFIG_AES_KEY", lambda: gen_hex(64))
+        secret_store.save()
         
         env_files = {}
 
@@ -567,6 +574,7 @@ class Deployer:
             filepath = os.path.join(env_dir, filename)
             with open(filepath, "w") as f:
                 f.write("\n".join(lines) + "\n")
+            secure_file(filepath)
             self.manager.setup_log.append(f"  [ENV] Created {filename}")
             
             # Ensure the non-local version exists too (satisfied by empty if referenced in compose)
@@ -576,6 +584,7 @@ class Deployer:
                 if not os.path.exists(base_path):
                     with open(base_path, "w") as f:
                         f.write("# Placeholder env file\n")
+                    secure_file(base_path)
                     self.manager.setup_log.append(f"  [ENV] Created placeholder {base_env}")
         
         for fname in os.listdir(env_dir):
@@ -585,25 +594,23 @@ class Deployer:
                 if not os.path.exists(local_path):
                     with open(local_path, "w") as f:
                         f.write("# Auto-generated empty local env\n")
+                    secure_file(local_path)
                     self.manager.setup_log.append(f"  [ENV] Created empty {local_name}")
         
         root_env = os.path.join(s_dir, ".env")
         with open(root_env, "w") as f:
             f.write(f"SERVER_IP={server_ip}\n")
+        secure_file(root_env)
         self.manager.setup_log.append(f"  [ENV] Created .env (SERVER_IP={server_ip})")
         
-        secrets_path = os.path.join(s_dir, "secrets.txt")
-        with open(secrets_path, "w") as f:
-            f.write(f"""Pretendo Network server secrets
-===============================
-
-MinIO root username: minio_pretendo
-MinIO root password: {minio_secret}
-Postgres username: postgres_pretendo
-Postgres password: {postgres_pass}
-Server IP address: {server_ip}
-""")
-        self.manager.setup_log.append("  [ENV] Created secrets.txt")
+        old_secrets_path = os.path.join(s_dir, "secrets.txt")
+        if os.path.exists(old_secrets_path):
+            try:
+                os.remove(old_secrets_path)
+                self.manager.setup_log.append("  [SECURITY] Removed old in-repo secrets.txt")
+            except Exception as e:
+                self.manager.setup_log.append(f"  [WARN] Could not remove old secrets.txt: {e}")
+        self.manager.setup_log.append(f"  [SECURITY] Secrets source: {get_secret_file_path()}")
 
     def _ensure_smm_metadata(self, s_dir):
         """Ensure 900000.bin exists to prevent 'specified key does not exist' S3 error."""
@@ -789,6 +796,9 @@ Server IP address: {server_ip}
 
     def _apply_compose_patches(self, port, s_dir, host_mode=False):
         """Robust YAML patching for mitmproxy port, Postgres health, and service injections."""
+        # Host networking breaks Docker service-name DNS (mongodb/postgres/redis) and makes
+        # every Go service collide on its internal Delve port 2345. Keep bridge networking.
+        host_mode = False
         applied_any = False
         for fname in ["compose.yaml", "compose.yml", "docker-compose.yml"]:
             path = os.path.join(s_dir, fname)
@@ -830,29 +840,10 @@ Server IP address: {server_ip}
                         current_section = None
                         in_ports = False
                         in_networks = False
-                        if host_mode and current_service:
-                             new_lines.append(line)
-                             next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
-                             if next_line != "network_mode: host":
-                                 new_lines.append("    network_mode: host\n")
-                                 changed = True
-                             continue
 
-                    if host_mode:
-                        # Skip port/network/dns definitions inside services in host mode.
-                        # Keep depends_on; dropping only the key leaves invalid orphaned YAML children.
-                        if current_service and (in_ports or stripped == "ports:"):
-                            changed = True
-                            continue
-                        if current_service and (in_networks or stripped == "networks:"):
-                            changed = True
-                            continue
-                        if current_service and stripped == "dns: 172.20.0.200":
-                            changed = True
-                            continue
-                        if current_service and (stripped.startswith("networks:") or stripped.startswith("dns:")):
-                            changed = True
-                            continue
+                    if current_service and stripped == "network_mode: host":
+                        changed = True
+                        continue
 
                     # 1. mitmproxy-pretendo: update external port
                     if current_service == "mitmproxy-pretendo":
@@ -1471,8 +1462,10 @@ TournamentsCollection=tourneys
             }
         }
         try:
-            with open(os.path.join(ui_repo, "config.json"), "w") as f:
+            config_path = os.path.join(ui_repo, "config.json")
+            with open(config_path, "w") as f:
                 json.dump(config, f, indent=4)
+            secure_file(config_path)
         except: pass
 
     def _inject_missing_services(self, s_dir):

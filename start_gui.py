@@ -26,6 +26,7 @@ from constants import (
     BG_DARK, BG_CARD, GREEN_MONEY, ORANGE_ACCOUNT
 )
 from utils import OS_INFO, DEFAULT_SERVER_DIR, CEMU_DIR, _obs, _deobs, get_local_ip, has_internet_connectivity
+from secrets_manager import SecretStore
 
 # Import mixins
 from mixins.server_mixin import ManagerServerMixin
@@ -381,14 +382,30 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         self.cemu_miiname.blockSignals(True)
         if hasattr(self, 'server_sudo_pass'): self.server_sudo_pass.blockSignals(True)
 
+        store = SecretStore()
+        password_ref = self.settings.value("password_ref", "ui.cemu_password")
+        saved_password = store.get(str(password_ref), "")
+        legacy_password = self.settings.value("password", "")
+        if not saved_password and legacy_password:
+            saved_password = _deobs(legacy_password)
+            store.set(str(password_ref), saved_password, save=True)
+            self.settings.setValue("password_ref", str(password_ref))
+            self.settings.remove("password")
+
         self.cemu_username.setText(str(self.settings.value("username", "")))
-        self.cemu_password.setText(_deobs(self.settings.value("password", "")))
+        self.cemu_password.setText(saved_password)
         self.cemu_miiname.setText(str(self.settings.value("miiname", "")))
         self.server_dir_field.setText(str(self.settings.value("server_dir", DEFAULT_SERVER_DIR)))
         self.cemu_dir_field.setText(str(self.settings.value("cemu_dir", CEMU_DIR)))
         
+        sudo_ref = self.settings.value("sudo_cache_ref", "ui.sudo_cache")
+        self.cached_password = store.get(str(sudo_ref), None)
         saved_sudo = self.settings.value("sudo_cache", None)
-        self.cached_password = _deobs(saved_sudo) if saved_sudo else None
+        if not self.cached_password and saved_sudo:
+            self.cached_password = _deobs(saved_sudo)
+            store.set(str(sudo_ref), self.cached_password, save=True)
+            self.settings.setValue("sudo_cache_ref", str(sudo_ref))
+            self.settings.remove("sudo_cache")
         if self.cached_password and hasattr(self, 'server_sudo_pass'):
             self.server_sudo_pass.setText(str(self.cached_password))
 
@@ -401,8 +418,11 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         if hasattr(self, 'server_sudo_pass'): self.server_sudo_pass.blockSignals(False)
 
     def save_settings(self):
+        store = SecretStore()
         self.settings.setValue("username", self.cemu_username.text())
-        self.settings.setValue("password", _obs(self.cemu_password.text()))
+        store.set("ui.cemu_password", self.cemu_password.text(), save=False)
+        self.settings.setValue("password_ref", "ui.cemu_password")
+        self.settings.remove("password")
         self.settings.setValue("miiname", self.cemu_miiname.text())
         self.settings.setValue("server_dir", self.server_dir_field.text())
         self.settings.setValue("cemu_dir", self.cemu_dir_field.text())
@@ -411,13 +431,20 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         if hasattr(self, 'server_sudo_pass'):
             sudo_pw = self.server_sudo_pass.text()
             if sudo_pw:
-                self.settings.setValue("sudo_cache", _obs(sudo_pw))
+                store.set("ui.sudo_cache", sudo_pw, save=False)
+                self.settings.setValue("sudo_cache_ref", "ui.sudo_cache")
+                self.settings.remove("sudo_cache")
                 self.cached_password = sudo_pw
+        store.save()
         self.settings.sync()
 
     def clear_sensitive_data(self):
         res = QMessageBox.warning(self, "Clear Data", "Permanently wipe credentials and admin password?", QMessageBox.Yes | QMessageBox.No)
         if res == QMessageBox.Yes:
+            store = SecretStore()
+            for key in ("ui.cemu_password", "ui.sudo_cache"):
+                store.delete(key, save=False)
+            store.save()
             self.cached_password = None
             self.cemu_username.clear()
             self.cemu_password.clear()
