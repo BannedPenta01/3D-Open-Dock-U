@@ -468,6 +468,7 @@ exit 0
             "PN_FRIENDS_CONFIG_SECURE_SERVER_PORT=60001",
             f"PN_FRIENDS_SECURE_SERVER_HOST={server_ip}",
             f"PN_FRIENDS_CONFIG_SECURE_SERVER_HOST={server_ip}",
+            f"PN_FRIENDS_CONFIG_AUTHENTICATION_SERVER_HOST={server_ip}",
         ]
 
         # 2b. Website
@@ -1414,11 +1415,13 @@ EXPOSE 60140/udp 60150/udp
 CMD ["./start.sh"]
 ''')
 
-        # Generate secure.config for mk8-secure
+        # Generate secure.config for mk8-secure. Keep this aligned with the
+        # compose-published MK8 secure port; otherwise account sends Cemu to a
+        # port with no PRUDP listener.
         secure_config = os.path.join(mk8_dir, "mk8-secure", "secure.config")
         self._write_file(secure_config, """PrudpVersion=1
 SignatureVersion=1
-ServerPort=60003
+ServerPort=60150
 KerberosKeySize=32
 AccessKey=25dbf96a
 ServerName=Pretendo MK8 Secure
@@ -1450,7 +1453,48 @@ TournamentsCollection=tourneys
 
     def _apply_mk8_source_patches(self, mk8_dir):
         # Apply targeted casing/signature fixes to MK8 Go source for nex-go v1.0.14 compat.
+        auth_dir = os.path.join(mk8_dir, "mk8-authentication")
         secure_dir = os.path.join(mk8_dir, "mk8-secure")
+        if os.path.isdir(auth_dir):
+            auth_main_go = os.path.join(auth_dir, "main.go")
+            if os.path.isfile(auth_main_go):
+                with open(auth_main_go, 'r', encoding='utf-8') as f: c = f.read()
+                if '"os"' not in c:
+                    c = c.replace('"fmt"\n', '"fmt"\n\t"os"\n')
+                c = c.replace('nexServer.Listen(":60002")', 'nexServer.Listen(":" + getenvDefault("PN_MK8_AUTHENTICATION_SERVER_PORT", "60140"))')
+                if 'func getenvDefault(' not in c:
+                    c += '''
+
+func getenvDefault(key string, fallback string) string {
+\tvalue := os.Getenv(key)
+\tif value == "" {
+\t\treturn fallback
+\t}
+\treturn value
+}
+'''
+                with open(auth_main_go, 'w', encoding='utf-8') as f: f.write(c)
+
+            login_ex_go = os.path.join(auth_dir, "login_ex.go")
+            if os.path.isfile(login_ex_go):
+                with open(login_ex_go, 'r', encoding='utf-8') as f: c = f.read()
+                c = c.replace('stationURL := "prudps:/address=163.123.195.148;port=60003;CID=1;PID=2;sid=1;stream=10;type=2"',
+                              'stationURL := fmt.Sprintf("prudps:/address=%s;port=%s;CID=1;PID=2;sid=1;stream=10;type=2", getenvDefault("PN_MK8_SECURE_SERVER_HOST", "127.0.0.1"), getenvDefault("PN_MK8_SECURE_SERVER_PORT", "60150"))')
+                c = c.replace('serverName := "Pretendo MK7"', 'serverName := "Pretendo MK8"')
+                with open(login_ex_go, 'w', encoding='utf-8') as f: f.write(c)
+
+            kerberos_go = os.path.join(auth_dir, "kerberos.go")
+            if os.path.isfile(kerberos_go):
+                with open(kerberos_go, 'r', encoding='utf-8') as f: c = f.read()
+                c = c.replace('serverPassword := "password"', 'serverPassword := getenvDefault("PN_MK8_KERBEROS_PASSWORD", "password")')
+                with open(kerberos_go, 'w', encoding='utf-8') as f: f.write(c)
+
+            auth_db_go = os.path.join(auth_dir, "database.go")
+            if os.path.isfile(auth_db_go):
+                with open(auth_db_go, 'r', encoding='utf-8') as f: c = f.read()
+                c = c.replace('mongoDatabase = mongoClient.Database("pretendo")', 'mongoDatabase = mongoClient.Database(getenvDefault("PN_MK8_ACCOUNT_DATABASE", "pretendo"))')
+                with open(auth_db_go, 'w', encoding='utf-8') as f: f.write(c)
+
         if not os.path.isdir(secure_dir): return
 
         # --- main.go: NAT Traversal casing ---

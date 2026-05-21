@@ -692,49 +692,163 @@ const mongoose = require("mongoose");
         self.manager.server_log.append("[System] Mii font check complete.")
 
     def patch_citra(self, mode):
+        m = self.manager
         citra_dir = self.manager.citra_dir_field.text().strip()
         if not citra_dir or not os.path.isdir(citra_dir):
             QMessageBox.warning(self.manager, "Directory Error", f"Citra directory not found or not specified.")
             return
 
         self.manager.server_log.append("<b>[System]</b> Selected Target 3DS Node.")
-        # Search for qt-config.ini in common locations
-        config_candidates = [
-            os.path.join(citra_dir, "config", "qt-config.ini"),
-            os.path.join(citra_dir, "qt-config.ini"),
-        ]
-        
-        p = None
-        for candidate in config_candidates:
-            if os.path.exists(candidate):
-                p = candidate
-                break
-        
-        if not p:
+
+        config_candidates = self._find_citra_config_candidates(citra_dir)
+        if not config_candidates:
             QMessageBox.warning(self.manager, "File Error", f"Could not locate qt-config.ini in {citra_dir}")
             return
         
-        target_url = self.manager.patch_url_input.text().strip()
+        if mode == "nintendo_restore":
+            target_url = "https://api.accounts.nintendo.com"
+            is_local = False
+        elif mode == "official_restore":
+            target_url = "https://api.pretendo.network"
+            is_local = False
+        elif mode == "reset_default":
+            target_url = "https://api.citra-emu.org"
+            is_local = False
+        else:
+            target_url = self.manager.patch_url_input.text().strip()
+            is_local = True
+
+        normalized_url, local_ip, local_port = self._normalize_target_url(target_url, is_official=not is_local)
+
+        def finish_patch():
+            try:
+                patched = []
+                for p in config_candidates:
+                    if self._patch_citra_config_file(p, normalized_url):
+                        patched.append(p)
+
+                self._write_citra_local_identity_files(citra_dir, normalized_url, local_ip, local_port)
+                for p in config_candidates:
+                    config_parent = os.path.dirname(p)
+                    user_base = os.path.dirname(config_parent) if os.path.basename(config_parent).lower() == "config" else config_parent
+                    self._write_citra_local_identity_files(user_base, normalized_url, local_ip, local_port)
+
+                for p in patched:
+                    self.manager.server_log.append(f"<span style='color:#3fb950;'>[System] 3DS config patched: {p}</span>")
+
+                QApplication.processEvents()
+                QMessageBox.information(
+                    self.manager,
+                    "3DS Patch Complete",
+                    f"Citra/Lime3DS/Azahar has been patched.\n\nAPI URL: {normalized_url}\n\nLocal account data has been synchronized when applicable."
+                )
+            except Exception as e:
+                self.manager.server_log.append(f"<span style='color:red;'>[ERROR] 3DS patch failed: {e}</span>")
+                QMessageBox.critical(self.manager, "Error", f"3DS patch failed: {e}")
+
+        def after_docker_sync(code):
+            if code != 0:
+                m.server_log.append("<span style='color:#ffa657;'>[Docker Sync] 3DS patch continuing, but Docker service sync did not complete.</span>")
+                finish_patch()
+                return
+            if hasattr(m, 'create_local_account'):
+                m.create_local_account(silent=True, on_done=lambda _account_code: finish_patch())
+            else:
+                finish_patch()
+
+        if is_local:
+            self._sync_docker_services_to_port(normalized_url, on_done=after_docker_sync)
+        else:
+            finish_patch()
+
+    def _find_citra_config_candidates(self, citra_dir):
+        candidates = [
+            citra_dir if os.path.basename(citra_dir).lower() == "qt-config.ini" else "",
+            os.path.join(citra_dir, "config", "qt-config.ini"),
+            os.path.join(citra_dir, "user", "config", "qt-config.ini"),
+            os.path.join(citra_dir, "qt-config.ini"),
+        ]
+        appdata = os.environ.get("APPDATA", "")
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        for base in [appdata, localappdata]:
+            if not base:
+                continue
+            candidates.extend([
+                os.path.join(base, "Citra", "config", "qt-config.ini"),
+                os.path.join(base, "Lime3DS", "config", "qt-config.ini"),
+                os.path.join(base, "Azahar", "config", "qt-config.ini"),
+                os.path.join(base, "Azahar", "qt-config.ini"),
+            ])
+
+        seen = set()
+        existing = []
+        for candidate in candidates:
+            if not candidate:
+                continue
+            key = os.path.normcase(os.path.abspath(candidate))
+            if key in seen:
+                continue
+            seen.add(key)
+            if os.path.isfile(candidate):
+                existing.append(candidate)
+        return existing
+
+    def _patch_citra_config_file(self, path, target_url):
         try:
-            with open(p, "r") as f: lines = f.readlines()
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()
             new_lines = []
-            found = False
+            found_url = False
+            found_default = False
             for line in lines:
                 if line.startswith("web_api_url="):
                     new_lines.append(f"web_api_url={target_url}\n")
-                    found = True
-                else: new_lines.append(line)
+                    found_url = True
+                elif line.startswith("web_api_url\\default="):
+                    new_lines.append("web_api_url\\default=false\n")
+                    found_default = True
+                else:
+                    new_lines.append(line)
             
-            if not found:
+            if not found_url:
                 new_lines.append(f"web_api_url={target_url}\n")
+            if not found_default:
+                new_lines.append("web_api_url\\default=false\n")
                 
-            with open(p, "w") as f: f.writelines(new_lines)
-            self.manager.server_log.append(f"<span style='color:#3fb950;'>[System] Citra patched successfully: {p}</span>")
-            QApplication.processEvents()
-            QMessageBox.information(self.manager, "Citra Patch Complete", f"Citra has been successfully patched.\n\nAPI URL has been updated to point to: {target_url}\n\nYou can now launch Citra and play online.")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.writelines(new_lines)
+            return True
         except Exception as e:
-            self.manager.server_log.append(f"<span style='color:red;'>[ERROR] Citra patch failed: {e}</span>")
-            QMessageBox.critical(self.manager, "Error", f"Citra patch failed: {e}")
+            self.manager.server_log.append(f"<span style='color:#ffa657;'>[3DS] Could not patch {path}: {e}</span>")
+            return False
+
+    def _write_citra_local_identity_files(self, citra_dir, target_url, local_ip, local_port):
+        payloads = {
+            "local_server_url.txt": f"{target_url}\nHost: {local_ip}\nPort: {local_port or ''}\n".encode("utf-8"),
+            "movable.sed": (b"\x00" * 0x110) + (b"\x00" * 0x10),
+            "SecureInfo_A": (b"\x00" * 0x100) + f"YW{random.randint(100000000, 999999999)}".encode("ascii").ljust(15, b"\x00"),
+            "LocalFriendCodeSeed_B": os.urandom(0x110),
+        }
+        roots = [os.path.join(citra_dir, "sysdata")]
+        user_root = os.path.join(citra_dir, "user")
+        if os.path.isdir(user_root):
+            roots.append(os.path.join(user_root, "sysdata"))
+
+        wrote_any = False
+        for root in roots:
+            try:
+                os.makedirs(root, exist_ok=True)
+                for name, data in payloads.items():
+                    path = os.path.join(root, name)
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    secure_file(path)
+                wrote_any = True
+            except Exception as e:
+                self.manager.server_log.append(f"<span style='color:#ffa657;'>[3DS] Could not write sysdata under {root}: {e}</span>")
+
+        if wrote_any:
+            self.manager.server_log.append("<span style='color:#3fb950;'>[3DS] Local sysdata helper files refreshed for Citra/Lime3DS/Azahar.</span>")
 
     # ─── Docker Sync & OAuth Fix Methods ───
 
