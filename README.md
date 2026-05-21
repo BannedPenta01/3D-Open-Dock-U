@@ -8,3 +8,7 @@ Supported features:
 - Made 100% with AI, just in case.
 
 Note: 3D Open Dock U uses Antigravity and Codex AIs in order for all of this to work. Yes this thing actually works
+
+Credits to Pretendo Network for the source code and manual reverse engineering I based the backend on.
+
+https://pretendo.network/
