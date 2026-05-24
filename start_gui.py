@@ -5,6 +5,9 @@ import sys
 import platform
 import shutil
 import socket
+import json
+import re
+import subprocess
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
@@ -15,7 +18,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QMessageBox, QFileDialog, QProgressBar, QFrame,
     QScrollArea, QSizePolicy, QSpacerItem, QInputDialog, QDialog,
     QCheckBox, QDialogButtonBox, QScroller, QScrollerProperties,
-    QListWidget, QListWidgetItem, QRadioButton, QButtonGroup
+    QListWidget, QListWidgetItem, QRadioButton, QButtonGroup, QColorDialog
 )
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QSettings, QTimer, QDir, QLockFile, QStandardPaths
 from PySide6.QtGui import QColor, QPixmap, QIcon
@@ -81,6 +84,7 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         self._last_compose_port = None
         self._last_env_ip = None
         self._last_connection_check = 0
+        self.server_profiles = []
         
         self._init_ui()
         self.load_settings()
@@ -122,6 +126,7 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         root.addWidget(sep)
 
         self.tabs = QTabWidget()
+        self.tabs.addTab(make_scrollable(self._build_quick_start_tab()), "Quick Start")
         self.tabs.addTab(make_scrollable(self._build_dashboard_tab()), "Server & Deployment")
         self.tabs.addTab(make_scrollable(self._build_emulator_tab()), "Identities & Emulators")
         self.tabs.addTab(make_scrollable(self._build_guide_tab()), "Help & Guide")
@@ -153,6 +158,601 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         root.addLayout(footer_layout)
         
         self.setStyleSheet(STYLESHEET)
+
+    def _build_quick_start_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        title = QLabel("Quick Start")
+        title.setStyleSheet(f"color: {CYAN_LIGHT}; font-size: 24px; font-weight: bold;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        subtitle = QLabel("Run your local stack on the left, or pick a saved server on the right.")
+        subtitle.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 13px;")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        main = QHBoxLayout()
+        main.setSpacing(14)
+
+        left_half = QWidget()
+        left_lay = QVBoxLayout(left_half)
+        left_lay.setContentsMargins(0, 0, 0, 0)
+        left_lay.setSpacing(10)
+
+        self.quick_local_address = QLabel(f"Local server address: http://{get_local_ip()}:8070")
+        self.quick_local_address.setStyleSheet(f"color: {GREEN_MONEY}; font-size: 14px; font-weight: bold;")
+        self.quick_local_address.setAlignment(Qt.AlignCenter)
+        left_lay.addWidget(self.quick_local_address)
+
+        local = QGroupBox("Play on My Local Server")
+        local_lay = QVBoxLayout(local)
+        local_text = QLabel("Use this when the server runs on this PC.")
+        local_text.setWordWrap(True)
+        local_text.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        local_lay.addWidget(local_text)
+        self.quick_prepare_btn = QPushButton("Prepare Server")
+        self.quick_prepare_btn.setObjectName("startBtn")
+        self.quick_prepare_btn.setMinimumHeight(52)
+        self.quick_prepare_btn.clicked.connect(self.quick_prepare_or_stop_server)
+        local_lay.addWidget(self.quick_prepare_btn)
+        self.quick_server_toggle_btn = QPushButton("Quick Start Server")
+        self.quick_server_toggle_btn.setObjectName("startBtn")
+        self.quick_server_toggle_btn.setMinimumHeight(42)
+        self.quick_server_toggle_btn.clicked.connect(self.quick_toggle_server)
+        local_lay.addWidget(self.quick_server_toggle_btn)
+        local_play_row = QHBoxLayout()
+        play_cemu_btn = QPushButton("Play Cemu")
+        play_cemu_btn.setStyleSheet("background: #007c89; color: white; border-color: #00AEDE;")
+        play_cemu_btn.clicked.connect(lambda: self.quick_play_emulator("cemu"))
+        play_citra_btn = QPushButton("Play Citra")
+        play_citra_btn.setStyleSheet("background: #5c1111; color: white; border-color: #8B0000;")
+        play_citra_btn.clicked.connect(lambda: self.quick_play_emulator("citra"))
+        local_play_row.addWidget(play_cemu_btn)
+        local_play_row.addWidget(play_citra_btn)
+        local_lay.addLayout(local_play_row)
+        left_lay.addWidget(local)
+
+        account = QGroupBox("Console Identity")
+        account_lay = QFormLayout(account)
+        self.quick_cemu_username = QLineEdit()
+        self.quick_cemu_username.setMaxLength(16)
+        self.quick_cemu_password = QLineEdit()
+        self.quick_cemu_password.setEchoMode(QLineEdit.Password)
+        self.quick_cemu_miiname = QLineEdit()
+        self.quick_cemu_miiname.setMaxLength(10)
+        self.quick_cemu_username.textChanged.connect(self._sync_quick_identity_to_advanced)
+        self.quick_cemu_password.textChanged.connect(self._sync_quick_identity_to_advanced)
+        self.quick_cemu_miiname.textChanged.connect(self._sync_quick_identity_to_advanced)
+        account_lay.addRow("Username:", self.quick_cemu_username)
+        account_lay.addRow("Password:", self.quick_cemu_password)
+        account_lay.addRow("Mii Name:", self.quick_cemu_miiname)
+        identity_patch_row = QHBoxLayout()
+        identity_cemu_btn = QPushButton("Patch Cemu")
+        identity_cemu_btn.setStyleSheet("background: #007c89; color: white; border-color: #00AEDE;")
+        identity_cemu_btn.clicked.connect(self.quick_patch_cemu)
+        identity_citra_btn = QPushButton("Patch Citra")
+        identity_citra_btn.setStyleSheet("background: #5c1111; color: white; border-color: #8B0000;")
+        identity_citra_btn.clicked.connect(self.quick_patch_citra)
+        identity_patch_row.addWidget(identity_cemu_btn)
+        identity_patch_row.addWidget(identity_citra_btn)
+        account_lay.addRow(identity_patch_row)
+        left_lay.addWidget(account)
+
+        join = QGroupBox("Join Someone Else's Server")
+        join_lay = QVBoxLayout(join)
+        join_text = QLabel("Paste a server address here if it is not in your saved server list.")
+        join_text.setWordWrap(True)
+        join_text.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        join_lay.addWidget(join_text)
+        self.quick_join_url = QLineEdit()
+        self.quick_join_url.setPlaceholderText("Example: http://123.45.67.89:8070")
+        self.quick_join_url.editingFinished.connect(self.quick_join_server)
+        join_lay.addWidget(self.quick_join_url)
+        join_hint = QLabel("The target node updates automatically when you leave this field.")
+        join_hint.setWordWrap(True)
+        join_hint.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
+        join_lay.addWidget(join_hint)
+        quick_patch_row = QHBoxLayout()
+        quick_cemu_btn = QPushButton("Patch Cemu")
+        quick_cemu_btn.setStyleSheet("background: #007c89; color: white; border-color: #00AEDE;")
+        quick_cemu_btn.clicked.connect(self.quick_patch_cemu)
+        quick_citra_btn = QPushButton("Patch Citra")
+        quick_citra_btn.setStyleSheet("background: #5c1111; color: white; border-color: #8B0000;")
+        quick_citra_btn.clicked.connect(self.quick_patch_citra)
+        quick_patch_row.addWidget(quick_cemu_btn)
+        quick_patch_row.addWidget(quick_citra_btn)
+        join_lay.addLayout(quick_patch_row)
+        left_lay.addWidget(join)
+        left_lay.addStretch(1)
+        main.addWidget(left_half, 1)
+
+        directory = QGroupBox("Saved Servers")
+        directory_lay = QVBoxLayout(directory)
+        server_help = QLabel("Choose a server profile, then patch Cemu or Citra. Game labels are shown first so the list stays scannable.")
+        server_help.setWordWrap(True)
+        server_help.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        directory_lay.addWidget(server_help)
+
+        self.server_profile_list = QListWidget()
+        self.server_profile_list.setMinimumHeight(260)
+        self.server_profile_list.itemDoubleClicked.connect(lambda _item: self.quick_use_selected_server())
+        directory_lay.addWidget(self.server_profile_list, 1)
+
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QPushButton("Add", clicked=self.quick_add_server_profile))
+        profile_row.addWidget(QPushButton("Edit", clicked=self.quick_edit_server_profile))
+        profile_row.addWidget(QPushButton("Remove", clicked=self.quick_remove_server_profile))
+        directory_lay.addLayout(profile_row)
+
+        file_row = QHBoxLayout()
+        file_row.addWidget(QPushButton("Open host.json", clicked=self.open_host_json))
+        file_row.addWidget(QPushButton("Reload List", clicked=self.reload_host_json))
+        directory_lay.addLayout(file_row)
+
+        patch_row = QHBoxLayout()
+        use_btn = QPushButton("Use Selected")
+        use_btn.setObjectName("patchBtn")
+        use_btn.clicked.connect(self.quick_use_selected_server)
+        patch_row.addWidget(use_btn)
+        selected_cemu_btn = QPushButton("Patch Cemu")
+        selected_cemu_btn.setStyleSheet("background: #007c89; color: white; border-color: #00AEDE;")
+        selected_cemu_btn.clicked.connect(lambda: self.quick_patch_selected_server("cemu"))
+        selected_citra_btn = QPushButton("Patch Citra")
+        selected_citra_btn.setStyleSheet("background: #5c1111; color: white; border-color: #8B0000;")
+        selected_citra_btn.clicked.connect(lambda: self.quick_patch_selected_server("citra"))
+        patch_row.addWidget(selected_cemu_btn)
+        patch_row.addWidget(selected_citra_btn)
+        directory_lay.addLayout(patch_row)
+
+        main.addWidget(directory, 1)
+        layout.addLayout(main, 1)
+        return w
+
+    def _quick_local_url(self):
+        return f"http://{get_local_ip()}:8070"
+
+    def _quick_set_target(self, url, message=None):
+        normalized, _, _ = self._resolve_target_node(url=url, is_official=False)
+        if hasattr(self, "patch_url_input"):
+            self.patch_url_input.setText(normalized)
+        if hasattr(self, "mode_local"):
+            self.mode_local.setChecked(True)
+        if hasattr(self, "mode_pretendo"):
+            self.mode_pretendo.setChecked(False)
+        if hasattr(self, "quick_join_url"):
+            self.quick_join_url.setText(normalized)
+        if message:
+            self.statusBar().showMessage(message, 8000)
+        self.save_settings()
+        return normalized
+
+    def _sync_quick_identity_to_advanced(self):
+        if not all(hasattr(self, name) for name in ("cemu_username", "cemu_password", "cemu_miiname", "quick_cemu_username", "quick_cemu_password", "quick_cemu_miiname")):
+            return
+        self.cemu_username.blockSignals(True)
+        self.cemu_password.blockSignals(True)
+        self.cemu_miiname.blockSignals(True)
+        self.cemu_username.setText(self.quick_cemu_username.text())
+        self.cemu_password.setText(self.quick_cemu_password.text())
+        self.cemu_miiname.setText(self.quick_cemu_miiname.text())
+        self.cemu_username.blockSignals(False)
+        self.cemu_password.blockSignals(False)
+        self.cemu_miiname.blockSignals(False)
+        self.save_settings()
+
+    def _sync_advanced_identity_to_quick(self):
+        if not all(hasattr(self, name) for name in ("cemu_username", "cemu_password", "cemu_miiname", "quick_cemu_username", "quick_cemu_password", "quick_cemu_miiname")):
+            return
+        self.quick_cemu_username.blockSignals(True)
+        self.quick_cemu_password.blockSignals(True)
+        self.quick_cemu_miiname.blockSignals(True)
+        self.quick_cemu_username.setText(self.cemu_username.text())
+        self.quick_cemu_password.setText(self.cemu_password.text())
+        self.quick_cemu_miiname.setText(self.cemu_miiname.text())
+        self.quick_cemu_username.blockSignals(False)
+        self.quick_cemu_password.blockSignals(False)
+        self.quick_cemu_miiname.blockSignals(False)
+
+    def _normalize_color(self, value, fallback):
+        color = str(value or "").strip()
+        if re.match(r"^#[0-9a-fA-F]{6}$", color):
+            return color
+        return fallback
+
+    def _pick_color_for_field(self, field, fallback):
+        current = QColor(self._normalize_color(field.text(), fallback))
+        color = QColorDialog.getColor(current, self, "Choose Color")
+        if color.isValid():
+            field.setText(color.name())
+
+    def _default_server_profiles(self):
+        local_url = self._quick_local_url()
+        return [
+            {"game": "Splatoon", "name": "My Local Server", "url": local_url, "game_color": CYAN_LIGHT, "name_color": GREEN_MONEY},
+            {"game": "Mario Kart 8", "name": "My Local Server", "url": local_url, "game_color": "#ff4d4d", "name_color": GREEN_MONEY},
+            {"game": "Smash Wii U", "name": "My Local Server", "url": local_url, "game_color": "#d7b7ff", "name_color": GREEN_MONEY},
+        ]
+
+    def _host_json_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "host.json")
+
+    def _coerce_server_profiles(self, payload):
+        profiles = payload.get("servers", payload) if isinstance(payload, dict) else payload
+        if not isinstance(profiles, list):
+            return []
+
+        clean = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            game = str(profile.get("game", "")).strip()
+            name = str(profile.get("name", "")).strip()
+            url = str(profile.get("url", "")).strip()
+            game_color = self._normalize_color(profile.get("game_color", CYAN_LIGHT), CYAN_LIGHT)
+            name_color = self._normalize_color(profile.get("name_color", GREEN_MONEY), GREEN_MONEY)
+            if game and name and url:
+                clean.append({"game": game, "name": name, "url": url, "game_color": game_color, "name_color": name_color})
+        return clean
+
+    def _load_server_profiles(self):
+        path = self._host_json_path()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    clean = self._coerce_server_profiles(json.load(f))
+                if clean:
+                    self.server_profiles = clean
+                    return
+            except Exception as error:
+                QMessageBox.warning(self, "host.json Error", f"Could not read host.json:\n\n{error}")
+
+        legacy = []
+        raw = self.settings.value("server_profiles", "")
+        if raw:
+            try:
+                legacy = self._coerce_server_profiles(json.loads(str(raw)))
+            except Exception:
+                legacy = []
+
+        self.server_profiles = legacy or self._default_server_profiles()
+        self._save_server_profiles()
+
+    def _save_server_profiles(self):
+        payload = {
+            "servers": self.server_profiles
+        }
+        with open(self._host_json_path(), "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+
+    def open_host_json(self):
+        path = self._host_json_path()
+        if not os.path.exists(path):
+            self._save_server_profiles()
+        try:
+            if OS_INFO["os"] == "windows":
+                os.startfile(path)
+            else:
+                QMessageBox.information(self, "host.json", f"Edit this file:\n\n{path}")
+        except Exception as error:
+            QMessageBox.warning(self, "Open host.json Failed", str(error))
+
+    def reload_host_json(self):
+        self._load_server_profiles()
+        self._refresh_server_profile_list()
+        self.statusBar().showMessage("Reloaded host.json", 5000)
+
+    def _refresh_server_profile_list(self):
+        if not hasattr(self, "server_profile_list"):
+            return
+        self.server_profile_list.clear()
+        for profile in self.server_profiles:
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, profile)
+            item.setSizeHint(QSize(100, 58))
+            self.server_profile_list.addItem(item)
+            game_color = self._normalize_color(profile.get("game_color", CYAN_LIGHT), CYAN_LIGHT)
+            name_color = self._normalize_color(profile.get("name_color", GREEN_MONEY), GREEN_MONEY)
+
+            label = QLabel(
+                f"<b style='color:{game_color};'>{profile['game']}</b> &nbsp; <span style='color:{name_color};'>{profile['name']}</span><br>"
+                f"<span style='color:{TEXT_SECONDARY}; font-size:10px;'>{profile['url']}</span>"
+            )
+            label.setStyleSheet("padding: 6px;")
+            label.setWordWrap(True)
+            self.server_profile_list.setItemWidget(item, label)
+
+        if self.server_profiles:
+            self.server_profile_list.setCurrentRow(0)
+
+    def _selected_server_profile(self):
+        if not hasattr(self, "server_profile_list"):
+            return None
+        item = self.server_profile_list.currentItem()
+        if not item:
+            return None
+        return item.data(Qt.UserRole)
+
+    def _server_profile_dialog(self, profile=None):
+        profile = profile or {"game": "", "name": "", "url": "", "game_color": CYAN_LIGHT, "name_color": GREEN_MONEY}
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Server Profile")
+        form = QFormLayout(dialog)
+
+        game_field = QLineEdit(str(profile.get("game", "")))
+        game_field.setPlaceholderText("Splatoon")
+        name_field = QLineEdit(str(profile.get("name", "")))
+        name_field.setPlaceholderText("Friend's Server")
+        url_field = QLineEdit(str(profile.get("url", "")))
+        url_field.setPlaceholderText("http://123.45.67.89:8070")
+        game_color_field = QLineEdit(self._normalize_color(profile.get("game_color", CYAN_LIGHT), CYAN_LIGHT))
+        name_color_field = QLineEdit(self._normalize_color(profile.get("name_color", GREEN_MONEY), GREEN_MONEY))
+
+        game_color_row = QHBoxLayout()
+        game_color_row.addWidget(game_color_field)
+        game_color_row.addWidget(QPushButton("Pick", clicked=lambda: self._pick_color_for_field(game_color_field, CYAN_LIGHT)))
+        name_color_row = QHBoxLayout()
+        name_color_row.addWidget(name_color_field)
+        name_color_row.addWidget(QPushButton("Pick", clicked=lambda: self._pick_color_for_field(name_color_field, GREEN_MONEY)))
+
+        form.addRow("Game:", game_field)
+        form.addRow("Server name:", name_field)
+        form.addRow("Address:", url_field)
+        form.addRow("Game color:", game_color_row)
+        form.addRow("Name color:", name_color_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return None
+
+        game = game_field.text().strip()
+        name = name_field.text().strip()
+        url = url_field.text().strip()
+        game_color = self._normalize_color(game_color_field.text(), CYAN_LIGHT)
+        name_color = self._normalize_color(name_color_field.text(), GREEN_MONEY)
+        if not game or not name or not url:
+            QMessageBox.warning(self, "Missing Server Info", "Game, server name, and address are all required.")
+            return None
+        return {"game": game, "name": name, "url": url, "game_color": game_color, "name_color": name_color}
+
+    def quick_add_server_profile(self):
+        profile = self._server_profile_dialog({"game": "Splatoon", "name": "New Server", "url": self._quick_local_url(), "game_color": CYAN_LIGHT, "name_color": GREEN_MONEY})
+        if not profile:
+            return
+        self.server_profiles.append(profile)
+        self._save_server_profiles()
+        self._refresh_server_profile_list()
+
+    def quick_edit_server_profile(self):
+        profile = self._selected_server_profile()
+        if not profile:
+            QMessageBox.warning(self, "No Server Selected", "Choose a server profile to edit first.")
+            return
+        row = self.server_profile_list.currentRow()
+        updated = self._server_profile_dialog(profile)
+        if not updated:
+            return
+        self.server_profiles[row] = updated
+        self._save_server_profiles()
+        self._refresh_server_profile_list()
+        self.server_profile_list.setCurrentRow(row)
+
+    def quick_remove_server_profile(self):
+        profile = self._selected_server_profile()
+        if not profile:
+            QMessageBox.warning(self, "No Server Selected", "Choose a server profile to remove first.")
+            return
+        row = self.server_profile_list.currentRow()
+        if QMessageBox.question(self, "Remove Server", f"Remove {profile['name']}?", QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        del self.server_profiles[row]
+        self._save_server_profiles()
+        self._refresh_server_profile_list()
+
+    def quick_use_selected_server(self):
+        profile = self._selected_server_profile()
+        if not profile:
+            QMessageBox.warning(self, "No Server Selected", "Choose a server profile first.")
+            return None
+        url = self._quick_set_target(profile["url"], f"{profile['game']} server selected.")
+        if hasattr(self, "server_log"):
+            self.server_log.append(f"<b>[Quick Start]</b> Selected {profile['game']} server: {profile['name']} ({url})")
+        return url
+
+    def quick_patch_selected_server(self, emulator):
+        if not self.quick_use_selected_server():
+            return
+        if not self._ensure_emulator_executable(emulator):
+            return
+        if emulator == "citra":
+            self.patcher.patch_citra("custom")
+        else:
+            self.patcher.apply_cemu_patch_all()
+
+    def quick_play_local(self):
+        url = self._quick_set_target(self._quick_local_url(), "Local server selected.")
+        if hasattr(self, "server_log"):
+            self.server_log.append(f"<b>[Quick Start]</b> Local server target selected: {url}")
+        self.tabs.setCurrentIndex(2)
+
+    def _quick_style_button(self, button, object_name):
+        if not button:
+            return
+        button.setObjectName(object_name)
+        button.style().unpolish(button)
+        button.style().polish(button)
+        button.update()
+
+    def _refresh_quick_start_state(self):
+        if not hasattr(self, "quick_prepare_btn") or not hasattr(self, "quick_server_toggle_btn"):
+            return
+
+        running = bool(self.server_running)
+        if running:
+            self.quick_prepare_btn.setText("Stop Server")
+            self._quick_style_button(self.quick_prepare_btn, "stopBtn")
+            self.quick_server_toggle_btn.setText("Quick Stop Server")
+            self._quick_style_button(self.quick_server_toggle_btn, "stopBtn")
+        else:
+            self.quick_prepare_btn.setText("Prepare Server")
+            self._quick_style_button(self.quick_prepare_btn, "startBtn")
+            self.quick_server_toggle_btn.setText("Quick Start Server")
+            self._quick_style_button(self.quick_server_toggle_btn, "startBtn")
+
+    def quick_prepare_or_stop_server(self):
+        self._refresh_quick_start_state()
+        if self.server_running:
+            self.stop_server()
+            return
+        self._quick_prepare_after_deploy = True
+        self._suppress_deploy_complete_popup = True
+        self.quick_deploy_local()
+
+    def _on_deploy_complete(self, code):
+        self._suppress_deploy_complete_popup = False
+        if not getattr(self, "_quick_prepare_after_deploy", False):
+            return
+        self._quick_prepare_after_deploy = False
+        if code != 0:
+            QMessageBox.warning(self, "Prepare Server Failed", "Deployment did not finish successfully, so the server was not started.")
+            return
+        self._quick_set_target(self._quick_local_url(), "Starting local server after deployment.")
+        self._quick_prepare_server_flow = True
+        self.start_server()
+
+    def quick_toggle_server(self):
+        self._quick_set_target(self._quick_local_url(), "Local server selected.")
+        self.toggle_server()
+        self._refresh_quick_start_state()
+
+    def quick_deploy_local(self):
+        url = self._quick_set_target(self._quick_local_url(), "Preparing local server deployment.")
+        if hasattr(self, "setup_log"):
+            self.setup_log.append(f"<b>[Quick Start]</b> Deploying local server stack for {url}")
+        self.tabs.setCurrentIndex(1)
+        self.deployer.automated_install_stack()
+
+    def quick_host_for_friends(self):
+        url = self._quick_set_target(self._quick_local_url(), "Hosting mode prepared.")
+        if hasattr(self, "setup_log"):
+            self.setup_log.append(f"<b>[Quick Start]</b> Hosting address prepared: {url}")
+        QMessageBox.information(
+            self,
+            "Hosting Prepared",
+            f"Your local server address is:\n\n{url}\n\nUse the Server tab to deploy/start the stack. Friends on your same network can try this address first."
+        )
+        self.tabs.setCurrentIndex(1)
+
+    def quick_copy_local_address(self):
+        url = self._quick_local_url()
+        QApplication.clipboard().setText(url)
+        self.statusBar().showMessage(f"Copied {url}", 6000)
+
+    def quick_join_server(self):
+        raw = self.quick_join_url.text().strip() if hasattr(self, "quick_join_url") else ""
+        if not raw:
+            return None
+        url = self._quick_set_target(raw, "Join server selected.")
+        if hasattr(self, "server_log"):
+            self.server_log.append(f"<b>[Quick Start]</b> Join target selected: {url}")
+        return url
+
+    def quick_patch_cemu(self):
+        if hasattr(self, "quick_join_url") and self.quick_join_url.text().strip():
+            self.quick_join_server()
+        elif hasattr(self, "patch_url_input") and not self.patch_url_input.text().strip():
+            self._quick_set_target(self._quick_local_url())
+        if not self._ensure_emulator_executable("cemu"):
+            return
+        self.patcher.apply_cemu_patch_all()
+
+    def quick_patch_citra(self):
+        if hasattr(self, "quick_join_url") and self.quick_join_url.text().strip():
+            self.quick_join_server()
+        elif hasattr(self, "patch_url_input") and not self.patch_url_input.text().strip():
+            self._quick_set_target(self._quick_local_url())
+        if not self._ensure_emulator_executable("citra"):
+            return
+        self.patcher.patch_citra("custom")
+
+    def _find_emulator_executable(self, path, names):
+        candidate = os.path.expanduser(str(path or "").strip().strip('"'))
+        if not candidate:
+            return None
+        if os.path.isfile(candidate) and os.path.basename(candidate).lower() in names:
+            return candidate
+        if os.path.isdir(candidate):
+            for name in names:
+                exe = os.path.join(candidate, name)
+                if os.path.isfile(exe):
+                    return exe
+            for root, _dirs, files in os.walk(candidate):
+                for file_name in files:
+                    if file_name.lower() in names:
+                        return os.path.join(root, file_name)
+        return None
+
+    def _ensure_emulator_executable(self, emulator):
+        if emulator == "citra":
+            field = self.citra_dir_field
+            names = {"citra-qt.exe", "lime3ds.exe", "azahar.exe", "mandarine.exe", "citra.exe"}
+            title = "Choose Citra, Lime3DS, Azahar, or another 3DS fork executable"
+        else:
+            field = self.cemu_dir_field
+            names = {"cemu.exe"}
+            title = "Choose Cemu.exe"
+
+        exe = self._find_emulator_executable(field.text(), names)
+        if exe:
+            field.setText(os.path.dirname(exe))
+            self.save_settings()
+            return True
+
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            field.text() if field.text().strip() else os.path.expanduser("~"),
+            "Emulator executables (*.exe);;All files (*.*)"
+        )
+        if not selected:
+            return False
+        if os.path.basename(selected).lower() not in names:
+            QMessageBox.warning(self, "Wrong Emulator File", f"That does not look like a supported {emulator.upper()} executable.")
+            return False
+        field.setText(os.path.dirname(selected))
+        self.save_settings()
+        return True
+
+    def _emulator_executable_for_launch(self, emulator):
+        if emulator == "citra":
+            field = self.citra_dir_field
+            names = {"citra-qt.exe", "lime3ds.exe", "azahar.exe", "mandarine.exe", "citra.exe"}
+        else:
+            field = self.cemu_dir_field
+            names = {"cemu.exe"}
+        return self._find_emulator_executable(field.text(), names)
+
+    def quick_play_emulator(self, emulator):
+        if not self._ensure_emulator_executable(emulator):
+            return
+        exe = self._emulator_executable_for_launch(emulator)
+        if not exe:
+            QMessageBox.warning(self, "Emulator Missing", f"Could not find the {emulator.upper()} executable after selecting its folder.")
+            return
+        try:
+            subprocess.Popen([exe], cwd=os.path.dirname(exe))
+            self.statusBar().showMessage(f"Launched {os.path.basename(exe)}", 6000)
+        except Exception as error:
+            QMessageBox.warning(self, "Launch Failed", f"Could not start {exe}:\n\n{error}")
 
     def _build_dashboard_tab(self):
         w = QWidget()
@@ -271,6 +871,14 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         self.cemu_miiname.setMaxLength(10)
         self.cemu_dir_field = QLineEdit(CEMU_DIR)
         self.citra_dir_field = QLineEdit()
+        self.cemu_username.textChanged.connect(self._sync_advanced_identity_to_quick)
+        self.cemu_password.textChanged.connect(self._sync_advanced_identity_to_quick)
+        self.cemu_miiname.textChanged.connect(self._sync_advanced_identity_to_quick)
+        self.cemu_username.textChanged.connect(self.save_settings)
+        self.cemu_password.textChanged.connect(self.save_settings)
+        self.cemu_miiname.textChanged.connect(self.save_settings)
+        self.cemu_dir_field.textChanged.connect(self.save_settings)
+        self.citra_dir_field.textChanged.connect(self.save_settings)
         crgl.addRow("Username:", self.cemu_username)
         crgl.addRow("Password:", self.cemu_password)
         crgl.addRow("Mii Name:", self.cemu_miiname)
@@ -301,6 +909,7 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         url_row = QHBoxLayout()
         url_row.addWidget(QLabel("Target Node:"))
         self.patch_url_input = QLineEdit(f"http://{get_local_ip()}:8070")
+        self.patch_url_input.textChanged.connect(self.save_settings)
         url_row.addWidget(self.patch_url_input)
         nlay.addLayout(url_row)
         mode_row = QHBoxLayout()
@@ -362,12 +971,12 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
             <h1 style='color:{RED_LIGHT};'>Simple Setup Guide</h1>
             <p>Follow these steps to get online quickly:</p>
             <ol>
-                <li><b>Step 1:</b> Click <b>Deploy Server Stack</b> on the first tab.</li>
+                <li><b>Step 1:</b> Use the <b>Quick Start</b> tab to choose Local, Host, or Join.</li>
                 <li><b>Step 2:</b> Wait until the <b>Deploy Server Stack</b> button does its job.</li>
                 <li><b>Step 3:</b> Click <b>Start Server</b>.</li>
                 <li><b>Step 4:</b> Put a username, password (<b>NOT</b> your daily one), and a Mii name.</li>
                 <li><b>Step 5:</b> Locate your Cemu or any Citra fork folder and choose the root of these folders.</li>
-                <li><b>Step 6:</b> Go to the second tab and click either <b>Patch Cemu</b> or <b>Patch Citra</b>.</li>
+                <li><b>Step 6:</b> Go to the identity tab and click either <b>Patch Cemu</b> or <b>Patch Citra</b>.</li>
                 <li><b>Step 7 (For Cemu):</b> Go to Options, General Settings, press the Account tab and toggle <b>Pretendo</b>. You should also see your Mii name on the active account.</li>
                 <li><b>Step 8:</b> Enjoy! And don't ever forget to share the <b>Target Node</b> to whoever you want to play against.</li>
             </ol>
@@ -380,6 +989,13 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         self.cemu_username.blockSignals(True)
         self.cemu_password.blockSignals(True)
         self.cemu_miiname.blockSignals(True)
+        self.cemu_dir_field.blockSignals(True)
+        self.patch_url_input.blockSignals(True)
+        self.citra_dir_field.blockSignals(True)
+        if hasattr(self, "quick_cemu_username"):
+            self.quick_cemu_username.blockSignals(True)
+            self.quick_cemu_password.blockSignals(True)
+            self.quick_cemu_miiname.blockSignals(True)
         if hasattr(self, 'server_sudo_pass'): self.server_sudo_pass.blockSignals(True)
 
         store = SecretStore()
@@ -395,8 +1011,19 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         self.cemu_username.setText(str(self.settings.value("username", "")))
         self.cemu_password.setText(saved_password)
         self.cemu_miiname.setText(str(self.settings.value("miiname", "")))
+        if hasattr(self, "quick_cemu_username"):
+            self.quick_cemu_username.setText(self.cemu_username.text())
+            self.quick_cemu_password.setText(self.cemu_password.text())
+            self.quick_cemu_miiname.setText(self.cemu_miiname.text())
         self.server_dir_field.setText(str(self.settings.value("server_dir", DEFAULT_SERVER_DIR)))
         self.cemu_dir_field.setText(str(self.settings.value("cemu_dir", CEMU_DIR)))
+        target_url = str(self.settings.value("target_url", f"http://{get_local_ip()}:8070"))
+        self.patch_url_input.setText(target_url)
+        self.citra_dir_field.setText(str(self.settings.value("citra_dir", "")))
+        if hasattr(self, "quick_join_url"):
+            self.quick_join_url.setText(target_url)
+        self._load_server_profiles()
+        self._refresh_server_profile_list()
         
         sudo_ref = self.settings.value("sudo_cache_ref", "ui.sudo_cache")
         self.cached_password = store.get(str(sudo_ref), None)
@@ -415,6 +1042,13 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         self.cemu_username.blockSignals(False)
         self.cemu_password.blockSignals(False)
         self.cemu_miiname.blockSignals(False)
+        self.cemu_dir_field.blockSignals(False)
+        self.patch_url_input.blockSignals(False)
+        self.citra_dir_field.blockSignals(False)
+        if hasattr(self, "quick_cemu_username"):
+            self.quick_cemu_username.blockSignals(False)
+            self.quick_cemu_password.blockSignals(False)
+            self.quick_cemu_miiname.blockSignals(False)
         if hasattr(self, 'server_sudo_pass'): self.server_sudo_pass.blockSignals(False)
 
     def save_settings(self):
@@ -426,6 +1060,8 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         self.settings.setValue("miiname", self.cemu_miiname.text())
         self.settings.setValue("server_dir", self.server_dir_field.text())
         self.settings.setValue("cemu_dir", self.cemu_dir_field.text())
+        self.settings.setValue("citra_dir", self.citra_dir_field.text())
+        self.settings.setValue("target_url", self.patch_url_input.text())
         self.settings.setValue("host_net", "true" if self.host_net_check.isChecked() else "false")
         
         if hasattr(self, 'server_sudo_pass'):
@@ -449,6 +1085,10 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
             self.cemu_username.clear()
             self.cemu_password.clear()
             self.cemu_miiname.clear()
+            if hasattr(self, "quick_cemu_username"):
+                self.quick_cemu_username.clear()
+                self.quick_cemu_password.clear()
+                self.quick_cemu_miiname.clear()
             if hasattr(self, "server_sudo_pass"): self.server_sudo_pass.clear()
             for key in self.settings.allKeys(): self.settings.remove(key)
             self.settings.sync()
@@ -484,6 +1124,9 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
 
         if hasattr(self, 'ip_info'):
             self.ip_info.setText(f"Local Network IP: {current_ip}")
+        if hasattr(self, 'quick_local_address'):
+            self.quick_local_address.setText(f"Your current local server address: http://{current_ip}:8070")
+        self._refresh_quick_start_state()
 
         if not is_connected and self.last_connectivity_state:
             msg = "\n[ALARM] Internet Connection Lost!\n"

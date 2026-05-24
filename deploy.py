@@ -116,11 +116,12 @@ class Deployer:
         s_dir = self.manager.server_dir_field.text().strip()
         self.manager.setup_log.append("[System] Repo ready. Checking sub-repos...")
         
-        # Check sub-repos: super-smash-bros-wiiu, pokken-tournament, mario-kart-8
+        # Check sub-repos: super-smash-bros-wiiu, pokken-tournament, mario-kart-8, super-mario-3d-world-secure
         for name, url in [
             ("super-smash-bros-wiiu", "https://github.com/PretendoNetwork/super-smash-bros-wiiu"),
             ("pokken-tournament", "https://github.com/PretendoNetwork/pokken-tournament"),
-            ("mario-kart-8", "https://github.com/PretendoNetwork/mario-kart-8")
+            ("mario-kart-8", "https://github.com/PretendoNetwork/mario-kart-8"),
+            ("super-mario-3d-world-secure", "https://github.com/PretendoNetwork/super-mario-3d-world-secure")
         ]:
             d = os.path.join(s_dir, "repos", name)
             if not os.path.isdir(d):
@@ -330,6 +331,127 @@ exit 0
         
         self._run_environment_setup(s_dir)
 
+    def _checkout_super_mario_maker_upstream(self, s_dir):
+        """Keep Super Mario Maker on current upstream instead of the pinned submodule revision."""
+        smm_dir = os.path.join(s_dir, "repos", "super-mario-maker")
+        if not os.path.isdir(smm_dir):
+            return
+
+        try:
+            flags = 0x08000000 if OS_INFO["os"] == "windows" else 0
+            for args in (
+                ["git", "-C", smm_dir, "fetch", "origin", "--prune"],
+                ["git", "-C", smm_dir, "reset", "--hard", "origin/master"],
+                ["git", "-C", smm_dir, "clean", "-fdx"],
+            ):
+                subprocess.run(
+                    args,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                    creationflags=flags,
+                )
+            self.manager.setup_log.append("[OK] Super Mario Maker source updated to current upstream.")
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not update Super Mario Maker to upstream: {e}")
+
+    def _patch_super_mario_maker_current_upstream_datastore(self, s_dir):
+        """Patch current upstream SMM's common DataStore helper for local MinIO keys."""
+        smm_dir = os.path.join(s_dir, "repos", "super-mario-maker")
+        if not os.path.isdir(smm_dir):
+            return
+
+        go_mod_path = os.path.join(smm_dir, "go.mod")
+        try:
+            with open(go_mod_path, "r", encoding="utf-8") as f:
+                go_mod = f.read()
+            if "github.com/PretendoNetwork/nex-protocols-common-go/v2" not in go_mod:
+                return
+
+            third_party = os.path.join(smm_dir, "third_party", "nex-protocols-common-go")
+            if not os.path.isdir(third_party):
+                flags = 0x08000000 if OS_INFO["os"] == "windows" else 0
+                subprocess.run(
+                    [
+                        "docker", "run", "--rm",
+                        "-v", f"{smm_dir}:/src",
+                        "-w", "/src",
+                        "golang:1.23-alpine3.20",
+                        "sh", "-lc",
+                        "/usr/local/go/bin/go mod download >/dev/null && "
+                        "rm -rf third_party/nex-protocols-common-go && "
+                        "mkdir -p third_party && "
+                        "cp -a /go/pkg/mod/github.com/!pretendo!network/nex-protocols-common-go/v2@v2.2.2 third_party/nex-protocols-common-go",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    creationflags=flags,
+                )
+
+            for root, _, files in os.walk(third_party):
+                for file_name in files:
+                    try:
+                        os.chmod(os.path.join(root, file_name), 0o666)
+                    except Exception:
+                        pass
+
+            replacements = {
+                os.path.join(third_party, "datastore", "prepare_get_object.go"): [
+                    ('import (\n\t"fmt"\n\t"time"', 'import (\n\t"fmt"\n\t"strings"\n\t"time"'),
+                    (
+                        'key := fmt.Sprintf("%s/%d.bin", commonProtocol.s3DataKeyBase, objectInfo.DataID)',
+                        'key := fmt.Sprintf("%d.bin", objectInfo.DataID)\n\tif strings.TrimSpace(commonProtocol.s3DataKeyBase) != "" {\n\t\tkey = fmt.Sprintf("%s/%d.bin", commonProtocol.s3DataKeyBase, objectInfo.DataID)\n\t}',
+                    ),
+                    ("pReqGetInfo.DataID = param.DataID", "pReqGetInfo.DataID = objectInfo.DataID"),
+                    (
+                        'if err != nil {\n\t\tcommon_globals.Logger.Error(err.Error())\n\t\treturn nil, nex.NewError(nex.ResultCodes.DataStore.OperationNotAllowed, "change_error")\n\t}',
+                        'if err != nil {\n\t\tcommon_globals.Logger.Error(err.Error())\n\t\treturn nil, nex.NewError(nex.ResultCodes.DataStore.OperationNotAllowed, "change_error")\n\t}\n\turl.RawQuery = ""',
+                    ),
+                ],
+                os.path.join(third_party, "datastore", "complete_post_object.go"): [
+                    ('import (\n\t"fmt"', 'import (\n\t"fmt"\n\t"strings"'),
+                    (
+                        'key := fmt.Sprintf("%s/%d.bin", commonProtocol.s3DataKeyBase, param.DataID)',
+                        'key := fmt.Sprintf("%d.bin", param.DataID)\n\tif strings.TrimSpace(commonProtocol.s3DataKeyBase) != "" {\n\t\tkey = fmt.Sprintf("%s/%d.bin", commonProtocol.s3DataKeyBase, param.DataID)\n\t}',
+                    ),
+                ],
+                os.path.join(third_party, "datastore", "complete_post_objects.go"): [
+                    ('import (\n\t"fmt"', 'import (\n\t"fmt"\n\t"strings"'),
+                    (
+                        'key := fmt.Sprintf("%s/%d.bin", commonProtocol.s3DataKeyBase, dataID)',
+                        'key := fmt.Sprintf("%d.bin", dataID)\n\t\tif strings.TrimSpace(commonProtocol.s3DataKeyBase) != "" {\n\t\t\tkey = fmt.Sprintf("%s/%d.bin", commonProtocol.s3DataKeyBase, dataID)\n\t\t}',
+                    ),
+                ],
+            }
+
+            for path, pairs in replacements.items():
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                for old, new in pairs:
+                    content = content.replace(old, new)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+
+            replace_line = "replace github.com/PretendoNetwork/nex-protocols-common-go/v2 => ./third_party/nex-protocols-common-go"
+            if replace_line not in go_mod:
+                with open(go_mod_path, "a", encoding="utf-8") as f:
+                    f.write("\n" + replace_line + "\n")
+
+            dockerfile_path = os.path.join(smm_dir, "Dockerfile")
+            with open(dockerfile_path, "r", encoding="utf-8") as f:
+                dockerfile = f.read()
+            if "COPY third_party ./third_party" not in dockerfile:
+                dockerfile = dockerfile.replace("WORKDIR ${app_dir}\n\nRUN --mount", "WORKDIR ${app_dir}\n\nCOPY third_party ./third_party\n\nRUN --mount", 1)
+                with open(dockerfile_path, "w", encoding="utf-8") as f:
+                    f.write(dockerfile)
+
+            self.manager.setup_log.append("[OK] Patched current upstream Super Mario Maker DataStore helper for local MinIO.")
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch current upstream Super Mario Maker DataStore helper: {e}")
+
     def _run_environment_setup(self, s_dir):
         self.manager.setup_log.append("[System] Finalizing environment...")
         _, local_ip, _ = self.manager._resolve_target_node()
@@ -353,16 +475,20 @@ exit 0
             host_mode = False
         
         try:
+            self._checkout_super_mario_maker_upstream(s_dir)
+            self._patch_super_mario_maker_current_upstream_datastore(s_dir)
             self._inject_missing_services(s_dir)
             self._generate_env_files(s_dir, local_ip)
             self._apply_compose_patches(custom_port, s_dir, host_mode=host_mode)
             self._ensure_smm_metadata(s_dir)
             self._fix_go_build_compatibility(s_dir)
+            self._patch_super_mario_maker_datastore_retry(s_dir)
             self._patch_friends(s_dir)
             self._patch_mario_kart_8(s_dir)
             self._patch_splatoon_schedules(s_dir)
             self._generate_juxtaposition_boot_config(s_dir)
             self._patch_mitmproxy_addon(s_dir)
+            self._patch_nginx_timeouts(s_dir)
             self._ensure_postgres_init_script(s_dir)
             
             self.manager.setup_log.append("[OK] All patches applied. Starting build process...")
@@ -446,6 +572,7 @@ exit 0
             f"PN_ACT_CONFIG_DATASTORE_SIGNATURE_SECRET={account_datastore_secret}",
             f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_ACCOUNT={account_grpc_key}",
             f"PN_ACT_CONFIG_GRPC_MASTER_API_KEY_API={account_grpc_key}",
+            "PN_ACT_CONFIG_ALLOW_LOCAL_BANNED_DEVICES=true",
             f"PN_ACT_CONFIG_S3_ACCESS_SECRET={minio_secret}",
             "PN_ACT_CONFIG_S3_ENDPOINT=minio:9000",
             "PN_ACT_CONFIG_S3_ACCESS_KEY=minio_pretendo",
@@ -522,9 +649,11 @@ exit 0
             f"PN_SMM_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
             f"PN_SMM_CONFIG_GRPC_ACCOUNT_API_KEY={account_grpc_key}",
             f"PN_SMM_CONFIG_S3_ACCESS_SECRET={minio_secret}",
-            "PN_SMM_CONFIG_S3_ENDPOINT=minio:9000",
+            "PN_SMM_CONFIG_S3_ENDPOINT=npdi.cdn.pretendo.cc",
             "PN_SMM_CONFIG_S3_ACCESS_KEY=minio_pretendo",
             "PN_SMM_CONFIG_S3_BUCKET=super-mario-maker",
+            "PN_SMM_CONFIG_S3_KEY_BASE=",
+            "PN_SMM_CONFIG_S3_SECURE=false",
             f"PN_SMM_KERBEROS_PASSWORD={smm_kerberos_pw}",
             f"PN_SMM_CONFIG_AES_KEY={smm_aes_key}",
             f"PN_SMM_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/super_mario_maker?sslmode=disable",
@@ -655,6 +784,17 @@ exit 0
             "PN_MK8_CONFIG_MONGODB_PORT=27017",
         ]
 
+        # 13b. Super Mario 3D World
+        env_files["super-mario-3d-world-secure.local.env"] = [
+            "PN_SM3DW_AUTHENTICATION_SERVER_PORT=60200",
+            f"PN_SM3DW_SECURE_SERVER_HOST={server_ip}",
+            "PN_SM3DW_SECURE_SERVER_PORT=60201",
+            "PN_SM3DW_ACCOUNT_GRPC_HOST=account",
+            "PN_SM3DW_ACCOUNT_GRPC_PORT=5000",
+            f"PN_SM3DW_ACCOUNT_GRPC_API_KEY={account_grpc_key}",
+            f"PN_SM3DW_POSTGRES_URI=postgres://postgres_pretendo:{postgres_pass}@postgres/super_mario_3d_world?sslmode=disable",
+        ]
+
         # 14. MinIO
         env_files["minio.local.env"] = [
             f"MINIO_ROOT_PASSWORD={minio_secret}",
@@ -693,6 +833,17 @@ exit 0
                 if not os.path.exists(local_path):
                     _write_managed_file(local_path, "# Auto-generated empty local env\n")
                     self.manager.setup_log.append(f"  [ENV] Created empty {local_name}")
+
+        smm_base_env = os.path.join(env_dir, "super-mario-maker.env")
+        if os.path.exists(smm_base_env):
+            with open(smm_base_env, "r", encoding="utf-8") as f:
+                smm_base_content = f.read()
+            smm_base_content = smm_base_content.replace(
+                "PN_SMM_CONFIG_S3_ENDPOINT=minio.pretendo.cc",
+                "PN_SMM_CONFIG_S3_ENDPOINT=npdi.cdn.pretendo.cc",
+            )
+            _write_managed_file(smm_base_env, smm_base_content)
+            self.manager.setup_log.append("  [ENV] Forced Super Mario Maker CDN endpoint to npdi.cdn.pretendo.cc")
         
         root_env = os.path.join(s_dir, ".env")
         _write_managed_file(root_env, f"SERVER_IP={server_ip}\n")
@@ -736,11 +887,13 @@ exit 0
             except:
                 continue
 
-        # Fallback: Create placeholder to satisfy the Stat check (patch handles rest)
+        # Fallback: Create a minimal empty-list metadata payload. A zero-byte
+        # object passes S3 stat checks but SMM can fail Course World before it
+        # even issues the HTTP GET.
         try:
             with open(dest_path, "wb") as f:
-                f.write(b"") 
-            self.manager.setup_log.append("[OK] SMM metadata placeholder created (0 bytes).")
+                f.write(b"\x00\x00\x00\x00")
+            self.manager.setup_log.append("[OK] SMM metadata placeholder created (4 bytes).")
         except Exception as e:
             self.manager.setup_log.append(f"[WARN] Failed to create SMM metadata placeholder: {e}")
 
@@ -844,6 +997,36 @@ exit 0
                             with open(pfpath, "w", encoding="utf-8") as f: f.write(pcontent)
                             self.manager.setup_log.append(f"  [PATCH] Converted SSH to HTTPS in {rname}/{pfname}")
                     except: pass
+
+            if rname == "account":
+                try:
+                    account_patches = [
+                        os.path.join(r_path, "src", "middleware", "console-status-verification.ts"),
+                        os.path.join(r_path, "src", "middleware", "pnid.ts"),
+                        os.path.join(r_path, "src", "services", "nnas", "routes", "oauth.ts"),
+                    ]
+                    for account_path in account_patches:
+                        if not os.path.isfile(account_path):
+                            continue
+                        with open(account_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        if "if (device.access_level < 0) {" in content and "PN_ACT_CONFIG_ALLOW_LOCAL_BANNED_DEVICES" not in content:
+                            content = content.replace(
+                                "if (device.access_level < 0) {",
+                                "if (device.access_level < 0 && process.env.PN_ACT_CONFIG_ALLOW_LOCAL_BANNED_DEVICES === 'true') {\n\t\tdevice.access_level = 0;\n\t\tdevice.server_access_level = 'prod';\n\t\tawait device.save();\n\t}\n\n\tif (device.access_level < 0) {",
+                                1,
+                            )
+                        if "if (pnid.access_level < 0) {" in content and "PN_ACT_CONFIG_ALLOW_LOCAL_BANNED_DEVICES" not in content:
+                            content = content.replace(
+                                "if (pnid.access_level < 0) {",
+                                "if (pnid.access_level < 0 && process.env.PN_ACT_CONFIG_ALLOW_LOCAL_BANNED_DEVICES === 'true') {\n\t\tpnid.access_level = 0;\n\t\tpnid.server_access_level = 'prod';\n\t\tawait pnid.save();\n\t}\n\n\tif (pnid.access_level < 0) {",
+                                1,
+                            )
+                        with open(account_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                    self.manager.setup_log.append("  [PATCH] Account local ban bypass enabled for self-host testing.")
+                except Exception as e:
+                    self.manager.setup_log.append(f"  [WARN] Account local ban bypass patch failed: {e}")
         if cnt > 0:
             self.manager.setup_log.append(f"[OK] Patched {cnt} Dockerfiles for build compatibility.")
 
@@ -888,6 +1071,874 @@ exit 0
                     except: pass
         if env_cnt > 0:
             self.manager.setup_log.append(f"[OK] Created {env_cnt} dummy .env files for noise reduction.")
+
+    def _patch_super_mario_maker_datastore_retry(self, s_dir):
+        """Make SMM CompletePostObject idempotent so retry ACK races do not become 106-1204."""
+        smm_dir = os.path.join(s_dir, "repos", "super-mario-maker")
+        if not os.path.isdir(smm_dir):
+            return
+
+        go_mod_path = os.path.join(smm_dir, "go.mod")
+        try:
+            with open(go_mod_path, "r", encoding="utf-8") as f:
+                go_mod_probe = f.read()
+            if "github.com/PretendoNetwork/nex-go/v2" in go_mod_probe:
+                self.manager.setup_log.append("[OK] Current upstream Super Mario Maker detected; skipping legacy SMM v1 deep patches.")
+                return
+        except Exception:
+            pass
+
+        secure_go_path = os.path.join(smm_dir, "nex", "secure.go")
+        try:
+            with open(secure_go_path, "r", encoding="utf-8") as f:
+                secure_go = f.read()
+            line = "\tglobals.SecureServer.SetDataStoreProtocolVersion(nex.NewPatchedNEXVersion(3, 4, 0, \"AMAJ\"))\n"
+            if line not in secure_go:
+                secure_go = secure_go.replace(
+                    "\tglobals.SecureServer.SetDataStoreProtocolVersion(nex.NewNEXVersion(3, 4, 0))\n",
+                    "",
+                    1,
+                )
+                secure_go = secure_go.replace(
+                    "\tglobals.SecureServer.SetDefaultNEXVersion(nex.NewPatchedNEXVersion(3, 8, 3, \"AMAJ\"))\n",
+                    "\tglobals.SecureServer.SetDefaultNEXVersion(nex.NewPatchedNEXVersion(3, 8, 3, \"AMAJ\"))\n" + line,
+                    1,
+                )
+                with open(secure_go_path, "w", encoding="utf-8") as f:
+                    f.write(secure_go)
+                self.manager.setup_log.append("[OK] Patched Super Mario Maker datastore protocol version for Course World.")
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch SMM datastore protocol version: {e}")
+
+        third_party = os.path.join(smm_dir, "third_party", "nex-protocols-common-go")
+        try:
+            if os.path.isdir(third_party):
+                shutil.rmtree(third_party, ignore_errors=True)
+            cmd = [
+                "docker", "run", "--rm",
+                "-v", f"{smm_dir}:/src",
+                "-w", "/src",
+                "golang:1.22-alpine",
+                "sh", "-lc",
+                "rm -rf third_party/nex-protocols-common-go && "
+                "/usr/local/go/bin/go mod download >/dev/null && "
+                "mkdir -p third_party && "
+                "cp -a /go/pkg/mod/github.com/!pretendo!network/nex-protocols-common-go@v1.0.30 third_party/nex-protocols-common-go && "
+                "chmod -R u+w third_party/nex-protocols-common-go",
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not stage SMM datastore retry patch module: {e}")
+            return
+
+        go_mod_path = os.path.join(smm_dir, "go.mod")
+        try:
+            with open(go_mod_path, "r", encoding="utf-8") as f:
+                go_mod = f.read()
+            replace_line = "replace github.com/PretendoNetwork/nex-protocols-common-go => ./third_party/nex-protocols-common-go"
+            if replace_line not in go_mod:
+                go_mod = go_mod.rstrip() + "\n\n" + replace_line + "\n"
+                with open(go_mod_path, "w", encoding="utf-8") as f:
+                    f.write(go_mod)
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch SMM go.mod for datastore retry fix: {e}")
+
+        dockerfile_path = os.path.join(smm_dir, "Dockerfile")
+        try:
+            with open(dockerfile_path, "r", encoding="utf-8") as f:
+                dockerfile = f.read()
+            bind_line = "\t--mount=type=bind,source=third_party/nex-protocols-common-go,target=third_party/nex-protocols-common-go \\\n"
+            if "source=third_party/nex-protocols-common-go" not in dockerfile:
+                dockerfile = dockerfile.replace(
+                    "\t--mount=type=bind,source=go.mod,target=go.mod \\\n",
+                    "\t--mount=type=bind,source=go.mod,target=go.mod \\\n" + bind_line,
+                    1,
+                )
+                with open(dockerfile_path, "w", encoding="utf-8") as f:
+                    f.write(dockerfile)
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch SMM Dockerfile for datastore retry fix: {e}")
+
+        complete_path = os.path.join(third_party, "datastore", "complete_post_object.go")
+        try:
+            with open(complete_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            old = """	// * If GetObjectInfoByDataID returns data then that means
+	// * the object has already been marked as uploaded. So do
+	// * nothing
+	objectInfo, _ := commonDataStoreProtocol.getObjectInfoByDataIDHandler(param.DataID)
+	if objectInfo != nil {
+		return nex.Errors.DataStore.PermissionDenied
+	}
+"""
+            new = """	// * If GetObjectInfoByDataID returns data then that means
+	// * the object has already been marked as uploaded. Treat this
+	// * as a successful idempotent retry instead of failing Cemu
+	// * during flaky upload-complete acknowledgement windows.
+	objectInfo, _ := commonDataStoreProtocol.getObjectInfoByDataIDHandler(param.DataID)
+	if objectInfo != nil {
+		rmcResponse := nex.NewRMCResponse(datastore.ProtocolID, callID)
+		rmcResponse.SetSuccess(datastore.MethodCompletePostObject, nil)
+
+		rmcResponseBytes := rmcResponse.Bytes()
+
+		var responsePacket nex.PacketInterface
+
+		if commonDataStoreProtocol.server.PRUDPVersion() == 0 {
+			responsePacket, _ = nex.NewPacketV0(client, nil)
+			responsePacket.SetVersion(0)
+		} else {
+			responsePacket, _ = nex.NewPacketV1(client, nil)
+			responsePacket.SetVersion(1)
+		}
+
+		responsePacket.SetSource(packet.Destination())
+		responsePacket.SetDestination(packet.Source())
+		responsePacket.SetType(nex.DataPacket)
+		responsePacket.SetPayload(rmcResponseBytes)
+
+		responsePacket.AddFlag(nex.FlagNeedsAck)
+		responsePacket.AddFlag(nex.FlagReliable)
+
+		commonDataStoreProtocol.server.Send(responsePacket)
+
+		return 0
+	}
+"""
+            changed = False
+            if old in content:
+                content = content.replace(old, new, 1)
+                changed = True
+            old_zero_size_check = """	if param.IsSuccess {
+		objectSizeS3, err := commonDataStoreProtocol.S3ObjectSize(bucket, key)
+		if err != nil {
+			common_globals.Logger.Error(err.Error())
+			return nex.Errors.DataStore.NotFound
+		}
+
+		objectSizeDB, errCode := commonDataStoreProtocol.getObjectSizeByDataIDHandler(param.DataID)
+		if errCode != 0 {
+			return errCode
+		}
+
+		if objectSizeS3 != uint64(objectSizeDB) {
+			common_globals.Logger.Errorf("Object with DataID %d did not upload correctly! Mismatched sizes", param.DataID)
+			// TODO - Is this a good error?
+			return nex.Errors.DataStore.Unknown
+		}
+"""
+            new_zero_size_check = """	if param.IsSuccess {
+		objectSizeDB, errCode := commonDataStoreProtocol.getObjectSizeByDataIDHandler(param.DataID)
+		if errCode != 0 {
+			return errCode
+		}
+
+		if objectSizeDB > 0 {
+			objectSizeS3, err := commonDataStoreProtocol.S3ObjectSize(bucket, key)
+			if err != nil {
+				common_globals.Logger.Error(err.Error())
+				return nex.Errors.DataStore.NotFound
+			}
+
+			if objectSizeS3 != uint64(objectSizeDB) {
+				common_globals.Logger.Errorf("Object with DataID %d did not upload correctly! Mismatched sizes", param.DataID)
+				// TODO - Is this a good error?
+				return nex.Errors.DataStore.Unknown
+			}
+		}
+"""
+            if old_zero_size_check in content:
+                content = content.replace(old_zero_size_check, new_zero_size_check, 1)
+                changed = True
+            early_zero_size_marker = """	// * Only allow an objects owner to make this request
+	ownerPID, errCode := commonDataStoreProtocol.getObjectOwnerByDataIDHandler(param.DataID)
+"""
+            early_zero_size_patch = """	if param.IsSuccess {
+		objectSizeDB, errCode := commonDataStoreProtocol.getObjectSizeByDataIDHandler(param.DataID)
+		if errCode != 0 {
+			return errCode
+		}
+
+		if objectSizeDB == 0 {
+			errCode = commonDataStoreProtocol.updateObjectUploadCompletedByDataIDHandler(param.DataID, true)
+			if errCode != 0 {
+				return errCode
+			}
+
+			rmcResponse := nex.NewRMCResponse(datastore.ProtocolID, callID)
+			rmcResponse.SetSuccess(datastore.MethodCompletePostObject, nil)
+
+			rmcResponseBytes := rmcResponse.Bytes()
+
+			var responsePacket nex.PacketInterface
+
+			if commonDataStoreProtocol.server.PRUDPVersion() == 0 {
+				responsePacket, _ = nex.NewPacketV0(client, nil)
+				responsePacket.SetVersion(0)
+			} else {
+				responsePacket, _ = nex.NewPacketV1(client, nil)
+				responsePacket.SetVersion(1)
+			}
+
+			responsePacket.SetSource(packet.Destination())
+			responsePacket.SetDestination(packet.Source())
+			responsePacket.SetType(nex.DataPacket)
+			responsePacket.SetPayload(rmcResponseBytes)
+
+			responsePacket.AddFlag(nex.FlagNeedsAck)
+			responsePacket.AddFlag(nex.FlagReliable)
+
+			commonDataStoreProtocol.server.Send(responsePacket)
+
+			return 0
+		}
+	}
+
+	// * Only allow an objects owner to make this request
+	ownerPID, errCode := commonDataStoreProtocol.getObjectOwnerByDataIDHandler(param.DataID)
+"""
+            if early_zero_size_marker in content and "if objectSizeDB == 0" not in content:
+                content = content.replace(early_zero_size_marker, early_zero_size_patch, 1)
+                changed = True
+            old_failed_upload = """	} else {
+		errCode := commonDataStoreProtocol.deleteObjectByDataIDHandler(param.DataID)
+		if errCode != 0 {
+			return errCode
+		}
+	}
+"""
+            new_failed_upload = """	} else {
+		objectSizeDB, errCode := commonDataStoreProtocol.getObjectSizeByDataIDHandler(param.DataID)
+		if errCode != 0 {
+			return errCode
+		}
+
+		if objectSizeDB == 0 {
+			errCode = commonDataStoreProtocol.updateObjectUploadCompletedByDataIDHandler(param.DataID, true)
+			if errCode != 0 {
+				return errCode
+			}
+		} else {
+			errCode = commonDataStoreProtocol.deleteObjectByDataIDHandler(param.DataID)
+			if errCode != 0 {
+				return errCode
+			}
+		}
+	}
+"""
+            if old_failed_upload in content:
+                content = content.replace(old_failed_upload, new_failed_upload, 1)
+                changed = True
+            if '"context"' not in content:
+                content = content.replace('import (\n', 'import (\n\t"context"\n', 1)
+                changed = True
+            if '"strings"' not in content:
+                content = content.replace('\t"fmt"\n', '\t"fmt"\n\t"strings"\n', 1)
+                changed = True
+            if '"github.com/minio/minio-go/v7"' not in content:
+                content = content.replace(
+                    '\tdatastore_types "github.com/PretendoNetwork/nex-protocols-go/datastore/types"\n',
+                    '\tdatastore_types "github.com/PretendoNetwork/nex-protocols-go/datastore/types"\n\t"github.com/minio/minio-go/v7"\n',
+                    1,
+                )
+                changed = True
+            if "ensureZeroByteDataStoreObject(param.DataID)" not in content:
+                content = content.replace(
+                    """		if objectSizeDB == 0 {
+			errCode = commonDataStoreProtocol.updateObjectUploadCompletedByDataIDHandler(param.DataID, true)
+""",
+                    """		if objectSizeDB == 0 {
+			errCode = ensureZeroByteDataStoreObject(param.DataID)
+			if errCode != 0 {
+				return errCode
+			}
+
+			errCode = commonDataStoreProtocol.updateObjectUploadCompletedByDataIDHandler(param.DataID, true)
+""",
+                )
+                changed = True
+            content2 = content.replace(
+                'fmt.Sprintf("%s/%d.bin", commonDataStoreProtocol.s3DataKeyBase, param.DataID)',
+                "dataStoreObjectKey(param.DataID)",
+            ).replace(
+                'fmt.Sprintf("%s/%d.bin", commonDataStoreProtocol.s3DataKeyBase, dataID)',
+                "dataStoreObjectKey(dataID)",
+            )
+            if content2 != content:
+                content = content2
+                changed = True
+            if "func ensureZeroByteDataStoreObject(dataID uint64) uint32" not in content:
+                content = content.rstrip() + """
+
+func ensureZeroByteDataStoreObject(dataID uint64) uint32 {
+	bucket := commonDataStoreProtocol.s3Bucket
+	key := dataStoreObjectKey(dataID)
+
+	_, err := commonDataStoreProtocol.minIOClient.PutObject(context.TODO(), bucket, key, strings.NewReader(""), 0, minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	if err != nil {
+		common_globals.Logger.Error(err.Error())
+		return nex.Errors.DataStore.Unknown
+	}
+
+	common_globals.Logger.Infof("SMM DataStore: ensured zero-byte object %s/%s", bucket, key)
+	return 0
+}
+"""
+                changed = True
+            if "func dataStoreObjectKey(dataID uint64) string" not in content:
+                content = content.rstrip() + """
+
+func dataStoreObjectKey(dataID uint64) string {
+	base := strings.Trim(commonDataStoreProtocol.s3DataKeyBase, "/")
+	if base == "" {
+		return fmt.Sprintf("%d.bin", dataID)
+	}
+
+	return fmt.Sprintf("%s/%d.bin", base, dataID)
+}
+"""
+                changed = True
+            if changed:
+                with open(complete_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.manager.setup_log.append("[OK] Patched Super Mario Maker datastore upload-complete retries.")
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch SMM datastore retry behavior: {e}")
+
+        prepare_get_path = os.path.join(third_party, "datastore", "prepare_get_object.go")
+        try:
+            with open(prepare_get_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            changed = False
+            content2 = content.replace(
+                'fmt.Sprintf("%s/%d.bin", commonDataStoreProtocol.s3DataKeyBase, param.DataID)',
+                "dataStoreObjectKey(param.DataID)",
+            )
+            if content2 != content:
+                content = content2.replace('\t"fmt"\n', "")
+                changed = True
+            guard = """	if objectInfo.Size == 0 && commonDataStoreProtocol.minIOClient != nil {
+		errCode = ensureZeroByteDataStoreObject(param.DataID)
+		if errCode != 0 {
+			return errCode
+		}
+	}
+
+"""
+            marker = "\turl, err := commonDataStoreProtocol.S3Presigner.GetObject(bucket, key, time.Minute*15)\n"
+            if "ensureZeroByteDataStoreObject(param.DataID)" not in content and marker in content:
+                content = content.replace(marker, guard + marker, 1)
+                changed = True
+            old_signed_get = """	url, err := commonDataStoreProtocol.S3Presigner.GetObject(bucket, key, time.Minute*15)
+	if err != nil {
+		common_globals.Logger.Error(err.Error())
+		return nex.Errors.DataStore.OperationNotAllowed
+	}
+	common_globals.Logger.Infof("SMM PrepareGetObject: dataID=%d bucket=%s key=%s url=%s", param.DataID, bucket, key, url.String())
+"""
+            new_routed_get = """	displayURL := ""
+	if bucket == "super-mario-maker" {
+		displayURL = "http://npts.app.pretendo.cc/" + bucket + "/" + key
+	} else {
+		url, err := commonDataStoreProtocol.S3Presigner.GetObject(bucket, key, time.Minute*15)
+		if err != nil {
+			common_globals.Logger.Error(err.Error())
+			return nex.Errors.DataStore.OperationNotAllowed
+		}
+		displayURL = url.String()
+	}
+	common_globals.Logger.Infof("SMM PrepareGetObject: dataID=%d bucket=%s key=%s url=%s", param.DataID, bucket, key, displayURL)
+"""
+            if old_signed_get in content:
+                content = content.replace(old_signed_get, new_routed_get, 1)
+                content = content.replace("pReqGetInfo.URL = url.String()", "pReqGetInfo.URL = displayURL", 1)
+                changed = True
+            if "pReqGetInfo := datastore_types.NewDataStoreReqGetInfoV1()" in content:
+                content = content.replace(
+                    "pReqGetInfo := datastore_types.NewDataStoreReqGetInfoV1()",
+                    "pReqGetInfo := datastore_types.NewDataStoreReqGetInfo()",
+                    1,
+                )
+                changed = True
+            if "pReqGetInfo := datastore_types.NewDataStoreReqGetInfo()" in content and "\n\tpReqGetInfo.DataID = param.DataID\n" not in content:
+                content = content.replace(
+                    "\tpReqGetInfo.RootCACert = commonDataStoreProtocol.rootCACert\n",
+                    "\tpReqGetInfo.RootCACert = commonDataStoreProtocol.rootCACert\n\tpReqGetInfo.DataID = param.DataID\n",
+                    1,
+                )
+                changed = True
+            if changed:
+                with open(prepare_get_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.manager.setup_log.append("[OK] Patched Super Mario Maker zero-byte datastore download placeholders.")
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch SMM datastore download placeholders: {e}")
+
+        object_infos_path = os.path.join(smm_dir, "nex", "datastore", "super-mario-maker", "get_object_infos.go")
+        try:
+            with open(object_infos_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            changed = False
+            old_infos_url = """		URL, err := globals.Presigner.GetObject(bucket, key, time.Minute*15)
+		if err != nil {
+			globals.Logger.Error(err.Error())
+			return nex.Errors.DataStore.OperationNotAllowed
+		}
+"""
+            new_infos_url = """		displayURL := ""
+		if bucket == "super-mario-maker" {
+			displayURL = "http://npts.app.pretendo.cc/" + bucket + "/" + key
+		} else {
+			URL, err := globals.Presigner.GetObject(bucket, key, time.Minute*15)
+			if err != nil {
+				globals.Logger.Error(err.Error())
+				return nex.Errors.DataStore.OperationNotAllowed
+			}
+			displayURL = URL.String()
+		}
+"""
+            if old_infos_url in content:
+                content = content.replace(old_infos_url, new_infos_url, 1)
+                content = content.replace("info.GetInfo.URL = URL.String()", "info.GetInfo.URL = displayURL", 1)
+                changed = True
+            if 'datastore_super_mario_maker_types "github.com/PretendoNetwork/nex-protocols-go/datastore/super-mario-maker/types"\n' in content:
+                content = content.replace(
+                    '\tdatastore_super_mario_maker_types "github.com/PretendoNetwork/nex-protocols-go/datastore/super-mario-maker/types"\n',
+                    "",
+                    1,
+                )
+                changed = True
+            if "type fileServerObjectInfoV1 struct" not in content:
+                content = content.replace(
+                    "\tclient := packet.Sender()\n\n\tpInfos := make([]*datastore_super_mario_maker_types.DataStoreFileServerObjectInfo, 0)\n",
+                    """	client := packet.Sender()
+
+	type fileServerObjectInfoV1 struct {
+		dataID  uint64
+		getInfo *datastore_types.DataStoreReqGetInfoV1
+	}
+
+	pInfos := make([]fileServerObjectInfoV1, 0)
+""",
+                    1,
+                )
+                content = content.replace(
+                    """		info := datastore_super_mario_maker_types.NewDataStoreFileServerObjectInfo()
+		info.DataID = objectInfo.DataID
+		info.GetInfo = datastore_types.NewDataStoreReqGetInfo()
+		info.GetInfo.URL = displayURL
+		info.GetInfo.RequestHeaders = []*datastore_types.DataStoreKeyValue{}
+		info.GetInfo.Size = objectInfo.Size
+		info.GetInfo.RootCACert = []byte{}
+		info.GetInfo.DataID = objectInfo.DataID
+
+		pInfos = append(pInfos, info)
+""",
+                    """		globals.Logger.Infof("SMM GetObjectInfos: dataID=%d size=%d url=%s", objectInfo.DataID, objectInfo.Size, displayURL)
+
+		info := datastore_types.NewDataStoreReqGetInfoV1()
+		info.URL = displayURL
+		info.RequestHeaders = []*datastore_types.DataStoreKeyValue{}
+		info.Size = objectInfo.Size
+		info.RootCACert = []byte{}
+
+		pInfos = append(pInfos, fileServerObjectInfoV1{
+			dataID:  objectInfo.DataID,
+			getInfo: info,
+		})
+""",
+                    1,
+                )
+                content = content.replace(
+                    "\trmcResponseStream.WriteListStructure(pInfos)\n",
+                    """	rmcResponseStream.WriteUInt32LE(uint32(len(pInfos)))
+	for _, info := range pInfos {
+		rmcResponseStream.WriteUInt64LE(info.dataID)
+		rmcResponseStream.WriteStructure(info.getInfo)
+	}
+""",
+                    1,
+                )
+                changed = True
+            if changed:
+                with open(object_infos_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.manager.setup_log.append("[OK] Patched Super Mario Maker object info download URLs.")
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch SMM object info download URLs: {e}")
+
+        for cfg_name, marker in (
+            ("get_application_config.go", "SMM GetApplicationConfig: applicationID=%d values=%d"),
+            ("get_application_config_string.go", "SMM GetApplicationConfigString: applicationID=%d values=%d"),
+        ):
+            cfg_path = os.path.join(smm_dir, "nex", "datastore", "super-mario-maker", cfg_name)
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if cfg_name == "get_application_config.go":
+                    content = content.replace("var MAX_COURSE_UPLOADS uint32 = 100", "var MAX_COURSE_UPLOADS uint32 = 10")
+                    endian_replacements = {
+                        "0x01000000, 0x32000000, 0x96000000, 0x2c010000, 0xf4010000,": "0x00000001, 0x00000032, 0x00000096, 0x0000012c, 0x000001f4,",
+                        "0x20030000, 0x14050000, 0xd0070000, 0xb80b0000, 0x88130000,": "0x00000320, 0x00000514, 0x000007d0, 0x00000bb8, 0x00001388,",
+                        "MAX_COURSE_UPLOADS, 0x14000000, 0x1e000000, 0x28000000, 0x32000000,": "MAX_COURSE_UPLOADS, 0x00000014, 0x0000001e, 0x00000028, 0x00000032,",
+                        "0x3c000000, 0x46000000, 0x50000000, 0x5a000000, 0x64000000,": "0x0000003c, 0x00000046, 0x00000050, 0x0000005a, 0x00000064,",
+                        "0x23000000, 0x4b000000, 0x23000000, 0x4b000000, 0x32000000,": "0x00000023, 0x0000004b, 0x00000023, 0x0000004b, 0x00000032,",
+                        "0x00000000, 0x03000000, 0x03000000, 0x64000000, 0x06000000,": "0x00000000, 0x00000003, 0x00000003, 0x00000064, 0x00000006,",
+                        "0x01000000, 0x60000000, 0x05000000, 0x60000000, 0x00000000,": "0x00000001, 0x00000060, 0x00000005, 0x00000060, 0x00000000,",
+                        "0xe4070000, 0x01000000, 0x01000000, 0x0c000000, 0x00000000,": "0x000007e4, 0x00000001, 0x00000001, 0x0000000c, 0x00000000,",
+                        "0x02000000, // * 2": "2, // * 2",
+                        "0x70cc8269, // * 1770179696": "1770179696, // * 1770179696",
+                        "0x50cc8269, // * 1770179664": "1770179664, // * 1770179664",
+                        "0x38cc8269, // * 1770179640": "1770179640, // * 1770179640",
+                        "0xdbd08269, // * 1770180827": "1770180827, // * 1770180827",
+                        "0xa9d08269, // * 1770180777": "1770180777, // * 1770180777",
+                        "0x89d08269, // * 1770180745": "1770180745, // * 1770180745",
+                        "0x59c48269, // * 1770177625": "1770177625, // * 1770177625",
+                        "0x36c48269, // * 1770177590": "1770177590, // * 1770177590",
+                        "0xdf070000, 0x0c000000, 0x16000000, 0x05000000, 0x00000000": "0x000007df, 0x0000000c, 0x00000016, 0x00000005, 0x00000000",
+                    }
+                    for old_value, new_value in endian_replacements.items():
+                        content = content.replace(old_value, new_value)
+                if marker not in content:
+                    if cfg_name == "get_application_config.go":
+                        content = content.replace(
+                            "\trmcResponseStream := nex.NewStreamOut(globals.SecureServer)\n",
+                            '\tglobals.Logger.Infof("SMM GetApplicationConfig: applicationID=%d values=%d", applicationID, len(config))\n\n\trmcResponseStream := nex.NewStreamOut(globals.SecureServer)\n',
+                            1,
+                        )
+                    else:
+                        content = content.replace(
+                            "\trmcResponseStream := nex.NewStreamOut(globals.SecureServer)\n",
+                            '\tglobals.Logger.Infof("SMM GetApplicationConfigString: applicationID=%d values=%d", applicationID, len(config))\n\n\trmcResponseStream := nex.NewStreamOut(globals.SecureServer)\n',
+                            1,
+                        )
+                    with open(cfg_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+            except Exception:
+                pass
+
+        config_string_path = os.path.join(smm_dir, "nex", "datastore", "super-mario-maker", "get_application_config_string.go")
+        try:
+            self._write_file(config_string_path, """package nex_datastore_super_mario_maker
+
+import (
+	"fmt"
+
+	nex "github.com/PretendoNetwork/nex-go"
+	datastore_super_mario_maker "github.com/PretendoNetwork/nex-protocols-go/datastore/super-mario-maker"
+	"github.com/PretendoNetwork/super-mario-maker-secure/globals"
+)
+
+func GetApplicationConfigString(err error, packet nex.PacketInterface, callID uint32, applicationID uint32) uint32 {
+	if err != nil {
+		globals.Logger.Error(err.Error())
+		return nex.Errors.DataStore.Unknown
+	}
+
+	client := packet.Sender()
+
+	config := make([]string, 0)
+
+	switch applicationID {
+	case 128:
+		config = getApplicationConfigString_WordBlacklist1()
+	case 129:
+		config = getApplicationConfigString_WordBlacklist2()
+	case 130:
+		config = getApplicationConfigString_WordBlacklist3()
+	default:
+		fmt.Printf("[Warning] DataStoreSMMProtocol::GetApplicationConfigString Unsupported applicationID: %v\\n", applicationID)
+	}
+
+	globals.Logger.Infof("SMM GetApplicationConfigString: applicationID=%d values=%d", applicationID, len(config))
+
+	rmcResponseStream := nex.NewStreamOut(globals.SecureServer)
+
+	rmcResponseStream.WriteListString(config)
+
+	rmcResponseBody := rmcResponseStream.Bytes()
+
+	rmcResponse := nex.NewRMCResponse(datastore_super_mario_maker.ProtocolID, callID)
+	rmcResponse.SetSuccess(datastore_super_mario_maker.MethodGetApplicationConfigString, rmcResponseBody)
+
+	rmcResponseBytes := rmcResponse.Bytes()
+
+	responsePacket, _ := nex.NewPacketV1(client, nil)
+
+	responsePacket.SetVersion(1)
+	responsePacket.SetSource(0xA1)
+	responsePacket.SetDestination(0xAF)
+	responsePacket.SetType(nex.DataPacket)
+	responsePacket.SetPayload(rmcResponseBytes)
+
+	responsePacket.AddFlag(nex.FlagNeedsAck)
+	responsePacket.AddFlag(nex.FlagReliable)
+
+	globals.SecureServer.Send(responsePacket)
+
+	return 0
+}
+
+func getApplicationConfigString_WordBlacklist1() []string {
+	return []string{}
+}
+
+func getApplicationConfigString_WordBlacklist2() []string {
+	return []string{}
+}
+
+func getApplicationConfigString_WordBlacklist3() []string {
+	return []string{}
+}
+""")
+        except Exception:
+            pass
+
+        buffer_queue_path = os.path.join(smm_dir, "nex", "datastore", "super-mario-maker", "get_buffer_queue.go")
+        try:
+            with open(buffer_queue_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            content = content.replace("rmcResponseStream.WriteListQBuffer(pBufferQueue)", "rmcResponseStream.WriteListBuffer(pBufferQueue)")
+            with open(buffer_queue_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception:
+            pass
+
+        for path, expr in (
+            (os.path.join(third_party, "datastore", "prepare_post_object.go"), "dataID"),
+            (os.path.join(third_party, "datastore", "complete_post_objects.go"), "dataID"),
+        ):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                content2 = content.replace(
+                    f'fmt.Sprintf("%s/%d.bin", commonDataStoreProtocol.s3DataKeyBase, {expr})',
+                    f"dataStoreObjectKey({expr})",
+                )
+                if content2 != content:
+                    content2 = content2.replace('\t"fmt"\n', "")
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(content2)
+                    self.manager.setup_log.append("[OK] Patched Super Mario Maker datastore S3 object key normalization.")
+            except Exception as e:
+                self.manager.setup_log.append(f"[WARN] Could not patch SMM datastore S3 object key normalization: {e}")
+
+        update_completed_path = os.path.join(smm_dir, "database", "datastore", "update_object_upload_completed_by_data_id.go")
+        try:
+            with open(update_completed_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            old = "SELECT update_password FROM datastore.objects WHERE data_id=$1 AND deleted=FALSE"
+            new = "SELECT under_review FROM datastore.objects WHERE data_id=$1 AND deleted=FALSE"
+            if old in content:
+                content = content.replace(old, new, 1)
+                with open(update_completed_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.manager.setup_log.append("[OK] Patched Super Mario Maker upload completion flag update.")
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch SMM upload completion flag update: {e}")
+
+        init_postgres_path = os.path.join(smm_dir, "database", "init_postgres.go")
+        try:
+            with open(init_postgres_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            changed = False
+            if "ensureOpenDockStarterCourseExists()" not in content:
+                content = content.replace(
+                    "\tensureEventCourseMetaDataFileExists()\n}",
+                    "\tensureEventCourseMetaDataFileExists()\n\tensureOpenDockStarterCourseExists()\n}",
+                    1,
+                )
+                content = content.rstrip() + r'''
+
+func ensureOpenDockStarterCourseExists() {
+	const courseDataID uint64 = 940100
+
+	bucket := os.Getenv("PN_SMM_CONFIG_S3_BUCKET")
+	key := "940100.bin"
+
+	_, err := globals.S3ObjectSize(bucket, key)
+	if err != nil {
+		_, err = globals.MinIOClient.PutObject(context.TODO(), bucket, key, strings.NewReader(""), 0, minio.PutObjectOptions{ContentType: "application/octet-stream"})
+		if err != nil {
+			globals.Logger.Warningf("Could not seed starter SMM course object in S3: %s", err.Error())
+			return
+		}
+	}
+
+	now := time.Now()
+	_, err = Postgres.Exec(`INSERT INTO datastore.objects (
+		data_id, upload_completed, deleted, under_review, owner, size, name, data_type,
+		meta_binary, permission, permission_recipients, delete_permission, delete_permission_recipients,
+		flag, period, refer_data_id, tags, persistence_slot_id, extra_data, access_password,
+		update_password, creation_date, update_date
+	) VALUES (
+		$1, TRUE, FALSE, FALSE, $2, 4, $3, 3, $4, 0, $5, 3, $6,
+		0, 90, 0, $7, 0, $8, 0, 0, $9, $9
+	) ON CONFLICT (data_id) DO UPDATE SET
+		upload_completed=TRUE, deleted=FALSE, under_review=FALSE, owner=$2, size=4,
+		name=$3, data_type=3, permission=0, delete_permission=3, flag=0, period=90,
+		update_date=$9`,
+		courseDataID, 1337, "Starter Course", []byte{}, pq.Array([]uint32{}),
+		pq.Array([]uint32{}), pq.Array([]string{"opendock"}), pq.Array([]string{}), now)
+	if err != nil {
+		globals.Logger.Warningf("Could not seed starter SMM course object in Postgres: %s", err.Error())
+		return
+	}
+
+	for _, applicationID := range []uint32{0, 300000000, 300002400} {
+		_, err = Postgres.Exec(`INSERT INTO datastore.object_custom_rankings (data_id, application_id, value)
+			VALUES ($1, $2, 0)
+			ON CONFLICT (data_id, application_id) DO UPDATE SET value=0`, courseDataID, applicationID)
+		if err != nil {
+			globals.Logger.Warningf("Could not seed starter SMM ranking: %s", err.Error())
+			return
+		}
+	}
+
+	_, err = Postgres.Exec(`INSERT INTO datastore.object_ratings (
+		data_id, slot, flag, internal_flag, lock_type, initial_value, range_min,
+		range_max, period_hour, period_duration, total_value, count
+	) VALUES ($1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	ON CONFLICT (data_id, slot) DO UPDATE SET total_value=0, count=0, initial_value=0`, courseDataID)
+	if err != nil {
+		globals.Logger.Warningf("Could not seed starter SMM rating: %s", err.Error())
+		return
+	}
+
+	_, err = Postgres.Exec(`INSERT INTO datastore.course_records (
+		data_id, slot, first_pid, best_pid, best_score, creation_date, update_date
+	) VALUES ($1, 0, 1337, 1337, 0, $2, $2)
+	ON CONFLICT (data_id, slot) DO UPDATE SET first_pid=1337, best_pid=1337, best_score=0, update_date=$2`, courseDataID, now)
+	if err != nil {
+		globals.Logger.Warningf("Could not seed starter SMM course record: %s", err.Error())
+		return
+	}
+
+	_, err = Postgres.Exec(`INSERT INTO datastore.buffer_queues (
+		data_id, slot, creation_date, buffer
+	)
+	SELECT data_id, 0, $1, $2
+	FROM datastore.objects
+	WHERE data_type=1 AND deleted=FALSE
+	ON CONFLICT (data_id, slot, buffer) DO UPDATE SET creation_date=$1`, now, []byte{0x44, 0x58, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00})
+	if err != nil {
+		globals.Logger.Warningf("Could not seed starter SMM maker buffer queue: %s", err.Error())
+		return
+	}
+
+	globals.Logger.Success("Open Dock starter SMM Course World seed is ready")
+}
+'''
+                changed = True
+            if changed:
+                with open(init_postgres_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.manager.setup_log.append("[OK] Patched Super Mario Maker starter Course World seed.")
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch SMM starter Course World seed: {e}")
+
+        attach_complete_path = os.path.join(smm_dir, "nex", "datastore", "super-mario-maker", "complete_attach_file.go")
+        try:
+            with open(attach_complete_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            changed = False
+            if '"context"' not in content:
+                content = content.replace('import (\n', 'import (\n\t"context"\n', 1)
+                changed = True
+            if '"strings"' not in content:
+                content = content.replace('\t"os"\n', '\t"os"\n\t"strings"\n', 1)
+                changed = True
+            if '"github.com/minio/minio-go/v7"' not in content:
+                content = content.replace(
+                    '\t"github.com/PretendoNetwork/super-mario-maker-secure/globals"\n',
+                    '\t"github.com/PretendoNetwork/super-mario-maker-secure/globals"\n\t"github.com/minio/minio-go/v7"\n',
+                    1,
+                )
+                changed = True
+
+            old_failed_attach = """	// TODO - What is param.IsSuccess? Is this correct?
+	if !param.IsSuccess {
+		return nex.Errors.DataStore.InvalidArgument
+	}
+"""
+            new_failed_attach = """	if !param.IsSuccess {
+		errCode := datastore_db.DeleteObjectByDataID(param.DataID)
+		if errCode != 0 {
+			return errCode
+		}
+
+		rmcResponse := nex.NewRMCResponse(datastore_super_mario_maker.ProtocolID, callID)
+		rmcResponse.SetSuccess(datastore_super_mario_maker.MethodCompleteAttachFile, []byte{})
+
+		responsePacket, _ := nex.NewPacketV1(client, nil)
+		responsePacket.SetVersion(1)
+		responsePacket.SetSource(0xA1)
+		responsePacket.SetDestination(0xAF)
+		responsePacket.SetType(nex.DataPacket)
+		responsePacket.SetPayload(rmcResponse.Bytes())
+		responsePacket.AddFlag(nex.FlagNeedsAck)
+		responsePacket.AddFlag(nex.FlagReliable)
+
+		globals.SecureServer.Send(responsePacket)
+
+		return 0
+	}
+"""
+            if old_failed_attach in content:
+                content = content.replace(old_failed_attach, new_failed_attach, 1)
+                changed = True
+
+            old_s3_size_check = """	objectSizeS3, err := globals.S3ObjectSize(bucket, key)
+	if err != nil {
+		globals.Logger.Error(err.Error())
+		return nex.Errors.DataStore.NotFound
+	}
+
+	objectSizeDB, errCode := datastore_db.GetObjectSizeDataID(param.DataID)
+	if errCode != 0 {
+		return errCode
+	}
+
+	if objectSizeS3 != uint64(objectSizeDB) {
+		// TODO - Is this a good error?
+		return nex.Errors.DataStore.Unknown
+	}
+"""
+            new_s3_size_check = """	objectSizeDB, errCode := datastore_db.GetObjectSizeDataID(param.DataID)
+	if errCode != 0 {
+		return errCode
+	}
+
+	if objectSizeDB == 0 {
+		_, err := globals.MinIOClient.PutObject(context.TODO(), bucket, key, strings.NewReader(""), 0, minio.PutObjectOptions{ContentType: "image/jpeg"})
+		if err != nil {
+			globals.Logger.Error(err.Error())
+			return nex.Errors.DataStore.Unknown
+		}
+	} else {
+		objectSizeS3, err := globals.S3ObjectSize(bucket, key)
+		if err != nil {
+			globals.Logger.Error(err.Error())
+			return nex.Errors.DataStore.NotFound
+		}
+
+		if objectSizeS3 != uint64(objectSizeDB) {
+			// TODO - Is this a good error?
+			return nex.Errors.DataStore.Unknown
+		}
+	}
+"""
+            if old_s3_size_check in content:
+                content = content.replace(old_s3_size_check, new_s3_size_check, 1)
+                changed = True
+
+            if changed:
+                with open(attach_complete_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.manager.setup_log.append("[OK] Patched Super Mario Maker attach-file upload completion.")
+        except Exception as e:
+            self.manager.setup_log.append(f"[WARN] Could not patch SMM attach-file upload completion: {e}")
 
     def _apply_compose_patches(self, port, s_dir, host_mode=False):
         """Robust YAML patching for mitmproxy port, Postgres health, and service injections."""
@@ -973,7 +2024,8 @@ exit 0
 
                     if current_service in ["friends", "mario-kart-8", "splatoon", "super-mario-maker", 
                                            "minecraft-wiiu", "pikmin-3", "super-smash-bros-wiiu", 
-                                           "wiiu-chat-authentication", "wiiu-chat-secure", "pokken-tournament"]:
+                                           "wiiu-chat-authentication", "wiiu-chat-secure", "pokken-tournament",
+                                           "super-mario-3d-world-secure"]:
                         if ":" in line and ("60" in line or "/udp" in line):
                              # Special case for 6000 -> 60000, 6001 -> 60001
                              if "6000:6000" in line:
@@ -1031,7 +2083,7 @@ exit 0
                             continue
 
                     # 4b. Update dependencies to wait for health
-                    if current_section == "depends_on" and line.startswith("      - ") and current_service in ["account", "friends", "super-mario-maker", "mario-kart-8", "pikmin-3", "splatoon", "super-smash-bros-wiiu", "boss", "mongo-express", "miiverse-api", "juxtaposition-ui", "website"]:
+                    if current_section == "depends_on" and line.startswith("      - ") and current_service in ["account", "friends", "super-mario-maker", "mario-kart-8", "pikmin-3", "splatoon", "super-smash-bros-wiiu", "super-mario-3d-world-secure", "boss", "mongo-express", "miiverse-api", "juxtaposition-ui", "website"]:
                         dep_name = stripped[2:].strip()
                         if dep_name == "postgres":
                              new_lines.append("      postgres:\n")
@@ -1152,6 +2204,41 @@ done
         except Exception as e:
             self.manager.setup_log.append(f"[ERROR] Failed to patch mitmproxy addon: {e}")
 
+    def _patch_nginx_timeouts(self, s_dir):
+        """Keep Cemu's long-lived account/friends HTTP sessions from idling out."""
+        timeout_block = """keepalive_timeout 3600s;
+    keepalive_requests 10000;
+    client_body_timeout 3600s;
+    client_header_timeout 3600s;
+    send_timeout 3600s;
+    proxy_connect_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_read_timeout 3600s;"""
+
+        for rel_path in ("config/nginx.conf", "config/nginx-sssl.conf"):
+            path = os.path.join(s_dir, rel_path)
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                old_blocks = [
+                    "keepalive_timeout 65;",
+                    timeout_block,
+                ]
+                for old in old_blocks:
+                    if old in content:
+                        content = content.replace(old, timeout_block, 1)
+                        break
+                else:
+                    content = content.replace("sendfile on;", "sendfile on;\n\n    " + timeout_block, 1)
+
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception as e:
+                self.manager.setup_log.append(f"[WARN] Failed to patch {rel_path} timeouts: {e}")
+
     def _patch_friends(self, s_dir):
         """Add stability/debug fixes and missing dummy handles to Friends service."""
         friends_dir = os.path.join(s_dir, "repos", "friends")
@@ -1240,6 +2327,51 @@ done
         # main.go panic recovery (keep existing logic but fix potential issues)
         main_go = os.path.join(friends_dir, "main.go")
         # ... (rest of main.go patching if needed)
+
+        # Friends PRUDP sessions are shared by MK8 and can be quiet long enough
+        # for the stock nex-go/v2 heartbeat to falsely clean them up.
+        friends_timeout_patches = [
+            (
+                os.path.join(friends_dir, "nex", "authentication.go"),
+                "globals.AuthenticationServer.AccessKey = \"ridfebb9\"",
+                "globals.AuthenticationServer.AccessKey = \"ridfebb9\"\n\tglobals.AuthenticationEndpoint.DefaultStreamSettings.MaxSilenceTime = 600000\n\tglobals.AuthenticationEndpoint.DefaultStreamSettings.KeepAliveTimeout = 600000",
+            ),
+            (
+                os.path.join(friends_dir, "nex", "secure.go"),
+                "globals.SecureServer.AccessKey = \"ridfebb9\"",
+                "globals.SecureServer.AccessKey = \"ridfebb9\"\n\tglobals.SecureEndpoint.DefaultStreamSettings.MaxSilenceTime = 600000\n\tglobals.SecureEndpoint.DefaultStreamSettings.KeepAliveTimeout = 600000",
+            ),
+        ]
+        for timeout_path, timeout_old, timeout_new in friends_timeout_patches:
+            if os.path.isfile(timeout_path):
+                try:
+                    with open(timeout_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    content = content.replace("DefaultStreamSettings.MaxSilenceTime = 120000", "DefaultStreamSettings.MaxSilenceTime = 600000")
+                    content = content.replace("DefaultStreamSettings.KeepAliveTimeout = 120000", "DefaultStreamSettings.KeepAliveTimeout = 600000")
+                    if "DefaultStreamSettings.MaxSilenceTime" not in content:
+                        content = content.replace(timeout_old, timeout_new)
+                        with open(timeout_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                    else:
+                        with open(timeout_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                except Exception:
+                    pass
+
+        auth_protocol_path = os.path.join(friends_dir, "nex", "register_common_authentication_server_protocols.go")
+        if os.path.isfile(auth_protocol_path):
+            try:
+                with open(auth_protocol_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                content = content.replace(
+                    "commonTicketGrantingProtocol.SecureServerAccount = globals.SecureEndpoint.ServerAccount",
+                    "commonTicketGrantingProtocol.SecureServerAccount = globals.SecureServerAccount",
+                )
+                with open(auth_protocol_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            except Exception:
+                pass
 
         # 1. Patch register_secure_server_protocols.go to add missing handles
         reg_path = os.path.join(friends_dir, "nex", "register_secure_server_protocols.go")
@@ -1462,6 +2594,8 @@ TournamentsCollection=tourneys
                 if '"os"' not in c:
                     c = c.replace('"fmt"\n', '"fmt"\n\t"os"\n')
                 c = c.replace('nexServer.Listen(":60002")', 'nexServer.Listen(":" + getenvDefault("PN_MK8_AUTHENTICATION_SERVER_PORT", "60140"))')
+                if 'nexServer.SetPingTimeout(120)' not in c:
+                    c = c.replace('nexServer.SetAccessKey("25dbf96a")', 'nexServer.SetAccessKey("25dbf96a")\n\tnexServer.SetPingTimeout(120)')
                 if 'func getenvDefault(' not in c:
                     c += '''
 
@@ -1503,6 +2637,8 @@ func getenvDefault(key string, fallback string) string {
             with open(main_go, 'r', encoding='utf-8') as f: c = f.read()
             c = c.replace('NewNatTraversalProtocol', 'NewNATTraversalProtocol')
             c = c.replace('.ReportNatProperties(', '.ReportNATProperties(')
+            if 'nexServer.SetPingTimeout(120)' not in c:
+                c = c.replace('nexServer.SetAccessKey(config.AccessKey)', 'nexServer.SetAccessKey(config.AccessKey)\n\tnexServer.SetPingTimeout(120)')
             with open(main_go, 'w', encoding='utf-8') as f: f.write(c)
 
         # --- register.go: ConnectionID, StationURL, pointer-to-value ---
@@ -1563,8 +2699,24 @@ func getenvDefault(key string, fallback string) string {
     listen 80;
     server_name npdi.cdn.pretendo.cc npdl.cdn.pretendo.cc npfl.c.app.pretendo.cc
     nppl.c.app.pretendo.cc nppl.app.pretendo.cc npts.app.pretendo.cc;
+    location = /p01/tasksheet/1//preport {
+        default_type application/xml;
+        return 200 '<?xml version="1.0" encoding="UTF-8"?><TaskSheet><TitleId>000500001018dc00</TitleId><TaskId>preport</TaskId><ServiceStatus>open</ServiceStatus><Files></Files></TaskSheet>';
+    }
+    location = /p01/tasksheet/1/preport {
+        default_type application/xml;
+        return 200 '<?xml version="1.0" encoding="UTF-8"?><TaskSheet><TitleId>000500001018dc00</TitleId><TaskId>preport</TaskId><ServiceStatus>open</ServiceStatus><Files></Files></TaskSheet>';
+    }
+    location ~ ^/p01/tasksheet/1/[^/]+/CHARA$ {
+        default_type application/xml;
+        return 200 '<?xml version="1.0" encoding="UTF-8"?><TaskSheet><TitleId>000500001018dc00</TitleId><TaskId>CHARA</TaskId><ServiceStatus>open</ServiceStatus><Files></Files></TaskSheet>';
+    }
+    location ^~ /super-mario-maker/ {
+        proxy_pass http://minio:9000;
+        proxy_set_header Host $host;
+    }
     location / {
-        resolver 8.8.8.8;
+        resolver 8.8.8.8 ipv6=off;
         proxy_ssl_server_name on;
         proxy_set_header Host $host;
         proxy_pass https://$host;
@@ -1680,6 +2832,25 @@ func getenvDefault(key string, fallback string) string {
       - ./environment/mario-kart-8.env
       - ./environment/mario-kart-8.local.env""")
                 changed = True
+
+            if "super-mario-3d-world-secure:" not in content:
+                self.manager.setup_log.append("[System] Injecting super-mario-3d-world-secure into compose.yml...")
+                injections.append("""  super-mario-3d-world-secure:
+    build: ./repos/super-mario-3d-world-secure
+    depends_on:
+      - account
+      - postgres
+    restart: unless-stopped
+    ports:
+      - 60200:60200/udp
+      - 60201:60201/udp
+    networks:
+      internal:
+    dns: 172.20.0.200
+    env_file:
+      - ./environment/super-mario-3d-world-secure.env
+      - ./environment/super-mario-3d-world-secure.local.env""")
+                changed = True
             
             if changed and len(injections) > (1 if "# INJECTED SERVICES" in content else 0):
                 # Find the 'volumes:' or 'networks:' at root level to insert before
@@ -1732,7 +2903,7 @@ func getenvDefault(key string, fallback string) string {
     def _execute_build(self, s_dir):
         """Run docker compose build after Docker has been confirmed ready."""
         self.manager.setup_log.append("[System] Starting container build process (Serial mode for stability)...")
-        services = "pokken-tournament mario-kart-8 boss super-smash-bros-wiiu website friends miiverse-api juxtaposition-ui wiiu-chat-authentication wiiu-chat-secure super-mario-maker splatoon minecraft-wiiu pikmin-3"
+        services = "pokken-tournament mario-kart-8 super-mario-3d-world-secure boss super-smash-bros-wiiu website friends miiverse-api juxtaposition-ui wiiu-chat-authentication wiiu-chat-secure super-mario-maker splatoon minecraft-wiiu pikmin-3"
         cmd = f"docker compose build {services}"
         pw = self.manager.cached_password
         if not pw and OS_INFO["os"] == "linux":
@@ -1743,10 +2914,13 @@ func getenvDefault(key string, fallback string) string {
         
         def _on_build_done(c):
             if c == 0:
-                from PySide6.QtWidgets import QMessageBox
-                QMessageBox.information(self.manager, "Deployment Complete", "The Full Stack Deployment has finished successfully! Your Pretendo environment is fully built.\n\nYou are now ready to Start the Server.")
+                if not getattr(self.manager, "_suppress_deploy_complete_popup", False):
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.information(self.manager, "Deployment Complete", "The Full Stack Deployment has finished successfully! Your Pretendo environment is fully built.\n\nYou are now ready to Start the Server.")
             else:
                 self.manager.setup_log.append(f"[ERROR] Build process failed with status {c}. Verify Docker status.")
+            if hasattr(self.manager, "_on_deploy_complete"):
+                self.manager._on_deploy_complete(c)
 
         self.manager._run_command(cmd, self.manager.setup_log, cwd=s_dir, stdin_data=pw, 
                                   on_done=_on_build_done, lock_ui=True)

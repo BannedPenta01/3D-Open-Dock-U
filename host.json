@@ -1,0 +1,25 @@
+{
+  "servers": [
+    {
+      "game": "Splatoon",
+      "name": "My Local Server",
+      "url": "http://127.0.0.1:8070",
+      "game_color": "#33CCFF",
+      "name_color": "#85BB65"
+    },
+    {
+      "game": "Mario Kart 8",
+      "name": "My Local Server",
+      "url": "http://127.0.0.1:8070",
+      "game_color": "#ff4d4d",
+      "name_color": "#85BB65"
+    },
+    {
+      "game": "Smash Wii U",
+      "name": "My Local Server",
+      "url": "http://127.0.0.1:8070",
+      "game_color": "#d7b7ff",
+      "name_color": "#85BB65"
+    }
+  ]
+}
