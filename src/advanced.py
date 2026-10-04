@@ -23,22 +23,22 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QSettings, QTimer, QDir, QLockFile, QStandardPaths
 from PySide6.QtGui import QColor, QPixmap, QIcon
 
-from constants import (
+from src.constants import (
     APP_NAME, APP_VERSION, STYLESHEET, RED_PRIMARY, CYAN_PRIMARY, 
     CYAN_DARK, CYAN_LIGHT, TEXT_SECONDARY, RED_DARK, RED_LIGHT, 
-    BG_DARK, BG_CARD, GREEN_MONEY, ORANGE_ACCOUNT
+    BG_DARK, BG_CARD, GREEN_MONEY, ORANGE_ACCOUNT, LOGO_PATH, HOST_JSON_PATH
 )
-from utils import OS_INFO, DEFAULT_SERVER_DIR, CEMU_DIR, _obs, _deobs, get_local_ip, has_internet_connectivity
-from secrets_manager import SecretStore
+from src.utils import OS_INFO, DEFAULT_SERVER_DIR, CEMU_DIR, _obs, _deobs, get_local_ip, has_internet_connectivity
+from src.secrets_manager import SecretStore
 
 # Import mixins
-from mixins.server_mixin import ManagerServerMixin
-from mixins.vault_mixin import ManagerVaultMixin
-from mixins.utils_mixin import ManagerUtilsMixin
+from src.mixins.server_mixin import ManagerServerMixin
+from src.mixins.vault_mixin import ManagerVaultMixin
+from src.mixins.utils_mixin import ManagerUtilsMixin
 
 # Import new modules
-from deploy import Deployer
-from patch_emulators import EmulatorPatcher
+from src.deploy import Deployer
+from src.patch_emulators import EmulatorPatcher
 
 def make_scrollable(widget):
     scroll = QScrollArea()
@@ -104,7 +104,7 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         
         # Header / Logo
         self.logo_label = QLabel()
-        logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+        logo_path = LOGO_PATH
         if os.path.exists(logo_path):
             pix = QPixmap(logo_path)
             # Scale to reasonable header height
@@ -379,7 +379,7 @@ class PretendoManager(QMainWindow, ManagerServerMixin, ManagerVaultMixin, Manage
         ]
 
     def _host_json_path(self):
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "host.json")
+        return HOST_JSON_PATH
 
     def _coerce_server_profiles(self, payload):
         profiles = payload.get("servers", payload) if isinstance(payload, dict) else payload

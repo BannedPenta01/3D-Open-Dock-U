@@ -17,9 +17,9 @@ import zipfile
 from urllib.parse import urlparse
 from PySide6.QtWidgets import QMessageBox, QFileDialog, QApplication
 from PySide6.QtCore import QDir
-from constants import SEC_KEYS, CONSOLE_CERTS_PACKED
-from secrets_manager import secure_file
-from utils import safe_unhex, OS_INFO, get_local_ip
+from src.constants import SEC_KEYS, CONSOLE_CERTS_PACKED
+from src.secrets_manager import secure_file
+from src.utils import safe_unhex, OS_INFO, get_local_ip
 
 class EmulatorPatcher:
     def __init__(self, manager):
@@ -344,16 +344,9 @@ const mongoose = require("mongoose");
             return
 
         self.manager.server_log.append(f"<span style='color:cyan;'>[System] Injecting custom network_services.xml...</span>")
-        
-        services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas", "npts", "api", "ecs", "ias", "cas", "boss", "friends", "account", "clp", "shop", "news", "portal", "discovery"]
+
         base_url, _, _ = self._normalize_target_url(url, is_official=is_official)
-        
-        url_nodes = []
-        for s in services:
-            url_nodes.append(f"        <{s}>{base_url}</{s}>")
-        
-        urls_block = "\n".join(url_nodes)
-        ns_content = f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>Pretendo-Bypass</networkname>\n    <disablesslverification>1</disablesslverification>\n    <urls>\n{urls_block}\n    </urls>\n</content>'
+        ns_content = self.build_cemu_network_services_xml(base_url)
         
         try:
             with open(ns_xml, "w") as f: f.write(ns_content)
@@ -361,31 +354,23 @@ const mongoose = require("mongoose");
         except Exception as e:
             self.manager.server_log.append(f"<span style='color:red;'>[ERROR] Failed to write network_services.xml: {e}</span>")
 
-    def generate_cemu_manual(self):
-        username = self.manager.cemu_username.text().strip()
-        password = self.manager.cemu_password.text()
-        miiname = self.manager.cemu_miiname.text().strip() or "Player"
-        data_path = self.manager.cemu_dir_field.text().strip()
+    @staticmethod
+    def build_cemu_network_services_xml(base_url, network_name="Pretendo-Bypass"):
+        """Build the network_services.xml text pointing every service at base_url."""
+        services = ["act", "con", "etc", "dls", "shp", "dsa", "pdm", "miv", "smm", "bas", "npts", "api", "ecs", "ias", "cas", "boss", "friends", "account", "clp", "shop", "news", "portal", "discovery"]
+        url_nodes = []
+        for s in services:
+            url_nodes.append(f"        <{s}>{base_url}</{s}>")
 
-        if not username or not password:
-            QMessageBox.warning(self.manager, "Input Required", "Username and password are required to generate identity files.")
-            return
+        urls_block = "\n".join(url_nodes)
+        return f'<?xml version="1.0" encoding="UTF-8"?>\n<content>\n    <networkname>{network_name}</networkname>\n    <disablesslverification>1</disablesslverification>\n    <urls>\n{urls_block}\n    </urls>\n</content>'
 
-        if not (6 <= len(username) <= 16):
-            QMessageBox.warning(self.manager, "Input Error", "Username must be between 6 and 16 characters long.")
-            return
-
-        if len(miiname) > 10:
-            QMessageBox.warning(self.manager, "Input Error", "Mii name must be 10 characters or fewer.")
-            return
+    @staticmethod
+    def build_cemu_account_text(username, password, miiname):
+        """Build the account.dat text for a Cemu identity. Same bytes the live patch writes."""
+        miiname = (miiname or "Player")[:10]
 
         try:
-            self.manager.server_log.append(f"<span style='color:#58a6ff;'>[System] Writing Cemu identity: AccountId={username}, MiiName={miiname}</span>")
-
-            # Deploy essential ccerts, identity files (otp/seeprom) and fonts
-            self._ensure_console_certs(data_path)
-            self._ensure_cemu_fonts(data_path)
-
             # 2. Account Generation (NEX-Compatible Authenticated Hash)
             pid = 1337
             pid_bytes = pid.to_bytes(4, byteorder='little')
@@ -462,7 +447,39 @@ const mongoose = require("mongoose");
                 "MiiImageLastModifiedDate=Tue, 09 Apr 2019 16:56:09 GMT",
                 "IsCommitted=1"
             ]
-            
+            return "\n".join(lines)
+        except Exception as e:
+            raise ValueError(f"Could not build Cemu identity: {e}")
+
+    def generate_cemu_manual(self):
+        username = self.manager.cemu_username.text().strip()
+        password = self.manager.cemu_password.text()
+        miiname = self.manager.cemu_miiname.text().strip() or "Player"
+        data_path = self.manager.cemu_dir_field.text().strip()
+
+        if not username or not password:
+            QMessageBox.warning(self.manager, "Input Required", "Username and password are required to generate identity files.")
+            return
+
+        if not (6 <= len(username) <= 16):
+            QMessageBox.warning(self.manager, "Input Error", "Username must be between 6 and 16 characters long.")
+            return
+
+        if len(miiname) > 10:
+            QMessageBox.warning(self.manager, "Input Error", "Mii name must be 10 characters or fewer.")
+            return
+
+        try:
+            self.manager.server_log.append(f"<span style='color:#58a6ff;'>[System] Writing Cemu identity: AccountId={username}, MiiName={miiname}</span>")
+
+            # Deploy essential ccerts, identity files (otp/seeprom) and fonts
+            self._ensure_console_certs(data_path)
+            self._ensure_cemu_fonts(data_path)
+
+            account_text = self.build_cemu_account_text(username, password, miiname)
+            mii_name_limited = miiname[:10]
+            pid = 1337
+
             p_targets = []
             cemu_candidates = self._get_cemu_data_candidates(data_path)
             
@@ -495,7 +512,7 @@ const mongoose = require("mongoose");
                     os.makedirs(os.path.dirname(fpath), exist_ok=True)
                     self._make_cemu_account_file_writable(fpath)
                     with open(fpath, "w") as f:
-                        f.write("\n".join(lines))
+                        f.write(account_text)
                     secure_file(fpath)
                     written_mii = self._read_account_file_mii_name(fpath)
                     written_mii_data = self._read_account_file_mii_data_name(fpath)

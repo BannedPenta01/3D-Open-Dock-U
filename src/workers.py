@@ -3,7 +3,7 @@ import subprocess
 import os
 import re
 from PySide6.QtCore import QThread, Signal
-from utils import OS_INFO
+from src.utils import OS_INFO
 
 class CommandWorker(QThread):
     output = Signal(str)

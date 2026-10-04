@@ -4,7 +4,16 @@ import binascii
 
 APP_NAME = "3D Open Dock U"
 APP_VERSION = "1.1.0"
-PRETENDO_REPO = "https://github.com/MatthewL246/pretendo-docker.git"
+# The server stack lives on the owner's account under a non-Pretendo name.
+# (A renamed fork of the upstream pretendo-docker project.)
+SERVER_REPO = "https://github.com/BannedPenta01/Open-Dock-U-Server.git"
+PRETENDO_REPO = SERVER_REPO  # legacy alias used by deploy.py
+
+# Project root (this file lives in src/). Shared data files stay at root
+# so users can find host.json and assets without digging through code.
+APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOST_JSON_PATH = os.path.join(APP_ROOT, "host.json")
+LOGO_PATH = os.path.join(APP_ROOT, "assets", "logo.png")
 
 # Nintendo Colors & Gradients
 RED_DARK = "#8B0000"
@@ -39,7 +48,6 @@ TITLE_MAP = {
     "00050000-10101D00": "The Legend of Zelda: The Wind Waker HD",
     "00050000-10143100": "The Legend of Zelda: Breath of the Wild",
     "00050000-10105700": "New SUPER MARIO BROS. U",
-    "00050000-10145C00": "Minecraft: Wii U Edition",
     "00050000-101c4d00": "Splatoon (Trial)",
     "00050000-10102400": "Hyrule Warriors",
     "00050000-10110300": "TLoZ: Skyward Sword",
@@ -91,7 +99,7 @@ QFrame#separator {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {
 
 # Master Keys loading logic
 def load_security_keys():
-    from secrets_manager import SecretStore, secure_file
+    from src.secrets_manager import SecretStore, secure_file
 
     k_dir = os.path.join(os.path.expanduser("~"), ".config", "OpenDock")
     fpath = os.path.join(k_dir, "identity_secrets.txt")

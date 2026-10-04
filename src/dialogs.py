@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QLineEdit,
                                QTextEdit, QCheckBox, QDialogButtonBox)
 from PySide6.QtCore import Qt
 from datetime import datetime
-from constants import STYLESHEET, RED_LIGHT, BG_INPUT, CYAN_LIGHT, TEXT_SECONDARY, BG_CARD_HOVER, CYAN_PRIMARY, RED_DARK
+from src.constants import STYLESHEET, RED_LIGHT, BG_INPUT, CYAN_LIGHT, TEXT_SECONDARY, BG_CARD_HOVER, CYAN_PRIMARY, RED_DARK
 
 class ErrorPopupDialog(QDialog):
     def __init__(self, parent, error_msg):

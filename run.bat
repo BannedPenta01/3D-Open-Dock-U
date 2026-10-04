@@ -24,5 +24,5 @@ if errorlevel 1 (
     )
 )
 
-".venv\Scripts\python.exe" start_gui.py
+".venv\Scripts\python.exe" -m src.advanced
 pause

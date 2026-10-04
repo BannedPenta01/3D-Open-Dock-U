@@ -240,6 +240,19 @@ def _start_docker_desktop():
     except Exception:
         return False
 
+SERVER_DIR_NAME = "Open-Dock-U-Server"
+LEGACY_SERVER_DIR_NAME = "pretendo-docker"
+
+
+def preferred_server_dir(base):
+    """New folder name, falling back to the legacy one if that is what exists."""
+    preferred = os.path.join(base, SERVER_DIR_NAME)
+    legacy = os.path.join(base, LEGACY_SERVER_DIR_NAME)
+    if os.path.isdir(legacy) and not os.path.isdir(preferred):
+        return legacy
+    return preferred
+
+
 def detect_os_info():
     """Detect OS, package manager, and default emulator paths."""
     system = platform.system().lower()
@@ -252,7 +265,7 @@ def detect_os_info():
     home = os.path.expanduser("~")
 
     if system == "linux":
-        info["server_dir"] = os.path.join(home, "pretendo-docker")
+        info["server_dir"] = preferred_server_dir(home)
         if shutil.which("pacman"):
             info["pkg_mgr"], info["pkg_install"], info["distro"] = "pacman", "pacman -S --noconfirm docker docker-compose", "Arch Linux"
         elif shutil.which("apt"):
@@ -285,7 +298,7 @@ def detect_os_info():
                 break
     elif system == "windows":
         userprofile = os.environ.get("USERPROFILE", "C:\\Users\\User")
-        info["server_dir"] = os.path.join(userprofile, "pretendo-docker")
+        info["server_dir"] = preferred_server_dir(userprofile)
         info["distro"] = "Windows"
         appdata = os.environ.get("APPDATA", "")
         localappdata = os.environ.get("LOCALAPPDATA", "")
@@ -407,6 +420,7 @@ def has_internet_connectivity(timeout=0.25, refresh=5.0):
         _LAST_INET_RESULT = False
     _LAST_INET_CHECK = now
     return _LAST_INET_RESULT
+
 
 def _win_to_wsl_path(win_path):
     """Convert a Windows path (C:\\Users\\foo) to a WSL path (/mnt/c/Users/foo)."""
